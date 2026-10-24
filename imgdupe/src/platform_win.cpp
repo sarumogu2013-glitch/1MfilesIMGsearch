@@ -80,4 +80,48 @@ bool makeDirs(const std::string& dir) {
 
 bool removeEmptyDir(const std::string& dir) { return RemoveDirectoryW(winutil::widen(dir).c_str()) != 0; }
 
+bool truncateFile(const std::string& path, uint64_t size) {
+    HANDLE f = CreateFileW(winutil::widen(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER pos;
+    pos.QuadPart = static_cast<LONGLONG>(size);
+    const bool ok = SetFilePointerEx(f, pos, nullptr, FILE_BEGIN) && SetEndOfFile(f);
+    CloseHandle(f);
+    return ok;
+}
+
+bool MappedFile::open(const std::string& path) {
+    close();
+    // 書いている途中のファイルも読めるように、共有の指定は広く
+    HANDLE f = CreateFileW(winutil::widen(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(f, &sz) || sz.QuadPart <= 0) {
+        CloseHandle(f);
+        return false;
+    }
+    HANDLE map = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(f);
+    if (!map) return false;
+    const void* p = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+    if (!p) {
+        CloseHandle(map);
+        return false;
+    }
+    data_ = static_cast<const uint8_t*>(p);
+    size_ = static_cast<uint64_t>(sz.QuadPart);
+    handle_ = map;
+    return true;
+}
+
+void MappedFile::close() {
+    if (data_) UnmapViewOfFile(data_);
+    if (handle_) CloseHandle(static_cast<HANDLE>(handle_));
+    data_ = nullptr;
+    size_ = 0;
+    handle_ = nullptr;
+}
+
 }  // namespace imgdupe

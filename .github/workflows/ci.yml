@@ -22,23 +22,36 @@ jobs:
           path: |
             imgdupe/out/imgdupe.exe
             imgdupe/out/imgdupe_setup.exe
-      - name: 一時的な調査（Hugging Face の CLIP の候補）
+      - name: 一時的な調査（CLIP のモデルの入出力）
         continue-on-error: true
         run: |
+          pip install --quiet onnx
           python3 - <<'PY'
-          import json, urllib.request
-          for repo in ["Xenova/clip-vit-base-patch32", "Xenova/clip-vit-base-patch16", "Xenova/clip-ViT-B-32-multilingual-v1",
-                       "sentence-transformers/clip-ViT-B-32-multilingual-v1", "line-corporation/clip-japanese-base",
-                       "jinaai/jina-clip-v2", "Xenova/siglip-base-patch16-224", "Xenova/siglip-base-patch16-256-multilingual",
-                       "google/siglip-base-patch16-256-multilingual", "rinna/japanese-clip-vit-b-16", "stabilityai/japanese-stable-clip-vit-l-16",
-                       "Marqo/marqo-fashionSigLIP", "onnx-community/siglip2-base-patch16-224-ONNX", "Xenova/mobileclip_s0"]:
-              try:
-                  t = json.load(urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true", timeout=60))
-                  files = [(e["path"], e.get("size")) for e in t if e.get("type") == "file"]
-                  print("==", repo)
-                  for p, s in files:
-                      if p.endswith((".onnx", ".json", ".txt", ".model")) and "/" not in p.replace("onnx/", ""):
-                          print("  ", p, s)
-              except Exception as ex:
-                  print("==", repo, "ERROR", ex)
+          import json, urllib.request, onnx
+          def tree(repo):
+              t = json.load(urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true", timeout=60))
+              return [(e["path"], e.get("size")) for e in t if e.get("type") == "file"]
+          def get(repo, path):
+              return urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/main/{path}", timeout=600).read()
+          def io(repo, path):
+              m = onnx.load_from_string(get(repo, path), load_external_data=False)
+              dims = lambda t: [d.dim_param or d.dim_value for d in t.type.tensor_type.shape.dim]
+              print("  IO", path, "in:", [(i.name, i.type.tensor_type.elem_type, dims(i)) for i in m.graph.input if i.name not in {x.name for x in m.graph.initializer}],
+                    "out:", [(o.name, dims(o)) for o in m.graph.output])
+          for repo in ["sentence-transformers/clip-ViT-B-32-multilingual-v1", "line-corporation/clip-japanese-base"]:
+              print("==", repo)
+              for p, s in tree(repo): print("  ", p, s)
+          r = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
+          for f in ["modules.json", "tokenizer_config.json", "special_tokens_map.json", "sentence_bert_config.json", "2_Dense/config.json", "1_Pooling/config.json"]:
+              try: print("--", f, get(r, f).decode()[:600])
+              except Exception as e: print("--", f, e)
+          io(r, "onnx/model_quint8_avx2.onnx")
+          r = "line-corporation/clip-japanese-base"
+          for f in ["onnx/list.txt", "config.json", "tokenizer_config.json", "preprocessor_config.json"]:
+              try: print("--", f, get(r, f).decode()[:900])
+              except Exception as e: print("--", f, e)
+          r = "Xenova/clip-vit-base-patch32"
+          for f in ["preprocessor_config.json"]:
+              print("--", f, get(r, f).decode()[:600])
+          io(r, "onnx/vision_model_quantized.onnx")
           PY

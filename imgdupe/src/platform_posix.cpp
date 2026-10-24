@@ -1,4 +1,6 @@
 // platform.hpp の POSIX 版（テスト用）
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -54,5 +56,30 @@ bool makeDirs(const std::string& dir) {
 }
 
 bool removeEmptyDir(const std::string& dir) { return ::rmdir(dir.c_str()) == 0; }
+
+bool truncateFile(const std::string& path, uint64_t size) { return ::truncate(path.c_str(), static_cast<off_t>(size)) == 0; }
+
+bool MappedFile::open(const std::string& path) {
+    close();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        ::close(fd);
+        return false;
+    }
+    void* p = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) return false;
+    data_ = static_cast<const uint8_t*>(p);
+    size_ = static_cast<uint64_t>(st.st_size);
+    return true;
+}
+
+void MappedFile::close() {
+    if (data_) munmap(const_cast<uint8_t*>(data_), static_cast<size_t>(size_));
+    data_ = nullptr;
+    size_ = 0;
+}
 
 }  // namespace imgdupe

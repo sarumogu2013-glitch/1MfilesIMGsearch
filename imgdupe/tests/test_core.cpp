@@ -18,6 +18,7 @@
 #include "names.hpp"
 #include "models.hpp"
 #include "tagger.hpp"
+#include "vectors.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1388,6 +1389,76 @@ static void testTagger() {
     fs::remove_all(dir);
 }
 
+static void testVectors() {
+    for (float f : {0.0f, 1.0f, -2.5f, 0.333f, 65504.0f, 1e-5f, -1e-7f}) {
+        const float back = halfToFloat(floatToHalf(f));
+        CHECK(std::abs(back - f) <= std::abs(f) * 1e-3f + 1e-7f);
+    }
+    CHECK(floatToHalf(1.0f) == 0x3c00 && floatToHalf(-2.0f) == 0xc000 && std::isinf(halfToFloat(floatToHalf(1e6f))));
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-vectors-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string path = (dir / "v.bin").string();
+    auto unit = [](std::vector<float> v) {
+        normalizeVector(v);
+        return v;
+    };
+    bool created = false;
+    {
+        VectorWriter w;
+        CHECK(w.open(path, 4, "m1", &created) && created);
+        CHECK(w.append(1, unit({1, 0, 0, 0}).data()));
+        CHECK(w.append(2, unit({0, 1, 0, 0}).data()));
+        CHECK(w.append(3, unit({1, 1, 0, 0}).data()));
+    }
+    {
+        VectorWriter w;
+        CHECK(w.open(path, 4, "m1", &created) && !created);  // 同じ版なら足していく
+        CHECK(w.append(2, unit({0, 0, 1, 0}).data()));       // 同じ画像は後のものを使う
+        CHECK(w.append(4, unit({-1, 0, 0, 0}).data()));
+    }
+    VectorIndex idx;
+    CHECK(idx.load(path) && idx.dim() == 4 && idx.version() == "m1" && idx.size() == 4 && idx.records() == 5);
+    std::vector<float> v;
+    CHECK(idx.get(2, v) && std::abs(v[2] - 1) < 1e-3 && !idx.get(9, v));
+    const auto q = unit({1, 0.1f, 0, 0});
+    auto hits = idx.topK(q.data(), 2);
+    CHECK(hits.size() == 2 && hits[0].first == 1 && hits[1].first == 3);
+    hits = idx.topK(q.data(), 10, [](int64_t id) { return id != 1; }, 3);
+    CHECK(hits.size() == 3 && hits[0].first == 3 && hits.back().first == 4);  // 1 を除いた全部、内積の順
+
+    // 書きかけのレコードは読まない。次に書く時に切り詰める
+    {
+        FILE* f = std::fopen(path.c_str(), "ab");
+        std::fwrite("\x05\0\0", 1, 3, f);
+        std::fclose(f);
+    }
+    idx.close();
+    CHECK(idx.load(path) && idx.size() == 4);
+    {
+        VectorWriter w;
+        CHECK(w.open(path, 4, "m1", &created) && !created);
+        CHECK(w.append(5, unit({0, 0, 0, 1}).data()));
+    }
+    idx.close();
+    CHECK(idx.load(path) && idx.size() == 5 && idx.get(5, v) && std::abs(v[3] - 1) < 1e-3);
+
+    // 作り直し: 消えた画像と古いレコードを捨てる
+    CHECK(compactVectors(path, [](int64_t id) { return id != 4; }));
+    idx.close();
+    CHECK(idx.load(path) && idx.size() == 4 && idx.records() == 4 && !idx.has(4) && idx.get(2, v) && std::abs(v[2] - 1) < 1e-3);
+    // 版が違えば作り直す
+    {
+        VectorWriter w;
+        CHECK(w.open(path, 4, "m2", &created) && created);
+    }
+    idx.close();
+    CHECK(idx.load(path) && idx.size() == 0 && idx.version() == "m2");
+    idx.close();
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1425,6 +1496,7 @@ int main() {
     testNames();
     testModels();
     testTagger();
+    testVectors();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

@@ -28,5 +28,24 @@ bool createHardLink(const std::string& existing, const std::string& link);  // l
 bool removeFile(const std::string& path);
 bool makeDirs(const std::string& dir);       // 途中のフォルダもまとめて作る（あれば true）
 bool removeEmptyDir(const std::string& dir);  // 空の時だけ消える
+bool truncateFile(const std::string& path, uint64_t size);  // size バイトに切り詰める
+
+// 読み取り専用のメモリマップ（大きなベクトルのファイルを、メモリに読み込まずに使う）
+class MappedFile {
+public:
+    MappedFile() = default;
+    ~MappedFile() { close(); }
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+    bool open(const std::string& path);  // 空のファイルや無いファイルは false
+    void close();
+    const uint8_t* data() const { return data_; }
+    uint64_t size() const { return size_; }
+
+private:
+    const uint8_t* data_ = nullptr;
+    uint64_t size_ = 0;
+    void* handle_ = nullptr;  // Windows のマッピングのハンドル
+};
 
 }  // namespace imgdupe
