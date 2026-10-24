@@ -22,3 +22,23 @@ jobs:
           path: |
             imgdupe/out/imgdupe.exe
             imgdupe/out/imgdupe_setup.exe
+      - name: 一時的な調査（Hugging Face の CLIP の候補）
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request
+          for repo in ["Xenova/clip-vit-base-patch32", "Xenova/clip-vit-base-patch16", "Xenova/clip-ViT-B-32-multilingual-v1",
+                       "sentence-transformers/clip-ViT-B-32-multilingual-v1", "line-corporation/clip-japanese-base",
+                       "jinaai/jina-clip-v2", "Xenova/siglip-base-patch16-224", "Xenova/siglip-base-patch16-256-multilingual",
+                       "google/siglip-base-patch16-256-multilingual", "rinna/japanese-clip-vit-b-16", "stabilityai/japanese-stable-clip-vit-l-16",
+                       "Marqo/marqo-fashionSigLIP", "onnx-community/siglip2-base-patch16-224-ONNX", "Xenova/mobileclip_s0"]:
+              try:
+                  t = json.load(urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true", timeout=60))
+                  files = [(e["path"], e.get("size")) for e in t if e.get("type") == "file"]
+                  print("==", repo)
+                  for p, s in files:
+                      if p.endswith((".onnx", ".json", ".txt", ".model")) and "/" not in p.replace("onnx/", ""):
+                          print("  ", p, s)
+              except Exception as ex:
+                  print("==", repo, "ERROR", ex)
+          PY
