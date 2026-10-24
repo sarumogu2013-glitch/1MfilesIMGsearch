@@ -34,18 +34,16 @@ jobs:
           def get(repo, path):
               return urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/main/{path}", timeout=600).read()
           def io(repo, path):
-              m = onnx.load_from_string(get(repo, path), load_external_data=False)
+              m = onnx.load_from_string(get(repo, path))
               dims = lambda t: [d.dim_param or d.dim_value for d in t.type.tensor_type.shape.dim]
               print("  IO", path, "in:", [(i.name, i.type.tensor_type.elem_type, dims(i)) for i in m.graph.input if i.name not in {x.name for x in m.graph.initializer}],
                     "out:", [(o.name, dims(o)) for o in m.graph.output])
-          for repo in ["sentence-transformers/clip-ViT-B-32-multilingual-v1", "line-corporation/clip-japanese-base"]:
-              print("==", repo)
-              for p, s in tree(repo): print("  ", p, s)
           r = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
           for f in ["modules.json", "tokenizer_config.json", "special_tokens_map.json", "sentence_bert_config.json", "2_Dense/config.json", "1_Pooling/config.json"]:
               try: print("--", f, get(r, f).decode()[:600])
               except Exception as e: print("--", f, e)
           io(r, "onnx/model_quint8_avx2.onnx")
+          print("--", "Dense header", get(r, "2_Dense/model.safetensors")[:200])
           r = "line-corporation/clip-japanese-base"
           for f in ["onnx/list.txt", "config.json", "tokenizer_config.json", "preprocessor_config.json"]:
               try: print("--", f, get(r, f).decode()[:900])
@@ -54,4 +52,5 @@ jobs:
           for f in ["preprocessor_config.json"]:
               print("--", f, get(r, f).decode()[:600])
           io(r, "onnx/vision_model_quantized.onnx")
+          io(r, "onnx/vision_model_fp16.onnx")
           PY
