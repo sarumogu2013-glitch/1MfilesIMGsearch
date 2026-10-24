@@ -27,6 +27,9 @@ HBITMAP thumbFromBytes(const std::vector<uint8_t>& bytes, int box, COLORREF bg);
 // パックに入れるサムネイル: 向きを直し、一辺 maxSide 以内に縮めた JPEG
 bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>& jpeg, int& width, int& height);
 
+// 向きを直し、box×box に収まるよう縮めた 32bpp の PBGRA の画素（AI の解析用）。読めなければ false
+bool decodeBgra(const std::wstring& path, int box, std::vector<uint8_t>& px, int& w, int& h);
+
 // メタデータ（形式・EXIF・XMP/IPTC のタグや星・PNG のテキスト・NTFS の情報・ダウンロード元）を読む。
 // ファイルが無ければ false
 bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& out);

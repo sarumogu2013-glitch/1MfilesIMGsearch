@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -33,9 +34,12 @@ struct IndexCallbacks {
     // メタデータを読む（無ければ段階 meta は飛ばす）
     std::function<bool(const std::string& path, FileMeta& out)> readMeta;
     std::function<void()> threadInit, threadExit;
+    // 段階 tagger（無ければ飛ばす）。版を先に聞き、済んでいない画像がある時だけ makeTagger でモデルを読む
+    std::function<int()> taggerVersion;
+    std::function<std::shared_ptr<Analyzer>(std::string& error)> makeTagger;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
@@ -43,7 +47,8 @@ struct IndexProgress {
 };
 
 struct IndexReport {
-    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, failed = 0;
+    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, failed = 0;
+    std::string taggerError;  // モデルを読めなかった時の理由
     bool cancelled = false;
 };
 

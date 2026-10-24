@@ -36,6 +36,7 @@
 #include "indexer_win.hpp"
 #include "install_win.hpp"
 #include "keymap_win.hpp"
+#include "tagger_win.hpp"
 #include "models_win.hpp"
 #include "resource.h"
 #include "search.hpp"
@@ -3272,10 +3273,15 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.readMeta = [](const std::string& path, FileMeta& m) { return imgwin::readFileMeta(widen(path), m); };
     cb.threadInit = imgwin::threadBegin;
     cb.threadExit = imgwin::threadEnd;
+    cb.taggerVersion = [] { return tagger::stageVersion(app.dataDir); };
+    cb.makeTagger = [](std::string& error) {
+        tagger::LoadResult r = tagger::load(app.dataDir);
+        error = narrow(r.error);
+        return r.analyzer;
+    };
     return cb;
 }
 
-// imgdupe.exe --index <フォルダ>...: 走査して DB に登録し、ハッシュとサムネイルを作る
 // アンインストール（「アプリと機能」から imgdupe.exe --uninstall で呼ばれる）
 int runUninstall() {
     const wchar_t* title = L"imgdupe のアンインストール";
@@ -3333,6 +3339,7 @@ int runUninstall() {
     return 0;
 }
 
+// imgdupe.exe --index <フォルダ>...: 走査して DB に登録し、ハッシュ・サムネイル・メタデータ・タグを作る
 int runIndexCli(int argc, wchar_t** argv) {
     Console con;
     IndexOptions opt;
@@ -3356,8 +3363,9 @@ int runIndexCli(int argc, wchar_t** argv) {
         const IndexReport r = indexOnce(opt, cb, prog, cancel);
         con.print(L"画像 " + withCommas(r.files) + L" 枚（追加 " + withCommas(r.added) + L"・削除 " + withCommas(r.removed) +
                   L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、メタデータ " +
-                  withCommas(r.metas) + L" 枚、json・フォルダ名 " + withCommas(r.names) + L" 枚、失敗 " +
-                  withCommas(r.failed) + L" 枚");
+                  withCommas(r.metas) + L" 枚、json・フォルダ名 " + withCommas(r.names) + L" 枚、タグ付け " +
+                  withCommas(r.tagged) + L" 枚、失敗 " + withCommas(r.failed) + L" 枚");
+        if (!r.taggerError.empty()) con.print(L"WD14 タガーを使えませんでした: " + widen(r.taggerError));
     } catch (const std::exception& e) {
         con.print(L"エラー: " + widen(e.what()));
         return 1;

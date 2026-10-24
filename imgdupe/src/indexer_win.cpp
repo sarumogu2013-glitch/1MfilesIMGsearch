@@ -22,6 +22,7 @@
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "links.hpp"
+#include "tagger_win.hpp"
 #include "resource.h"
 #include "win_util.hpp"
 
@@ -77,6 +78,7 @@ struct Resident {
     IndexProgress prog;
     std::wstring lastResult;                   // 最後の結果（m で守る）
     std::wstring waitReason;                   // 止めている理由（m で守る）
+    std::wstring taggerDevice;                 // タガーを動かしている所（GPU / CPU。m で守る）
 };
 
 Resident* g = nullptr;
@@ -167,6 +169,17 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.threadExit = [] {
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         imgwin::threadEnd();
+    };
+    cb.taggerVersion = [] { return tagger::stageVersion(g->dataDir); };
+    cb.makeTagger = [&cb](std::string& error) {
+        // 操作中は推論も 1 スレッドだけ（操作していなければ全部のコア）
+        tagger::LoadResult r = tagger::load(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
+        error = narrow(r.error);
+        if (r.analyzer) {
+            std::lock_guard<std::mutex> lock(g->m);
+            g->taggerDevice = r.device;
+        }
+        return r.analyzer;
     };
 
     // 見張り: 一時停止・終了・控えるべき状態になったら、すぐ止める（続きは次の回）
@@ -264,9 +277,10 @@ void workLoop() {
 // ---------------------------------------------------------------- タスクトレイ
 
 std::wstring statusText() {
-    std::wstring wait, last;
+    std::wstring wait, last, taggerDevice;
     {
         std::lock_guard<std::mutex> lock(g->m);
+        taggerDevice = g->taggerDevice;
         wait = g->waitReason;
         last = g->lastResult;
     }
@@ -285,6 +299,10 @@ std::wstring statusText() {
                 break;
             case IndexPhase::Meta:
                 swprintf(t, 128, L"メタデータ %llu / %llu", static_cast<unsigned long long>(done),
+                         static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Tagger:
+                swprintf(t, 128, L"タグ付け（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
                 break;
             case IndexPhase::Names:
@@ -393,6 +411,8 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
         if (waitForOld) Sleep(1000);
     }
     if (!mutex) return 0;  // もう動いている
+    // プロセスごと CPU とディスクの優先度を下げる（ONNX Runtime が作るスレッドも含めて）
+    SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
     Resident r;
     g = &r;
     r.inst = inst;

@@ -273,6 +273,15 @@ HBITMAP thumbFromBytes(const std::vector<uint8_t>& bytes, int box, COLORREF bg) 
     return composeThumb(px, w, h, box, bg);
 }
 
+bool decodeBgra(const std::wstring& path, int box, std::vector<uint8_t>& px, int& w, int& h) {
+    IWICImagingFactory* wic = factory();
+    UINT tw = 0, th = 0;
+    if (!wic || !orientedPixels(wic, path, static_cast<UINT>(box), px, tw, th)) return false;
+    w = static_cast<int>(tw);
+    h = static_cast<int>(th);
+    return true;
+}
+
 bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>& jpeg, int& width, int& height) {
     IWICImagingFactory* wic = factory();
     std::vector<BYTE> px;

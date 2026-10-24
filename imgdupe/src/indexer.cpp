@@ -129,7 +129,21 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
     sr = runStage(db, names, opt.threads, cancel, &progress.prog);
     rep.names = sr.processed - sr.failed;
     rep.failed += sr.failed;
-    rep.cancelled = sr.cancelled;
+    if (sr.cancelled) {
+        rep.cancelled = true;
+        return rep;
+    }
+    // WD14 タガー（重い。モデルの読み込みにも時間がかかるので、済んでいない画像がある時だけ読む）
+    const int tv = cb.taggerVersion ? cb.taggerVersion() : 0;
+    if (tv && cb.makeTagger && !pendingImages(db, stage::kTagger, tv, 1).empty()) {
+        progress.phase = static_cast<int>(IndexPhase::Tagger);
+        if (std::shared_ptr<Analyzer> tagger = cb.makeTagger(rep.taggerError)) {
+            sr = runStage(db, *tagger, opt.threads, cancel, &progress.prog);
+            rep.tagged = sr.processed - sr.failed;
+            rep.failed += sr.failed;
+            rep.cancelled = sr.cancelled;
+        }
+    }
     progress.phase = static_cast<int>(IndexPhase::Done);
     return rep;
 }

@@ -17,6 +17,7 @@
 #include "links.hpp"
 #include "names.hpp"
 #include "models.hpp"
+#include "tagger.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1317,6 +1318,76 @@ static void testModels() {
     CHECK(!parseManifest("[]", m) && !parseManifest(R"({"components":[{"id":"a","version":"1","files":[]}]})", m));
 }
 
+static void testTagger() {
+    std::vector<TaggerLabel> labels;
+    CHECK(parseSelectedTags("tag_id,name,category,count\r\n9999999,general,9,1\n9999998,sensitive,9,1\n1,1girl,0,5\n"
+                            "2,hatsune_miku,4,3\n3,\"a,b\",0,1\n4,highres,5,1\n5,vocaloid,3,1\n", labels));
+    CHECK(labels.size() == 7 && labels[4].name == "a,b" && labels[3].category == 4);
+    CHECK(!parseSelectedTags("x,y\n1,2\n", labels));
+    parseSelectedTags("tag_id,name,category,count\n0,general,9,1\n0,sensitive,9,1\n1,1girl,0,5\n2,hatsune_miku,4,3\n"
+                      "3,a,0,1\n4,highres,5,1\n5,vocaloid,3,1\n", labels);
+    const float probs[] = {0.1f, 0.8f, 0.95f, 0.9f, 0.1f, 0.99f, 0.5f};
+    const auto tags = taggerTags(probs, 7, labels);
+    std::vector<std::string> got;
+    for (const auto& t : tags) got.push_back(t.kind + ":" + t.tag + ":" + t.source);
+    CHECK((got == std::vector<std::string>{"general:1girl:tagger", "character:hatsune_miku:tagger", "copyright:vocaloid:tagger",
+                                           "rating:sensitive:tagger"}));  // 0.2 未満とメタは無し、レーティングは 1 つ
+    CHECK(taggerStageVersion("abc") > 0 && taggerStageVersion("abc") != taggerStageVersion("abd"));
+
+    // 前処理: 2×1 の画像（左: 不透明の赤、右: 透明）→ 4×4。白で正方形に広げ、透明は白、BGR
+    const uint8_t px[] = {0, 0, 255, 255, /* 透明 */ 0, 0, 0, 0};
+    std::vector<float> in(4 * 4 * 3);
+    prepareTaggerInput(px, 2, 1, 4, in.data());
+    auto at = [&](int x, int y, int c) { return in[(y * 4 + x) * 3 + c]; };
+    // 2×2 に広げると (2-1)/2 = 0 なので画像は上の行、下の行が白の余白（wd-tagger と同じ）
+    CHECK(at(0, 0, 0) == 0 && at(0, 0, 1) == 0 && at(0, 0, 2) == 255);        // 赤（B=0, G=0, R=255）
+    CHECK(at(0, 3, 0) == 255 && at(0, 3, 1) == 255 && at(0, 3, 2) == 255);  // 下の余白は白
+    CHECK(at(3, 0, 0) == 255 && at(3, 0, 2) == 255);                          // 透明は白
+    std::vector<float> same(2 * 2 * 3);
+    const uint8_t sq[] = {10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255};
+    prepareTaggerInput(sq, 2, 2, 2, same.data());
+    CHECK(same[0] == 10 && same[2] == 30 && same[9] == 100 && same[11] == 120);  // 大きさが同じならそのまま
+
+    // 段階 tagger: 推論を差し替えて、タグが DB に入ることを確かめる
+    struct Fake : TaggerModel {
+        int inputSide() const override { return 4; }
+        bool run(const std::vector<float>& input, std::vector<float>& out, std::string&) override {
+            out = {0.0f, 0.9f, input[0] > 128 ? 0.9f : 0.1f, 0.3f, 0.0f, 0.0f, 0.0f};
+            return true;
+        }
+    };
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-tagger-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{"/a.png", 1, 1}, {"/broken.png", 1, 2}});
+    TaggerAnalyzer ta(std::make_shared<Fake>(), labels, taggerStageVersion("m1"),
+                      [](const std::string& path, int box, std::vector<uint8_t>& bgra, int& w, int& h) {
+                          if (path == "/broken.png") return false;
+                          w = h = box;
+                          bgra.assign(static_cast<size_t>(box) * box * 4, 255);  // 白
+                          return true;
+                      });
+    std::atomic<bool> cancel{false};
+    StageReport rep = runStage(db, ta, 2, cancel);
+    CHECK(rep.processed == 2 && rep.failed == 1);
+    std::vector<std::string> t;
+    for (const auto& x : tagsOf(db, id["/a.png"])) t.push_back(x.tag);
+    std::sort(t.begin(), t.end());
+    CHECK((t == std::vector<std::string>{"1girl", "hatsune_miku", "sensitive"}));  // 白い画像 → 1girl 0.9、レーティング 1 つ
+    // 同じ版ではやり直さない、版が変わればやり直す
+    CHECK(runStage(db, ta, 1, cancel).processed == 0);
+    TaggerAnalyzer ta2(std::make_shared<Fake>(), labels, taggerStageVersion("m2"),
+                       [](const std::string&, int box, std::vector<uint8_t>& bgra, int& w, int& h) {
+                           w = h = box;
+                           bgra.assign(static_cast<size_t>(box) * box * 4, 255);
+                           return true;
+                       });
+    CHECK(runStage(db, ta2, 1, cancel).processed == 2);
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1353,6 +1424,7 @@ int main() {
     testLinks();
     testNames();
     testModels();
+    testTagger();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

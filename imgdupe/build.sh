@@ -19,7 +19,7 @@ sqlite_obj() {  # $1: C コンパイラ, $2: 出力（ソースかフラグが�
   fi
 }
 
-CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/search.cpp src/json.cpp src/update_logic.cpp src/commands.cpp src/links.cpp src/names.cpp src/models.cpp"
+CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/search.cpp src/json.cpp src/update_logic.cpp src/commands.cpp src/links.cpp src/names.cpp src/models.cpp src/tagger.cpp"
 
 if [ "${1:-}" = "test" ]; then
   sqlite_obj "${CC:-gcc}" out/sqlite3_host.o
@@ -45,8 +45,8 @@ sqlite_obj "$CC" out/sqlite3_win.o
 # -mpopcnt: ハミング距離の計算に POPCNT 命令を使う（2008 年以降の x64 CPU はすべて対応）
 # shellcheck disable=SC2086
 "$CXX" -std=c++17 -O2 -mpopcnt -s -Wall -Wextra -Wno-missing-field-initializers -municode -mwindows -static \
-  -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DIMGDUPE_VERSION="\"$VERSION\"" -Isrc -Ithird_party/sqlite \
-  $CORE_SRC src/platform_win.cpp src/image_win.cpp src/update_win.cpp src/models_win.cpp src/install_win.cpp \
+  -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DIMGDUPE_VERSION="\"$VERSION\"" -Isrc -Ithird_party/sqlite -isystem third_party/onnxruntime \
+  $CORE_SRC src/platform_win.cpp src/image_win.cpp src/update_win.cpp src/models_win.cpp src/install_win.cpp src/tagger_win.cpp \
   src/keymap_win.cpp src/indexer_win.cpp src/main_win.cpp \
   out/sqlite3_win.o out/app.res.o \
   -o out/imgdupe.exe \
