@@ -12,6 +12,7 @@
 #include "commands.hpp"
 #include "db.hpp"
 #include "indexer.hpp"
+#include "meta.hpp"
 #include "pack.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
@@ -636,6 +637,12 @@ static void testIndexer() {
         w = h = side;
         return true;
     };
+    std::atomic<int> metas{0};
+    cb.readMeta = [&metas](const std::string& path, FileMeta& out) {
+        metas.fetch_add(1);
+        out.title = "title of " + path.substr(path.find_last_of('/') + 1);
+        return true;
+    };
     IndexOptions opt;
     opt.roots = {pics.string()};
     opt.dbFile = (root / "imgdupe.db").string();
@@ -648,6 +655,7 @@ static void testIndexer() {
     CHECK(r.files == 4 && r.added == 4 && r.removed == 0);
     CHECK(r.hashed == 4 && decodes == 4);
     CHECK(r.thumbs == 3 && r.failed == 1 && encodes == 4);
+    CHECK(r.metas == 4 && metas == 4);
     CHECK(prog.phase == static_cast<int>(IndexPhase::Done));
 
     // 2 回目は何もしない。消したファイルは DB から消える
@@ -674,6 +682,176 @@ static void testIndexer() {
     ThumbData t;
     CHECK(pack.get(db, res.ids[0], t) && t.width == kThumbSide);
     fs::remove_all(root);
+}
+
+static std::vector<uint8_t> pngChunk(const std::string& type, const std::string& data) {
+    std::vector<uint8_t> c;
+    const uint32_t n = static_cast<uint32_t>(data.size());
+    for (int i = 3; i >= 0; --i) c.push_back(static_cast<uint8_t>(n >> (8 * i)));
+    c.insert(c.end(), type.begin(), type.end());
+    c.insert(c.end(), data.begin(), data.end());
+    c.insert(c.end(), {0, 0, 0, 0});  // CRC（読まない）
+    return c;
+}
+
+static void testMeta() {
+    // ファイル名の ID
+    auto ids = parseFilenameIds("D:\\pixiv\\98765432_p3_master1200.jpg");
+    CHECK(ids.size() == 1 && ids[0].site == "pixiv" && ids[0].postId == "98765432" && ids[0].page == 3);
+    ids = parseFilenameIds("/x/user-1789012345678901234-img1.png");
+    CHECK(ids.size() == 1 && ids[0].site == "x" && ids[0].postId == "1789012345678901234");
+    ids = parseFilenameIds("D41D8CD98F00B204E9800998ECF8427E.jpg");
+    CHECK(ids.size() == 1 && ids[0].site == "md5" && ids[0].postId == "d41d8cd98f00b204e9800998ecf8427e");
+    CHECK(parseFilenameIds("IMG_20240501_123456.jpg").empty());
+    CHECK(parseFilenameIds("123_p0.jpg").empty());  // 短すぎる数字は pixiv にしない
+
+    // PNG のテキスト（tEXt は Latin-1、iTXt は UTF-8）とアニメーション
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    auto add = [&](const std::vector<uint8_t>& c) { png.insert(png.end(), c.begin(), c.end()); };
+    add(pngChunk("IHDR", std::string(13, '\0')));
+    add(pngChunk("tEXt", std::string("parameters\0masterpiece, 1girl", 29)));
+    add(pngChunk("iTXt", std::string("Title\0\0\0\0\0", 10) + "夏の空"));
+    add(pngChunk("acTL", std::string(8, '\0')));
+    add(pngChunk("IEND", ""));
+    PngInfo pi;
+    CHECK(parsePng(png.data(), png.size(), pi));
+    CHECK(pi.animated && pi.texts.size() == 2);
+    CHECK(pi.texts[0].first == "parameters" && pi.texts[0].second == "masterpiece, 1girl");
+    CHECK(pi.texts[1].first == "Title" && pi.texts[1].second == "夏の空");
+    PngInfo cut;
+    CHECK(parsePng(png.data(), 40, cut));  // 途中で切れていても落ちない
+    const uint8_t jpg[] = {0xFF, 0xD8, 0xFF};
+    CHECK(!parsePng(jpg, 3, cut));
+
+    // JPEG の EXIF（IFD0 と Exif IFD、Windows の XPKeywords）と XMP（優先される）
+    {
+        std::vector<uint8_t> tiff = {'I', 'I', 42, 0, 8, 0, 0, 0};
+        auto p16 = [&](uint16_t v) { tiff.insert(tiff.end(), {uint8_t(v), uint8_t(v >> 8)}); };
+        auto p32 = [&](uint32_t v) { p16(uint16_t(v)); p16(uint16_t(v >> 16)); };
+        // 値の置き場（IFD の後ろ）を先に決める
+        const std::string make = "Canon", model = "Canon EOS R5", date = "2024:05:01 12:34:56";
+        std::vector<uint8_t> xpkw;  // "風景;海" を UTF-16LE で
+        for (char16_t c : std::u16string(u"風景;海")) xpkw.insert(xpkw.end(), {uint8_t(c), uint8_t(c >> 8)});
+        xpkw.insert(xpkw.end(), {0, 0});
+        const uint32_t ifd0 = 8, ifd0Count = 4, exifIfd = ifd0 + 2 + ifd0Count * 12 + 4, exifCount = 2;
+        uint32_t data = exifIfd + 2 + exifCount * 12 + 4;
+        const uint32_t makeAt = data, modelAt = makeAt + uint32_t(make.size() + 1), xpAt = modelAt + uint32_t(model.size() + 1),
+                       dateAt = xpAt + uint32_t(xpkw.size());
+        p16(ifd0Count);
+        p16(0x010F); p16(2); p32(uint32_t(make.size() + 1)); p32(makeAt);
+        p16(0x0110); p16(2); p32(uint32_t(model.size() + 1)); p32(modelAt);
+        p16(0x8769); p16(4); p32(1); p32(exifIfd);
+        p16(0x9C9E); p16(1); p32(uint32_t(xpkw.size())); p32(xpAt);
+        p32(0);
+        p16(exifCount);
+        p16(0x8827); p16(3); p32(1); p16(400); p16(0);
+        p16(0x9003); p16(2); p32(uint32_t(date.size() + 1)); p32(dateAt);
+        p32(0);
+        for (const std::string* str : {&make, &model}) {
+            tiff.insert(tiff.end(), str->begin(), str->end());
+            tiff.push_back(0);
+        }
+        tiff.insert(tiff.end(), xpkw.begin(), xpkw.end());
+        tiff.insert(tiff.end(), date.begin(), date.end());
+        tiff.push_back(0);
+
+        auto segment = [](std::vector<uint8_t>& out, const std::string& head, const std::vector<uint8_t>& body) {
+            const size_t len = head.size() + body.size() + 2;
+            out.insert(out.end(), {0xFF, 0xE1, uint8_t(len >> 8), uint8_t(len)});
+            out.insert(out.end(), head.begin(), head.end());
+            out.insert(out.end(), body.begin(), body.end());
+        };
+        std::vector<uint8_t> jpg = {0xFF, 0xD8};
+        segment(jpg, std::string("Exif\0\0", 6), tiff);
+        FileMeta fm;
+        CHECK(parseJpegMeta(jpg.data(), jpg.size(), fm));
+        CHECK(fm.camera == "Canon EOS R5" && fm.iso == 400 && fm.taken == 1714566896);
+        CHECK((fm.keywords == std::vector<std::string>{"風景", "海"}));
+        CHECK(fm.rating == -1);
+
+        const std::string xmp =
+            "<x:xmpmeta><rdf:RDF><rdf:Description xmp:Rating=\"4\"><dc:subject><rdf:Bag><rdf:li>夏</rdf:li>"
+            "<rdf:li>空 &amp; 海</rdf:li></rdf:Bag></dc:subject><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">夕焼け"
+            "</rdf:li></rdf:Alt></dc:title></rdf:Description></rdf:RDF></x:xmpmeta>";
+        segment(jpg, std::string("http://ns.adobe.com/xap/1.0/") + std::string(1, '\0'),
+                std::vector<uint8_t>(xmp.begin(), xmp.end()));
+        jpg.insert(jpg.end(), {0xFF, 0xDA, 0, 2});
+        FileMeta fx;
+        CHECK(parseJpegMeta(jpg.data(), jpg.size(), fx));
+        CHECK((fx.keywords == std::vector<std::string>{"夏", "空 & 海"}));  // XMP を優先
+        CHECK(fx.rating == 4 && fx.title == "夕焼け" && fx.camera == "Canon EOS R5");
+        FileMeta cut;
+        CHECK(parseJpegMeta(jpg.data(), 30, cut));  // 途中で切れていても落ちない
+
+        FileMeta a, b;
+        a.title = "keep";
+        b.title = "other";
+        b.camera = "X";
+        b.rating = 2;
+        fillMissing(a, b);
+        CHECK(a.title == "keep" && a.camera == "X" && a.rating == 2);
+    }
+
+    std::string host, ref;
+    parseZoneIdentifier("[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://www.pixiv.net/\r\nHostUrl=https://i.pximg.net/a.png\r\n",
+                        host, ref);
+    CHECK(host == "https://i.pximg.net/a.png" && ref == "https://www.pixiv.net/");
+    CHECK(fileTimeToUnix(116444736000000000ull + 10000000ull * 86400) == 86400);
+    CHECK(parseExifDate("2024:05:01 12:34:56") == 1714566896);
+    CHECK(parseExifDate("garbage") == 0);
+
+    // DB に書いて、全文検索・タグ・出典で引ける
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-meta-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto m = upsertScanned(db, {{"/p/98765432_p0.png", 1, 1}, {"/p/b.jpg", 2, 2}});
+    FileMeta fm;
+    fm.format = "PNG";
+    fm.title = "夏の空と海";
+    fm.keywords = {"風景", "海"};
+    fm.rating = 4;
+    fm.pngText = "masterpiece, 1girl, blue sky";
+    fm.zoneUrl = "https://i.pximg.net/a.png";
+    fm.fileId = 0x1234;
+    storeMeta(db, m["/p/98765432_p0.png"], "/p/98765432_p0.png", fm);
+    storeMeta(db, m["/p/b.jpg"], "/p/b.jpg", FileMeta{});
+    CHECK((searchMetaText(db, "空と海") == std::vector<int64_t>{m["/p/98765432_p0.png"]}));
+    CHECK((searchMetaText(db, "blue sky") == std::vector<int64_t>{m["/p/98765432_p0.png"]}));
+    CHECK((searchMetaText(db, "海") == std::vector<int64_t>{m["/p/98765432_p0.png"]}));  // 2 文字以下
+    CHECK(searchMetaText(db, "冬").empty());
+    const auto tags = tagsOf(db, m["/p/98765432_p0.png"]);
+    CHECK(tags.size() == 2 && tags[0].source == kSourceEmbedded && tags[0].confidence == kEmbeddedTagConfidence);
+    {
+        Stmt st(db.handle(), "SELECT site,post_id FROM sources WHERE image_id=? ORDER BY site");
+        st.bind(1, m["/p/98765432_p0.png"]);
+        CHECK(st.step() && st.text(0) == "download");
+        CHECK(st.step() && st.text(0) == "pixiv" && st.text(1) == "98765432");
+        Stmt r(db.handle(), "SELECT rating,format FROM file_meta WHERE image_id=?");
+        r.bind(1, m["/p/98765432_p0.png"]);
+        CHECK(r.step() && r.i64(0) == 4 && r.text(1) == "PNG");
+    }
+    // 書き直すと置き換わる。画像を消すと索引からも消える
+    fm.title = "冬の山";
+    storeMeta(db, m["/p/98765432_p0.png"], "/p/98765432_p0.png", fm);
+    CHECK(searchMetaText(db, "空と海").empty());
+    CHECK(searchMetaText(db, "冬の山").size() == 1);
+    removeMissing(db, {"/p"}, {});
+    CHECK(searchMetaText(db, "冬の山").empty());
+    db.close();
+
+    // 版 2 の DB は版 3（全文検索）へ移行する
+    {
+        Db d;
+        CHECK(d.open((dir / "v2.db").string()));
+        d.exec("DROP TRIGGER images_delete_fts; DROP TABLE meta_fts; PRAGMA user_version=2;");
+    }
+    Db d2;
+    CHECK(d2.open((dir / "v2.db").string()));
+    CHECK(d2.schemaVersion() == kSchemaVersion);
+    CHECK(searchMetaText(d2, "abc").empty());
+    fs::remove_all(dir);
 }
 
 static void testMisc() {
@@ -707,6 +885,7 @@ int main() {
     testDb();
     testPack();
     testIndexer();
+    testMeta();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

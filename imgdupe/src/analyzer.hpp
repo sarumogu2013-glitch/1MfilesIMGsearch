@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,7 @@ struct AnalyzerOutput {
     std::vector<TagRow> tags;    // 出どころは解析器の段階の名前
     std::vector<uint8_t> data;   // 解析器ごとの結果（サムネイルの画像など。store で書く）
     int width = 0, height = 0;
+    std::shared_ptr<void> payload;  // 解析器ごとの結果（構造のあるもの）
 };
 
 class Analyzer {

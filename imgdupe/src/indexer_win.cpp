@@ -153,6 +153,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
         return imgwin::encodeThumbnail(widen(path), side, bytes, w, h);
     };
+    cb.readMeta = [](const std::string& path, FileMeta& m) { return imgwin::readFileMeta(widen(path), m); };
     cb.threadInit = [] {
         imgwin::threadBegin();
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
@@ -180,8 +181,8 @@ void runOnce(const std::vector<std::wstring>& roots) {
             wchar_t t[200];
             SYSTEMTIME now;
             GetLocalTime(&now);
-            swprintf(t, 200, L"%02d:%02d に完了（画像 %zu 枚、追加 %zu・削除 %zu、ハッシュ %zu、サムネイル %zu）", now.wHour,
-                     now.wMinute, r.files, r.added, r.removed, r.hashed, r.thumbs);
+            swprintf(t, 200, L"%02d:%02d に完了（画像 %zu 枚、追加 %zu・削除 %zu、ハッシュ %zu、サムネイル %zu、メタデータ %zu）",
+                     now.wHour, now.wMinute, r.files, r.added, r.removed, r.hashed, r.thumbs, r.metas);
             setStatus(&g->lastResult, t);
         }
     } catch (const std::exception& e) {
@@ -274,6 +275,10 @@ std::wstring statusText() {
                 break;
             case IndexPhase::Thumb:
                 swprintf(t, 128, L"サムネイル %llu / %llu", static_cast<unsigned long long>(done),
+                         static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Meta:
+                swprintf(t, 128, L"メタデータ %llu / %llu", static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
                 break;
             default: swprintf(t, 128, L"処理中"); break;

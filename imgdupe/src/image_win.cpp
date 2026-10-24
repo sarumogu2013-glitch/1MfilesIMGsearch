@@ -316,6 +316,181 @@ bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>
     return true;
 }
 
+namespace {
+
+std::string propString(const PROPVARIANT& v) {
+    if (v.vt == VT_LPWSTR && v.pwszVal) return winutil::narrow(v.pwszVal);
+    if (v.vt == VT_BSTR && v.bstrVal) return winutil::narrow(v.bstrVal);
+    if (v.vt == VT_LPSTR && v.pszVal) return v.pszVal;
+    return {};
+}
+
+std::vector<std::string> propStrings(const PROPVARIANT& v) {
+    std::vector<std::string> out;
+    if (v.vt == (VT_VECTOR | VT_LPWSTR)) {
+        for (ULONG i = 0; i < v.calpwstr.cElems; ++i)
+            if (v.calpwstr.pElems[i]) out.push_back(winutil::narrow(v.calpwstr.pElems[i]));
+    } else if (v.vt == (VT_VECTOR | VT_LPSTR)) {
+        for (ULONG i = 0; i < v.calpstr.cElems; ++i)
+            if (v.calpstr.pElems[i]) out.emplace_back(v.calpstr.pElems[i]);
+    } else {
+        // 1 つの文字で「a; b; c」と入っていることもある
+        const std::string s = propString(v);
+        size_t a = 0;
+        while (a < s.size()) {
+            size_t b = s.find(';', a);
+            if (b == std::string::npos) b = s.size();
+            std::string t = s.substr(a, b - a);
+            while (!t.empty() && t.front() == ' ') t.erase(t.begin());
+            while (!t.empty() && t.back() == ' ') t.pop_back();
+            if (!t.empty()) out.push_back(t);
+            a = b + 1;
+        }
+    }
+    return out;
+}
+
+double propNumber(const PROPVARIANT& v) {
+    switch (v.vt) {
+        case VT_R8: return v.dblVal;
+        case VT_R4: return v.fltVal;
+        case VT_UI1: return v.bVal;
+        case VT_UI2: return v.uiVal;
+        case VT_UI4: return v.ulVal;
+        case VT_I2: return v.iVal;
+        case VT_I4: return v.lVal;
+        case VT_UI8: return static_cast<double>(v.uhVal.QuadPart);
+        default: return 0;
+    }
+}
+
+// クエリの名前を順に試し、最初に見つかったものを fn に渡す
+template <class Fn>
+bool query(IWICMetadataQueryReader* q, std::initializer_list<const wchar_t*> names, Fn fn) {
+    for (const wchar_t* name : names) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        bool used = false;
+        if (SUCCEEDED(q->GetMetadataByName(name, &v)) && v.vt != VT_EMPTY) used = fn(v);
+        PropVariantClear(&v);
+        if (used) return true;
+    }
+    return false;
+}
+
+std::string containerName(const GUID& g) {
+    if (IsEqualGUID(g, GUID_ContainerFormatJpeg)) return "JPEG";
+    if (IsEqualGUID(g, GUID_ContainerFormatPng)) return "PNG";
+    if (IsEqualGUID(g, GUID_ContainerFormatGif)) return "GIF";
+    if (IsEqualGUID(g, GUID_ContainerFormatBmp)) return "BMP";
+    if (IsEqualGUID(g, GUID_ContainerFormatTiff)) return "TIFF";
+    if (IsEqualGUID(g, GUID_ContainerFormatWmp)) return "JPEG XR";
+    if (IsEqualGUID(g, GUID_ContainerFormatIco)) return "ICO";
+    // WebP・HEIF は新しい SDK にしか定義が無いので値で比べる
+    static const GUID webp = {0xe094b0e2, 0x67f2, 0x45b3, {0xb0, 0xea, 0x11, 0x53, 0x37, 0xca, 0x7c, 0xf3}};
+    static const GUID heif = {0xe1e62521, 0x6787, 0x405b, {0xa3, 0x39, 0x50, 0x07, 0x15, 0xb5, 0x76, 0x3f}};
+    if (IsEqualGUID(g, webp)) return "WebP";
+    if (IsEqualGUID(g, heif)) return "HEIF";
+    return "";
+}
+
+std::vector<uint8_t> readHead(const std::wstring& path, size_t max) {
+    std::vector<uint8_t> buf;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return buf;
+    buf.resize(max);
+    DWORD n = 0;
+    if (!ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr)) n = 0;
+    buf.resize(n);
+    CloseHandle(h);
+    return buf;
+}
+
+}  // namespace
+
+bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& m) {
+    using imgdupe::fileTimeToUnix;
+    // NTFS: 作成・アクセス日時、属性、ハードリンクの数、ファイル ID（移動・名前変更しても変わらない）
+    {
+        HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        BY_HANDLE_FILE_INFORMATION fi;
+        if (GetFileInformationByHandle(h, &fi)) {
+            auto ft = [](const FILETIME& t) { return (static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+            m.created = fileTimeToUnix(ft(fi.ftCreationTime));
+            m.accessed = fileTimeToUnix(ft(fi.ftLastAccessTime));
+            m.attributes = fi.dwFileAttributes;
+            m.hardlinks = fi.nNumberOfLinks;
+            m.fileId = (static_cast<uint64_t>(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+        }
+        CloseHandle(h);
+    }
+    // 代替データストリーム Zone.Identifier（ブラウザでダウンロードした時の取得元）
+    {
+        const std::vector<uint8_t> z = readHead(path + L":Zone.Identifier", 8192);
+        if (!z.empty()) imgdupe::parseZoneIdentifier(std::string(z.begin(), z.end()), m.zoneUrl, m.zoneReferrer);
+    }
+
+    // JPEG と PNG の EXIF・XMP・テキストは自分で読む（どの環境でも同じに読める）
+    const std::vector<uint8_t> head = readHead(path, 4 * 1024 * 1024);
+    imgdupe::PngInfo pi;
+    if (!imgdupe::parseJpegMeta(head.data(), head.size(), m) && imgdupe::parsePng(head.data(), head.size(), pi))
+        imgdupe::applyPng(pi, m);
+
+    // ほかの形式（TIFF・HEIF など）や、足りない項目は Windows の写真のプロパティで埋める
+    imgdupe::FileMeta w;
+    IWICImagingFactory* wic = factory();
+    Com<IWICBitmapDecoder> dec;
+    if (!wic || FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                      WICDecodeMetadataCacheOnDemand, dec.put())))
+        return true;  // 画像として読めなくても、ファイルの情報はある
+    GUID container{};
+    if (SUCCEEDED(dec->GetContainerFormat(&container))) w.format = containerName(container);
+    UINT frames = 0;
+    if (SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1) w.animated = true;
+    Com<IWICBitmapFrameDecode> frame;
+    if (SUCCEEDED(dec->GetFrame(0, frame.put()))) {
+        WICPixelFormatGUID fmt{};
+        if (SUCCEEDED(frame->GetPixelFormat(&fmt))) w.bitDepth = static_cast<int>(bitsPerPixel(wic, fmt));
+        Com<IWICMetadataQueryReader> q;
+        if (SUCCEEDED(frame->GetMetadataQueryReader(q.put()))) {
+            query(q.get(), {L"System.Photo.DateTaken"}, [&](const PROPVARIANT& v) {
+                if (v.vt != VT_FILETIME) return false;
+                w.taken = fileTimeToUnix((static_cast<uint64_t>(v.filetime.dwHighDateTime) << 32) | v.filetime.dwLowDateTime);
+                return w.taken != 0;
+            });
+            std::string maker, model;
+            query(q.get(), {L"System.Photo.CameraManufacturer"}, [&](const PROPVARIANT& v) { return !(maker = propString(v)).empty(); });
+            query(q.get(), {L"System.Photo.CameraModel"}, [&](const PROPVARIANT& v) { return !(model = propString(v)).empty(); });
+            w.camera = maker.empty() || model.compare(0, maker.size(), maker) == 0 ? model : maker + " " + model;
+            query(q.get(), {L"System.Photo.LensModel"}, [&](const PROPVARIANT& v) { return !(w.lens = propString(v)).empty(); });
+            query(q.get(), {L"System.Photo.FocalLength"}, [&](const PROPVARIANT& v) { return (w.focal = propNumber(v)) > 0; });
+            query(q.get(), {L"System.Photo.ISOSpeed"}, [&](const PROPVARIANT& v) { return (w.iso = static_cast<int>(propNumber(v))) > 0; });
+            w.hasGps = query(q.get(), {L"System.GPS.Latitude"}, [](const PROPVARIANT&) { return true; });
+            query(q.get(), {L"System.ApplicationName"}, [&](const PROPVARIANT& v) { return !(w.software = propString(v)).empty(); });
+            query(q.get(), {L"System.Keywords"}, [&](const PROPVARIANT& v) { return !(w.keywords = propStrings(v)).empty(); });
+            query(q.get(), {L"System.Rating"}, [&](const PROPVARIANT& v) {
+                // 0〜99 → 星 0〜5（Windows と同じ区切り）
+                const int r = static_cast<int>(propNumber(v));
+                w.rating = r <= 0 ? 0 : r < 13 ? 1 : r < 38 ? 2 : r < 63 ? 3 : r < 88 ? 4 : 5;
+                return true;
+            });
+            query(q.get(), {L"System.Title"}, [&](const PROPVARIANT& v) { return !(w.title = propString(v)).empty(); });
+            query(q.get(), {L"System.Subject"}, [&](const PROPVARIANT& v) { return !(w.subject = propString(v)).empty(); });
+            query(q.get(), {L"System.Comment"}, [&](const PROPVARIANT& v) { return !(w.comment = propString(v)).empty(); });
+            query(q.get(), {L"System.Author"}, [&](const PROPVARIANT& v) {
+                for (const auto& a : propStrings(v)) w.author += (w.author.empty() ? "" : "; ") + a;
+                return !w.author.empty();
+            });
+        }
+    }
+    m.bitDepth = w.bitDepth;  // 色深度は WIC の値を使う
+    imgdupe::fillMissing(m, w);
+    return true;
+}
+
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,
                 const std::atomic<bool>& cancel) {
     std::vector<std::wstring> stack{root};

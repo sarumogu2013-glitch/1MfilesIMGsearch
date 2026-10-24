@@ -176,6 +176,14 @@ CREATE TABLE IF NOT EXISTS thumbs(
 );
 )SQL";
 
+// 版 3: タイトル・件名・コメント・キーワード・PNG のテキストの全文検索（trigram なので日本語の部分一致もできる）
+const char* const kSchemaV3 = R"SQL(
+CREATE VIRTUAL TABLE IF NOT EXISTS meta_fts USING fts5(title, subject, comment, keywords, png_text, tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS images_delete_fts AFTER DELETE ON images BEGIN
+    DELETE FROM meta_fts WHERE rowid=old.id;
+END;
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -304,7 +312,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i)
         if (!exec(steps[i])) {

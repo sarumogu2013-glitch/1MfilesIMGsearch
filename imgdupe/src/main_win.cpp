@@ -1641,6 +1641,7 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
         return imgwin::encodeThumbnail(widen(path), side, bytes, w, h);
     };
+    cb.readMeta = [](const std::string& path, FileMeta& m) { return imgwin::readFileMeta(widen(path), m); };
     cb.threadInit = imgwin::threadBegin;
     cb.threadExit = imgwin::threadEnd;
     return cb;
@@ -1668,7 +1669,8 @@ int runIndexCli(int argc, wchar_t** argv) {
     try {
         const IndexReport r = indexOnce(opt, cb, prog, cancel);
         con.print(L"画像 " + withCommas(r.files) + L" 枚（追加 " + withCommas(r.added) + L"・削除 " + withCommas(r.removed) +
-                  L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、失敗 " +
+                  L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、メタデータ " +
+                  withCommas(r.metas) + L" 枚、失敗 " +
                   withCommas(r.failed) + L" 枚");
     } catch (const std::exception& e) {
         con.print(L"エラー: " + widen(e.what()));

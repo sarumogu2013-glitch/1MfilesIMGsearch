@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core.hpp"
+#include "meta.hpp"
 
 namespace imgwin {
 
@@ -25,6 +26,10 @@ HBITMAP thumbFromBytes(const std::vector<uint8_t>& bytes, int box, COLORREF bg);
 
 // パックに入れるサムネイル: 向きを直し、一辺 maxSide 以内に縮めた JPEG
 bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>& jpeg, int& width, int& height);
+
+// メタデータ（形式・EXIF・XMP/IPTC のタグや星・PNG のテキスト・NTFS の情報・ダウンロード元）を読む。
+// ファイルが無ければ false
+bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& out);
 
 // root 以下の画像を out に追加する（リパースポイントのフォルダはたどらない）
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,

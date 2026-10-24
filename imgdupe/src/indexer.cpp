@@ -105,6 +105,17 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
         sr = runStage(db, thumb, opt.threads, cancel, &progress.prog);
         rep.thumbs = sr.processed - sr.failed;
         rep.failed += sr.failed;
+        if (sr.cancelled) {
+            rep.cancelled = true;
+            return rep;
+        }
+    }
+    if (cb.readMeta) {
+        progress.phase = static_cast<int>(IndexPhase::Meta);
+        MetaAnalyzer meta(cb.readMeta, cb.threadInit, cb.threadExit);
+        sr = runStage(db, meta, opt.threads, cancel, &progress.prog);
+        rep.metas = sr.processed - sr.failed;
+        rep.failed += sr.failed;
         rep.cancelled = sr.cancelled;
     }
     progress.phase = static_cast<int>(IndexPhase::Done);

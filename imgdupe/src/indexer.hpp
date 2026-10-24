@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "analyzer.hpp"
+#include "meta.hpp"
 #include "pack.hpp"
 
 namespace imgdupe {
@@ -29,10 +30,12 @@ struct IndexCallbacks {
     std::function<Features(const std::string& path)> decode;
     // サムネイルを作る（JPEG）。失敗したら false
     std::function<bool(const std::string& path, int maxSide, std::vector<uint8_t>& bytes, int& w, int& h)> encodeThumb;
+    // メタデータを読む（無ければ段階 meta は飛ばす）
+    std::function<bool(const std::string& path, FileMeta& out)> readMeta;
     std::function<void()> threadInit, threadExit;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
@@ -40,7 +43,7 @@ struct IndexProgress {
 };
 
 struct IndexReport {
-    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, failed = 0;
+    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, failed = 0;
     bool cancelled = false;
 };
 
@@ -75,7 +78,7 @@ private:
     ThumbPack& pack_;
 };
 
-// 1 回分: 走査 → 登録（消えたものは消す）→ ハッシュ → サムネイル
+// 1 回分: 走査 → 登録（消えたものは消す）→ ハッシュ → サムネイル → メタデータ
 IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexProgress& progress,
                       const std::atomic<bool>& cancel);
 

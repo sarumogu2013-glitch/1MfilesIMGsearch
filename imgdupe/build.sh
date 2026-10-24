@@ -18,7 +18,7 @@ sqlite_obj() {  # $1: C コンパイラ, $2: 出力
   fi
 }
 
-CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/json.cpp src/update_logic.cpp src/commands.cpp"
+CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/json.cpp src/update_logic.cpp src/commands.cpp"
 
 if [ "${1:-}" = "test" ]; then
   sqlite_obj "${CC:-gcc}" out/sqlite3_host.o
