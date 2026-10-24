@@ -147,6 +147,8 @@ int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
 
 // ---------------------------------------------------------------- ツールバー
 
+int stopImage = 0, startImage = 0;  // 検索開始ボタンの絵（検索中は中止の絵にする）
+
 void tbEnable(int id, bool on) { SendMessageW(app.toolbar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0)); }
 
 void tbSetText(int id, const wchar_t* text) {
@@ -498,6 +500,7 @@ void showResult(Result&& r, bool query) {
 void setRunning(bool on) {
     app.running = on;
     tbSetText(IDC_START, on ? L"検索を中止" : L"検索開始");
+    SendMessageW(app.toolbar, TB_CHANGEBITMAP, IDC_START, MAKELPARAM(on ? stopImage : startImage, 0));
     for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat}) EnableWindow(h, !on);
     for (int id : {IDC_ADD, IDC_QUERY}) tbEnable(id, !on);
     tbEnable(IDC_EXPORT, !on && !app.result.groups.empty());
@@ -896,53 +899,120 @@ void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT
     ListView_InsertColumn(lv, i, &c);
 }
 
+bool fontExists(const wchar_t* face) {
+    HDC dc = GetDC(nullptr);
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, face, LF_FACESIZE);
+    bool found = false;
+    EnumFontFamiliesExW(
+        dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int {
+            *reinterpret_cast<bool*>(p) = true;
+            return 0;
+        },
+        reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
+// 記号フォントの文字を、アルファ付きの 32bpp アイコンにする（Massiguraedit と同じ作り）
+HBITMAP makeGlyphIcon(int size, const wchar_t* face, const std::wstring& text, double scale, COLORREF color) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    std::memset(bits, 0, static_cast<size_t>(size) * size * 4);
+    HFONT font = CreateFontW(-static_cast<int>(size * scale), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                             ANTIALIASED_QUALITY, 0, face);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT r{0, 0, size, size};
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+    // 白で描いた明るさをアルファにして、指定色で塗る（乗算済み）
+    auto* px = static_cast<uint8_t*>(bits);
+    for (int i = 0; i < size * size; ++i) {
+        const uint8_t a = std::max(px[i * 4], std::max(px[i * 4 + 1], px[i * 4 + 2]));
+        px[i * 4 + 0] = static_cast<uint8_t>(GetBValue(color) * a / 255);
+        px[i * 4 + 1] = static_cast<uint8_t>(GetGValue(color) * a / 255);
+        px[i * 4 + 2] = static_cast<uint8_t>(GetRValue(color) * a / 255);
+        px[i * 4 + 3] = a;
+    }
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+    SelectObject(dc, oldBmp);
+    DeleteDC(dc);
+    return bmp;
+}
+
+struct ToolButton {
+    int id;
+    wchar_t glyph;         // Segoe Fluent Icons / Segoe MDL2 Assets の文字
+    const wchar_t* text;   // フォントが無い時の代わり
+    const wchar_t* tip;    // ツールチップ
+    bool enabled;
+};
+const ToolButton kToolButtons[] = {
+    {IDC_ADD, 0xE8F4, L"追", L"フォルダを追加", true},
+    {IDC_START, 0xE721, L"検", L"検索開始", true},
+    {IDC_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
+    {IDC_EXPORT, 0xE74E, L"保", L"結果を保存", false},
+    {0, 0, nullptr, nullptr, false},
+    {ID_OPEN, 0xE8E5, L"開", L"開く", false},
+    {ID_EXPLORER, 0xE838, L"場", L"エクスプローラーで表示", false},
+    {ID_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
+    {0, 0, nullptr, nullptr, false},
+    {ID_CHECK_UPDATE, 0xE895, L"更", L"アップデートを確認", true},
+    {ID_HELP, 0xE897, L"?", L"使い方", true},
+};
+
 void createToolbar() {
     app.toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
-                                  WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS | CCS_TOP,
+                                  WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_TOP | CCS_NODIVIDER,
                                   0, 0, 0, 0, app.hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR)),
                                   app.inst, nullptr);
     SendMessageW(app.toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    SendMessageW(app.toolbar, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
-    // Windows に入っている標準の絵（高 DPI では大きい方）
-    const bool large = app.scale >= 1.5;
-    TBADDBITMAP stdBmp{HINST_COMMCTRL, static_cast<UINT_PTR>(large ? IDB_STD_LARGE_COLOR : IDB_STD_SMALL_COLOR)};
-    const int stdBase = static_cast<int>(SendMessageW(app.toolbar, TB_ADDBITMAP, 0, reinterpret_cast<LPARAM>(&stdBmp)));
-    TBADDBITMAP viewBmp{HINST_COMMCTRL, static_cast<UINT_PTR>(large ? IDB_VIEW_LARGE_COLOR : IDB_VIEW_SMALL_COLOR)};
-    const int viewBase = static_cast<int>(SendMessageW(app.toolbar, TB_ADDBITMAP, 0, reinterpret_cast<LPARAM>(&viewBmp)));
 
-    struct Def {
-        int id, image;
-        const wchar_t* text;
-        bool enabled;
+    const int size = px(20);
+    const wchar_t* face = fontExists(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons"
+                          : fontExists(L"Segoe MDL2 Assets") ? L"Segoe MDL2 Assets"
+                                                              : nullptr;
+    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32, 0, 16);
+    auto add = [&](wchar_t glyph, const std::wstring& text) {
+        HBITMAP bmp = (face && glyph) ? makeGlyphIcon(size, face, std::wstring(1, glyph), 0.8, RGB(40, 40, 40))
+                                      : makeGlyphIcon(size, L"MS UI Gothic", text, text.size() > 1 ? 0.5 : 0.75,
+                                                      RGB(40, 40, 40));
+        const int n = ImageList_Add(images, bmp, nullptr);
+        DeleteObject(bmp);
+        return n;
     };
-    const Def defs[] = {
-        {IDC_ADD, stdBase + STD_FILEOPEN, L"フォルダを追加", true},
-        {IDC_START, stdBase + STD_FIND, L"検索開始", true},
-        {IDC_QUERY, stdBase + STD_PRINTPRE, L"1 枚で検索", true},
-        {IDC_EXPORT, stdBase + STD_FILESAVE, L"結果を保存", false},
-        {0, 0, nullptr, false},
-        {ID_OPEN, stdBase + STD_FILENEW, L"開く", false},
-        {ID_EXPLORER, viewBase + VIEW_PARENTFOLDER, L"フォルダを表示", false},
-        {ID_COPY_PATH, stdBase + STD_COPY, L"パスをコピー", false},
-        {0, 0, nullptr, false},
-        {ID_CHECK_UPDATE, stdBase + STD_REDOW, L"アップデート", true},
-        {ID_HELP, stdBase + STD_HELP, L"使い方", true},
-    };
+
+    // 文字はツールチップだけに出す（MIXEDBUTTONS で BTNS_SHOWTEXT を付けなければ、ボタンには絵だけ）
+    SendMessageW(app.toolbar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
     std::vector<TBBUTTON> buttons;
-    for (const Def& d : defs) {
+    for (const ToolButton& d : kToolButtons) {
         TBBUTTON b{};
         if (!d.id) {
             b.fsStyle = BTNS_SEP;
         } else {
-            b.iBitmap = d.image;
+            b.iBitmap = add(d.glyph, d.text);
+            if (d.id == IDC_START) startImage = b.iBitmap;
             b.idCommand = d.id;
             b.fsState = d.enabled ? TBSTATE_ENABLED : 0;
-            b.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT;
-            b.iString = reinterpret_cast<INT_PTR>(d.text);
+            b.fsStyle = BTNS_BUTTON;
+            b.iString = reinterpret_cast<INT_PTR>(d.tip);
         }
         buttons.push_back(b);
     }
-    SendMessageW(app.toolbar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
+    stopImage = add(0xE71A, L"止");
+    SendMessageW(app.toolbar, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
     SendMessageW(app.toolbar, TB_ADDBUTTONSW, buttons.size(), reinterpret_cast<LPARAM>(buttons.data()));
     SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
 }
