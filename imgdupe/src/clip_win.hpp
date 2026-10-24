@@ -1,6 +1,7 @@
 // CLIP を ONNX Runtime で動かす（Windows 専用）。画像側は indexer の段階 clip、言葉側は画面の「内容」の検索で使う。
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -17,6 +18,12 @@ std::wstring vectorPath(const std::wstring& dataDir);  // <dataDir>\vectors_clip
 // 段階 clip の前に呼ぶ: ベクトルのファイルの版が今のモデルと違う（無い）なら、段階 clip の記録を消してやり直させる。
 // 古いレコードや消えた画像が多ければ、ファイルを作り直す
 void prepare(const std::wstring& dataDir, imgdupe::Db& db);
+
+// 段階 clip の後に呼ぶ: 近似最近傍の索引（ann_clip.hnsw）に新しい画像を足し、変わっていれば差分グループを作り直す。
+// 似ている度合いの下限は imgdupe.ini の [imgdupe] variantSimilarity（既定 0.92）
+void updateVariants(const std::wstring& dataDir, imgdupe::Db& db, unsigned threads, const std::atomic<bool>& cancel,
+                    imgdupe::Progress* progress);
+double variantSimilarity(const std::wstring& dataDir);
 
 struct LoadResult {
     std::shared_ptr<imgdupe::Analyzer> analyzer;

@@ -162,6 +162,12 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
                 rep.cancelled = sr.cancelled;
             }
         }
+        // 差分グループ（索引に新しい画像を足し、変わっていれば作り直す）
+        if (!rep.cancelled && cb.afterClip) {
+            progress.phase = static_cast<int>(IndexPhase::Variants);
+            cb.afterClip(db, opt.threads, cancel, &progress.prog);
+            rep.cancelled = cancel.load();
+        }
     }
     progress.phase = static_cast<int>(IndexPhase::Done);
     return rep;

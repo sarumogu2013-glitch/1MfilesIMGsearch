@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <unordered_set>
 
+#include "ann.hpp"
 #include "image_win.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
@@ -172,6 +173,48 @@ void prepare(const std::wstring& dataDir, imgdupe::Db& db) {
         idx.close();
         imgdupe::compactVectors(path, [&](int64_t id) { return live.count(id) != 0; });  // 開いている画面があれば失敗する（次の回に）
     }
+}
+
+double variantSimilarity(const std::wstring& dataDir) {
+    wchar_t buf[32] = L"";
+    GetPrivateProfileStringW(L"imgdupe", L"variantSimilarity", L"", buf, 32, (dataDir + L"\\imgdupe.ini").c_str());
+    const double v = buf[0] ? _wtof(buf) : imgdupe::kDefaultVariantSimilarity;
+    return v >= 0.5 && v <= 0.999 ? v : imgdupe::kDefaultVariantSimilarity;
+}
+
+void updateVariants(const std::wstring& dataDir, imgdupe::Db& db, unsigned threads, const std::atomic<bool>& cancel,
+                    imgdupe::Progress* progress) {
+    const Files f = findFiles(dataDir);
+    if (!f.ok || !enabled(dataDir)) return;
+    imgdupe::VectorIndex vecs;
+    if (!vecs.load(narrow(vectorPath(dataDir))) || vecs.version() != f.version) return;
+    std::unordered_set<int64_t> live;
+    {
+        imgdupe::Stmt st(db.handle(), "SELECT id FROM images");
+        while (st.step()) live.insert(st.i64(0));
+    }
+    // 前回から何も変わっていなければ（ベクトルの数・画像の数・下限）、大きな索引を読まずに終える
+    const double sim = variantSimilarity(dataDir);
+    char input[96];
+    snprintf(input, sizeof input, "%zu|%zu|%zu|%.3f", vecs.records(), vecs.size(), live.size(), sim);
+    if (db.setting("variants:input") == input) return;
+    imgdupe::AnnIndex ann;
+    ann.open(narrow(dataDir + L"\\ann_clip.hnsw"), vecs.dim(), f.version);
+    const bool changed = ann.sync(vecs, [&](int64_t id) { return live.count(id) != 0; }, threads, cancel, progress);
+    if (changed) ann.save();  // 途中で止めても、足した分は残す
+    if (cancel) return;
+    // 索引が変わったか、下限の設定が変わった時だけ作り直す
+    char key[64];
+    snprintf(key, sizeof key, "%zu|%.3f", ann.size(), sim);
+    if (!changed && db.setting("variants:last") == key) {
+        db.setSetting("variants:input", input);
+        return;
+    }
+    const auto groups = imgdupe::variantGroups(ann, vecs, sim, 10, threads, cancel, progress);
+    if (cancel) return;
+    imgdupe::replaceVariantGroups(db, groups);
+    db.setSetting("variants:last", key);
+    db.setSetting("variants:input", input);
 }
 
 LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::function<void()> threadInit, std::function<void()> threadExit) {

@@ -107,7 +107,10 @@ size_t removeMissing(Db& db, const std::vector<std::string>& roots, const std::u
 
 // 重複のまとまりを置き換える（kind が完全一致・見た目一致のものを全部消して入れ直す）
 void replaceDuplicateGroups(Db& db, const Result& r, const std::vector<int64_t>& imageIdOfFile);
-const char* groupKindName(Kind k);  // "exact" / "similar" / "query"
+const char* groupKindName(Kind k);  // "exact" / "similar" / "query" / "variant"
+// DB の差分グループ（CLIP）のうち、r.files にある画像を 2 枚以上含むものを r.groups の後ろに足す（前に足した分は入れ替え）。
+// 同じ重複のグループの中だけで閉じているものは足さない
+void appendVariantGroups(Db& db, Result& r);
 
 // ---------------------------------------------------------------- タグ（tags）
 

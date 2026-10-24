@@ -184,6 +184,9 @@ void runOnce(const std::vector<std::wstring>& roots) {
     };
     cb.clipVersion = [] { return clip::stageVersion(g->dataDir); };
     cb.prepareClip = [](Db& db) { clip::prepare(g->dataDir, db); };
+    cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
+        clip::updateVariants(g->dataDir, db, threads, cancel, p);
+    };
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
         error = narrow(r.error);
@@ -316,6 +319,9 @@ std::wstring statusText() {
             case IndexPhase::Clip:
                 swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Variants:
+                swprintf(t, 128, L"差分グループ %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
                 break;
             case IndexPhase::Tagger:
                 swprintf(t, 128, L"タグ付け（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),

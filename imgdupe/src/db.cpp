@@ -548,8 +548,48 @@ const char* groupKindName(Kind k) {
         case Kind::Exact: return "exact";
         case Kind::Similar: return "similar";
         case Kind::Query: return "query";
+        case Kind::Variant: return "variant";
     }
     return "";
+}
+
+void appendVariantGroups(Db& db, Result& r) {
+    r.groups.erase(std::remove_if(r.groups.begin(), r.groups.end(), [](const Group& g) { return g.kind == Kind::Variant; }),
+                   r.groups.end());
+    std::unordered_map<int64_t, uint32_t> fileOf;  // 画像 ID → files の添字
+    for (size_t i = 0; i < r.ids.size(); ++i)
+        if (r.ids[i]) fileOf[r.ids[i]] = static_cast<uint32_t>(i);
+    std::vector<int> dupOf(r.files.size(), -1);  // 重複のグループ（同じ重複のグループの中だけの差分は出さない）
+    for (size_t g = 0; g < r.groups.size(); ++g)
+        for (const auto& m : r.groups[g].members) dupOf[m.index] = static_cast<int>(g);
+    Stmt st(db.handle(), "SELECT m.group_id, m.image_id FROM group_members m JOIN groups g ON g.id=m.group_id "
+                         "WHERE g.kind='variant' ORDER BY m.group_id");
+    int64_t current = -1;
+    Group grp;
+    auto flush = [&] {
+        if (grp.members.size() >= 2) {
+            const int first = dupOf[grp.members[0].index];
+            bool sameDup = first >= 0;
+            for (const auto& m : grp.members) sameDup &= dupOf[m.index] == first;
+            if (!sameDup) {
+                for (const auto& m : grp.members) grp.totalSize += r.files[m.index].size;
+                r.groups.push_back(grp);
+            }
+        }
+        grp = Group{};
+        grp.kind = Kind::Variant;
+    };
+    grp.kind = Kind::Variant;
+    while (st.step()) {
+        const int64_t gid = st.i64(0);
+        if (gid != current) {
+            flush();
+            current = gid;
+        }
+        auto it = fileOf.find(st.i64(1));
+        if (it != fileOf.end()) grp.members.push_back({it->second, 0});  // 今回のフォルダにある画像だけ
+    }
+    flush();
 }
 
 void replaceDuplicateGroups(Db& db, const Result& r, const std::vector<int64_t>& imageIdOfFile) {
@@ -560,7 +600,7 @@ void replaceDuplicateGroups(Db& db, const Result& r, const std::vector<int64_t>&
         Stmt m(db.handle(), "INSERT INTO group_members(group_id,image_id,representative,distance) VALUES(?,?,?,?)");
         const int64_t now = nowUnix();
         for (const auto& grp : r.groups) {
-            if (grp.kind == Kind::Query) continue;
+            if (grp.kind == Kind::Query || grp.kind == Kind::Variant) continue;
             g.bind(1, std::string(groupKindName(grp.kind))).bind(2, now);
             g.step();
             g.reset();

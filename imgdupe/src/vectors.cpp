@@ -186,6 +186,11 @@ void VectorIndex::close() {
 
 const uint16_t* VectorIndex::vec(size_t i) const { return reinterpret_cast<const uint16_t*>(map_.data() + offsets_[i] + 8); }
 
+const uint16_t* VectorIndex::raw(int64_t id) const {
+    auto it = pos_.find(id);
+    return it == pos_.end() ? nullptr : vec(it->second);
+}
+
 bool VectorIndex::get(int64_t id, std::vector<float>& out) const {
     auto it = pos_.find(id);
     if (it == pos_.end()) return false;

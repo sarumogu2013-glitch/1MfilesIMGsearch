@@ -905,6 +905,7 @@ std::string kindName(Kind k) {
         case Kind::Exact: return "完全一致";
         case Kind::Similar: return "見た目一致";
         case Kind::Query: return "検索結果";
+        case Kind::Variant: return "差分（AI）";
     }
     return "";
 }

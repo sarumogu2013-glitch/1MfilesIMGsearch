@@ -49,6 +49,7 @@ public:
     size_t records() const { return records_; }     // ファイルの中のレコードの数（作り直しの目安）
     bool has(int64_t id) const { return pos_.count(id) != 0; }
     const std::vector<int64_t>& ids() const { return ids_; }  // 最初に出てきた順
+    const uint16_t* raw(int64_t id) const;  // fp16 のまま（無ければ nullptr）。並びはそろっていないことがある
     bool get(int64_t id, std::vector<float>& out) const;
     // q（長さ 1）と内積の大きい順に k 個。accept が false を返す画像は除く
     std::vector<std::pair<int64_t, float>> topK(const float* q, size_t k, const std::function<bool(int64_t)>& accept = {},

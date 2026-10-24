@@ -41,9 +41,11 @@ struct IndexCallbacks {
     std::function<int()> clipVersion;
     std::function<void(Db&)> prepareClip;
     std::function<std::shared_ptr<Analyzer>(std::string& error)> makeClip;
+    // CLIP の後（差分グループ）
+    std::function<void(Db&, unsigned threads, const std::atomic<bool>& cancel, Progress*)> afterClip;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};

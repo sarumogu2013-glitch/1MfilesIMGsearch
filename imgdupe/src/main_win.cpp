@@ -36,6 +36,7 @@
 #include "indexer_win.hpp"
 #include "install_win.hpp"
 #include "keymap_win.hpp"
+#include "ann.hpp"
 #include "clip_win.hpp"
 #include "tagger_win.hpp"
 #include "models_win.hpp"
@@ -77,6 +78,7 @@ enum : int {
     IDC_THRESHOLD_LABEL,
     IDC_EXACT,
     IDC_FLAT,
+    IDC_VARIANTS,
     IDC_PROGRESS,
     IDC_STATUS,
     IDC_GROUPS,
@@ -152,7 +154,7 @@ struct App {
     HINSTANCE inst = nullptr;
     HWND hwnd = nullptr;
     HWND folders = nullptr, add = nullptr, remove = nullptr, foldersLabel = nullptr;
-    HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr;
+    HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr, variants = nullptr;
     HWND toolbar = nullptr;
     HWND progress = nullptr, status = nullptr;
     HWND groups = nullptr, thumbs = nullptr, info = nullptr;
@@ -216,6 +218,7 @@ struct App {
     Result result;
     std::vector<std::string> resultRoots;  // result.files を作った時のフォルダ
     bool haveFiles = false;
+    bool resultIsQuery = false;  // 1 枚で検索した結果を出している
     int curGroup = -1;
 
     // サムネイル
@@ -313,6 +316,7 @@ void saveSettings() {
     iniSet(L"threshold", std::to_wstring(SendMessageW(app.threshold, TBM_GETPOS, 0, 0)));
     iniSet(L"exactOnly", Button_GetCheck(app.exact) == BST_CHECKED ? L"1" : L"0");
     iniSet(L"includeFlat", Button_GetCheck(app.flat) == BST_CHECKED ? L"1" : L"0");
+    iniSet(L"showVariants", Button_GetCheck(app.variants) == BST_CHECKED ? L"1" : L"0");
     WINDOWPLACEMENT wp{sizeof(wp)};
     if (GetWindowPlacement(app.hwnd, &wp)) {
         const RECT& r = wp.rcNormalPosition;
@@ -595,8 +599,25 @@ int64_t memberImageId(int item) {
 
 // ---------------------------------------------------------------- 結果の表示
 
+Db* uiDb();
+
 void showResult(Result&& r, bool query) {
     app.result = std::move(r);
+    app.resultIsQuery = query;
+    // 差分（CLIP）のグループを DB から足す（重複の後ろ）。外していれば取り除く
+    if (!query) {
+        if (Button_GetCheck(app.variants) == BST_CHECKED) {
+            if (Db* db = uiDb()) {
+                try {
+                    appendVariantGroups(*db, app.result);
+                } catch (const std::exception&) {
+                }
+            }
+        } else {
+            auto& gs = app.result.groups;
+            gs.erase(std::remove_if(gs.begin(), gs.end(), [](const Group& g) { return g.kind == Kind::Variant; }), gs.end());
+        }
+    }
     ListView_SetItemCountEx(app.groups, static_cast<int>(app.result.groups.size()), 0);
     InvalidateRect(app.groups, nullptr, TRUE);
     selectGroup(-1);
@@ -611,12 +632,13 @@ void showResult(Result&& r, bool query) {
         const size_t hits = app.result.groups.empty() ? 0 : app.result.groups[0].members.size();
         s = L"似た画像 " + withCommas(hits) + L" 枚（" + withCommas(app.result.files.size()) + L" 枚の中から）";
     } else {
-        size_t exact = 0, similar = 0;
-        for (const auto& g : app.result.groups) (g.kind == Kind::Exact ? exact : similar)++;
+        size_t exact = 0, similar = 0, variant = 0;
+        for (const auto& g : app.result.groups) (g.kind == Kind::Exact ? exact : g.kind == Kind::Variant ? variant : similar)++;
         uint64_t reclaim = 0;
         for (const auto& g : app.result.groups) reclaim += g.reclaim;
         s = L"画像 " + withCommas(app.result.files.size()) + L" 枚: 完全一致 " + withCommas(exact) + L" グループ・見た目一致 " +
-            withCommas(similar) + L" グループ（重複を消せば約 " + sizeText(reclaim) + L" 空きます）";
+            withCommas(similar) + L" グループ" + (variant ? L"・差分（AI） " + withCommas(variant) + L" グループ" : L"") +
+            L"（重複を消せば約 " + sizeText(reclaim) + L" 空きます）";
         wchar_t t[96];
         if (app.result.hashed)
             swprintf(t, 96, L"　新しく読み込んだ画像 %llu 枚（%.0f 秒）", static_cast<unsigned long long>(app.result.hashed),
@@ -636,7 +658,7 @@ void setRunning(bool on) {
     app.running = on;
     tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"検索開始");
     SendMessageW(app.toolbar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
-    for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat}) EnableWindow(h, !on);
+    for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat, app.variants}) EnableWindow(h, !on);
     for (int id : {CMD_ADD_FOLDER, CMD_QUERY}) tbEnable(id, !on);
     tbEnable(CMD_EXPORT, !on && !app.result.groups.empty());
     SendMessageW(app.progress, PBM_SETPOS, 0, 0);
@@ -2129,12 +2151,13 @@ void undoTagEdit() {
 // ---------------------------------------------------------------- 設定の画面（imgdupe.ini と同じ内容を画面から変える）
 
 struct SettingsWindow {
-    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr;
+    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
+         variantSim = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2155,6 +2178,11 @@ void applySettings() {
     iniSet(L"taggerEnabled", std::to_wstring(tagger));
     iniSet(L"clipEnabled", std::to_wstring(clipOn));
     iniSet(L"taggerCpu", std::to_wstring(cpu));
+    // 差分とみなす似ている度合い（0.80〜0.99。外れていたら既定に戻す）
+    const double sim = _wtof(editText(w.variantSim).c_str());
+    wchar_t v[16];
+    swprintf(v, 16, L"%.2f", sim >= 0.8 && sim <= 0.99 ? sim : kDefaultVariantSimilarity);
+    iniSet(L"variantSimilarity", v);
     if (changed) restartIndexerAfterUpdate();  // 動いているバックグラウンドの解析に新しい設定を使わせる
 }
 
@@ -2206,7 +2234,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(520), ch = px(416), m = px(12);
+    const int cw = px(560), ch = px(440), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2236,15 +2264,19 @@ void showSettingsWindow() {
                          in, gy, iw, rowH);
     gy = group(L"バックグラウンドの解析", px(52));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
-    gy = group(L"AI 解析", px(150));
+    gy = group(L"AI 解析", px(174));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
     w.clip = child(WC_BUTTONW, L"CLIP で画像の内容を調べる（似た画像を探す・言葉で探す）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_CLIP,
                    in, gy + rowH + px(2), iw, rowH);
+    child(WC_STATICW, L"差分とみなす似ている度合い（0.80〜0.99。大きいほど厳しい）", SS_NOPREFIX, -1, in + px(18),
+          gy + 2 * (rowH + px(2)) + px(4), iw - px(90), rowH);
+    w.variantSim = child(WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, IDC_ST_VARIANT, in + iw - px(60),
+                         gy + 2 * (rowH + px(2)), px(60), rowH);
     w.gpu = child(WC_BUTTONW, L"GPU（DirectML）を使う（調子が悪い時は外すと CPU だけで動きます）", WS_TABSTOP | BS_AUTOCHECKBOX,
-                  IDC_ST_GPU, in, gy + 2 * (rowH + px(2)), iw, rowH);
-    w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 3 * (rowH + px(2)) + px(6), iw - px(150), px(36));
-    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 3 * (rowH + px(2)) + px(4), px(140), bh);
+                  IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
+    w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
+    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
@@ -2258,6 +2290,11 @@ void showSettingsWindow() {
     Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.clip, iniInt(L"clipEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
+    setText(w.variantSim, [&] {
+        wchar_t v[16];
+        swprintf(v, 16, L"%.2f", clip::variantSimilarity(app.dataDir));
+        return std::wstring(v);
+    }());
     Button_SetCheck(w.gpu, iniInt(L"taggerCpu", 0) ? BST_UNCHECKED : BST_CHECKED);
     EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED || Button_GetCheck(w.clip) == BST_CHECKED);
     {
@@ -2713,6 +2750,8 @@ void layout() {
     MoveWindow(app.exact, x, y + px(2), px(110), rowH, TRUE);
     x += px(114);
     MoveWindow(app.flat, x, y + px(2), px(200), rowH, TRUE);
+    x += px(204);
+    MoveWindow(app.variants, x, y + px(2), px(220), rowH, TRUE);
     y += rowH + px(10);
 
     MoveWindow(app.progress, m, y + px(3), px(220), px(16), TRUE);
@@ -2883,6 +2922,7 @@ void createControls() {
     app.thresholdLabel = makeControl(WC_STATICW, L"", 0, IDC_THRESHOLD_LABEL);
     app.exact = makeControl(WC_BUTTONW, L"完全一致だけ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_EXACT);
     app.flat = makeControl(WC_BUTTONW, L"単色に近い画像も比べる", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_FLAT);
+    app.variants = makeControl(WC_BUTTONW, L"差分（AI）も出す", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_VARIANTS);
     app.progress = makeControl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
     SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     app.status = makeControl(WC_STATICW, L"フォルダを追加して「検索開始」を押してください。", SS_ENDELLIPSIS | SS_NOPREFIX,
@@ -2908,7 +2948,7 @@ void createControls() {
 
     app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);  // 4 行まで（省略の指定をすると 1 行になる）
     app.dupPage = {app.foldersLabel, app.folders, app.add,      app.remove,   app.thresholdCaption, app.threshold,
-                   app.thresholdLabel, app.exact, app.flat,     app.progress, app.status,           app.groups,
+                   app.thresholdLabel, app.exact, app.flat, app.variants,     app.progress, app.status,           app.groups,
                    app.thumbs};
     createSearchControls();
 }
@@ -2962,8 +3002,10 @@ LRESULT onNotify(NMHDR* nm) {
                 uint8_t dist = 0;
                 const Entry* e = memberEntry(i, &dist);
                 if (!e) break;
+                const Group* cg = currentGroup();
+                const bool variant = cg && cg->kind == Kind::Variant;  // 差分は見た目の距離を持たない
                 if (di->item.mask & LVIF_TEXT)
-                    copyOut(di->item, L"距離" + std::to_wstring(dist) + L"  " + sizeText(e->size) + L"  " +
+                    copyOut(di->item, (variant ? std::wstring() : L"距離" + std::to_wstring(dist) + L"  ") + sizeText(e->size) + L"  " +
                                           std::to_wstring(e->f.width) + L"×" + std::to_wstring(e->f.height) + L"  " +
                                           fileName(e->path));
                 if (di->item.mask & LVIF_IMAGE) di->item.iImage = thumbImage(kDupView, i, widen(e->path), memberImageId(i));
@@ -3251,6 +3293,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_EXACT:
                 case IDC_FLAT:
                     syncMenuChecks();
+                    break;
+                case IDC_VARIANTS:
+                    // 出している結果に、差分のグループを足す・外す
+                    if (!app.running && app.haveFiles && !app.resultIsQuery) {
+                        Result r = std::move(app.result);
+                        showResult(std::move(r), false);
+                    }
                     break;
                 case CMD_THRESHOLD_DOWN:
                 case CMD_THRESHOLD_UP: {
@@ -3566,6 +3615,9 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
         error = narrow(r.error);
         return r.analyzer;
     };
+    cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
+        clip::updateVariants(app.dataDir, db, threads, cancel, p);
+    };
     return cb;
 }
 
@@ -3743,6 +3795,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     setText(app.thresholdLabel, thresholdText(t));
     Button_SetCheck(app.exact, iniInt(L"exactOnly", 0) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(app.flat, iniInt(L"includeFlat", 0) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.variants, iniInt(L"showVariants", 1) ? BST_CHECKED : BST_UNCHECKED);
     wchar_t win[128];
     GetPrivateProfileStringW(L"imgdupe", L"window", L"", win, 128, iniPath().c_str());
     int l, tp, r, b, maxed = 0;

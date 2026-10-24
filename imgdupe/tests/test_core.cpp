@@ -20,6 +20,7 @@
 #include "tagger.hpp"
 #include "vectors.hpp"
 #include "clip.hpp"
+#include "ann.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1569,6 +1570,102 @@ static void testClip() {
     fs::remove_all(dir);
 }
 
+static void testAnn() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-ann-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string vpath = (dir / "v.bin").string(), apath = (dir / "a.hnsw").string();
+    // 20 個の「元の絵」と、それぞれの少しだけ違う版（差分）を 2 つずつ。元の絵どうしは遠い
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0, 1);
+    const uint32_t dim = 32;
+    std::vector<std::vector<float>> base(20);
+    {
+        VectorWriter w;
+        CHECK(w.open(vpath, dim, "m1"));
+        int64_t id = 1;
+        for (int b = 0; b < 20; ++b) {
+            base[b].resize(dim);
+            for (auto& x : base[b]) x = nd(rng);
+            for (int v = 0; v < 3; ++v) {
+                std::vector<float> x = base[b];
+                if (v)
+                    for (auto& e : x) e += 0.15f * nd(rng);
+                normalizeVector(x);
+                w.append(id++, x.data());
+            }
+        }
+    }
+    VectorIndex vecs;
+    CHECK(vecs.load(vpath) && vecs.size() == 60);
+    std::atomic<bool> cancel{false};
+    {
+        AnnIndex ann;
+        CHECK(ann.open(apath, dim, "m1") && ann.size() == 0);
+        CHECK(ann.sync(vecs, [](int64_t) { return true; }, 2, cancel) && ann.size() == 60);
+        // 近い順の 1 つ目は自分、次は同じ元の絵の差分
+        auto nn = ann.knn(vecs.raw(4), 3);
+        CHECK(nn.size() == 3 && nn[0].first == 4 && std::abs(nn[0].second - 1) < 1e-2 && (nn[1].first == 5 || nn[1].first == 6));
+        auto groups = variantGroups(ann, vecs, 0.8, 5, 2, cancel);
+        CHECK(groups.size() == 20);
+        CHECK((groups[1] == std::vector<int64_t>{4, 5, 6}));
+        CHECK(ann.save());
+    }
+    {
+        AnnIndex ann;
+        CHECK(ann.open(apath, dim, "m1") && ann.size() == 60);  // 保存したものを読む
+        CHECK(!ann.sync(vecs, [](int64_t) { return true; }, 1, cancel));  // 変わらない
+        CHECK(ann.sync(vecs, [](int64_t id) { return id != 5; }, 1, cancel) && ann.size() == 59 && !ann.has(5));  // 消えた画像
+        auto groups = variantGroups(ann, vecs, 0.8, 5, 1, cancel);
+        CHECK(groups.size() == 20 && (groups[1] == std::vector<int64_t>{4, 6}));
+        CHECK(variantGroups(ann, vecs, 0.9999, 5, 1, cancel).empty());  // 厳しくすればまとまらない
+    }
+    {
+        AnnIndex ann;
+        CHECK(ann.open(apath, dim, "m2") && ann.size() == 0);  // 版が違えば作り直す
+    }
+    // DB に入れる
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 6; ++i) files.push_back({"/x/" + std::to_string(i) + ".png", 1, i});
+    auto ids = upsertScanned(db, files);
+    replaceVariantGroups(db, {{ids["/x/1.png"], ids["/x/2.png"]}, {ids["/x/4.png"], ids["/x/5.png"], ids["/x/6.png"]}});
+    replaceVariantGroups(db, {{ids["/x/1.png"], ids["/x/3.png"]}});  // 入れ替え
+    {
+        Stmt st(db.handle(), "SELECT COUNT(*) FROM groups WHERE kind='variant'");
+        CHECK(st.step() && st.i64(0) == 1);
+        Stmt m(db.handle(), "SELECT COUNT(*) FROM group_members m JOIN groups g ON g.id=m.group_id WHERE g.kind='variant'");
+        CHECK(m.step() && m.i64(0) == 2);
+    }
+    // 重複の結果に差分を足す: 今回のフォルダにある画像だけ、同じ重複のグループの中だけのものは出さない
+    {
+        const int64_t other = upsertScanned(db, {{"/elsewhere/9.png", 1, 9}})["/elsewhere/9.png"];  // 今回のフォルダの外
+        replaceVariantGroups(db, {{ids["/x/1.png"], ids["/x/2.png"], other},
+                                  {ids["/x/3.png"], ids["/x/4.png"]},
+                                  {ids["/x/5.png"], ids["/x/6.png"]}});
+        Result r;
+        for (int i2 = 1; i2 <= 6; ++i2) {
+            Entry e;
+            e.path = "/x/" + std::to_string(i2) + ".png";
+            e.size = 100;
+            r.files.push_back(e);
+            r.ids.push_back(ids[e.path]);
+        }
+        Group dup;
+        dup.kind = Kind::Exact;
+        dup.members = {{4, 0}, {5, 0}};  // 5.png と 6.png は完全一致
+        r.groups.push_back(dup);
+        appendVariantGroups(db, r);
+        CHECK(r.groups.size() == 3 && r.groups[1].kind == Kind::Variant && r.groups[1].members.size() == 2);
+        CHECK(r.groups[2].members.size() == 2 && r.files[r.groups[2].members[0].index].path == "/x/3.png");
+        appendVariantGroups(db, r);  // 2 回目は入れ替え
+        CHECK(r.groups.size() == 3);
+    }
+    vecs.close();
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1608,6 +1705,7 @@ int main() {
     testTagger();
     testVectors();
     testClip();
+    testAnn();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

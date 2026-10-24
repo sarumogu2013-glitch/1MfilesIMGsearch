@@ -132,7 +132,7 @@ struct Progress {
     std::atomic<uint64_t> total{0};
 };
 
-enum class Kind { Exact, Similar, Query };
+enum class Kind { Exact, Similar, Query, Variant };  // Variant: 差分（CLIP。DB から足す）
 
 struct Member {
     uint32_t index;  // Result::files の添字
