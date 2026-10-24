@@ -763,9 +763,17 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
         startDownload(kManual, r.info);
 }
 
+// 更新した後、動いているバックグラウンドの解析を新しい版で起動し直す
+void restartIndexerAfterUpdate() {
+    if (!indexer::isRunning()) return;
+    indexer::requestQuit(app.dataDir);
+    indexer::start(true);  // 新しい版は、古い版が終わるのを待ってから始まる
+}
+
 void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
     app.updating = false;
     tbEnable(CMD_CHECK_UPDATE, true);
+    if (r.ok) restartIndexerAfterUpdate();
     if (mode == kOnExit) {
         if (!r.ok)
             MessageBoxW(nullptr, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
@@ -1680,8 +1688,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--indexer") == 0) {
+        const bool waitForOld = argc >= 3 && lstrcmpiW(argv[2], L"--restart") == 0;
         LocalFree(argv);
-        const int code = indexer::runResident(inst, app.dataDir);
+        const int code = indexer::runResident(inst, app.dataDir, waitForOld);
         CoUninitialize();
         return code;
     }

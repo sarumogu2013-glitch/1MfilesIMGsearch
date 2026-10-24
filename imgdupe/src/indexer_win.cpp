@@ -367,12 +367,17 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-int runResident(HINSTANCE inst, const std::wstring& dataDir) {
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
+    HANDLE mutex = nullptr;
+    // 起動し直しの時は、古い版が終わるまで最大 60 秒待つ
+    for (int i = 0; i < (waitForOld ? 60 : 1); ++i) {
+        mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+        if (mutex && GetLastError() != ERROR_ALREADY_EXISTS) break;
         if (mutex) CloseHandle(mutex);
-        return 0;  // もう動いている
+        mutex = nullptr;
+        if (waitForOld) Sleep(1000);
     }
+    if (!mutex) return 0;  // もう動いている
     Resident r;
     g = &r;
     r.inst = inst;
@@ -419,9 +424,9 @@ bool isRunning() {
     return true;
 }
 
-bool start() {
-    if (isRunning()) return true;
-    std::wstring cmd = L"\"" + exePath() + L"\" --indexer";
+bool start(bool restart) {
+    if (!restart && isRunning()) return true;
+    std::wstring cmd = L"\"" + exePath() + L"\" --indexer" + (restart ? L" --restart" : L"");
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return false;

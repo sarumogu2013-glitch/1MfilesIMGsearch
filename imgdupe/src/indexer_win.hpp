@@ -9,14 +9,15 @@
 
 namespace indexer {
 
-// 常駐を始める（すでに動いていれば何もせず 0）。dataDir: DB とパックの場所
-int runResident(HINSTANCE inst, const std::wstring& dataDir);
+// 常駐を始める（すでに動いていれば何もせず 0）。dataDir: DB とパックの場所。
+// waitForOld: 古い版が終わるのを少し待つ（アップデートの後に起動し直す時）
+int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld = false);
 
 // 動いているか（同じユーザーの別のプロセスを含む）
 bool isRunning();
 
-// GUI から: 起動する（--indexer で自分を起動）
-bool start();
+// GUI から: 起動する（--indexer で自分を起動）。restart: 動いている古い版が終わるのを待ってから始める
+bool start(bool restart = false);
 // GUI から: 終わるよう頼む（commands に "quit" を入れる）
 void requestQuit(const std::wstring& dataDir);
 // GUI から: 今すぐ調べ直すよう頼む
