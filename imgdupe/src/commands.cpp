@@ -48,6 +48,8 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_EXPLORER, "ShowInExplorer", L"エクスプローラーで表示(&E)", "Ctrl+E"},
     {CMD_COPY_PATH, "CopyPath", L"パスをコピー(&C)", "Ctrl+C"},
     {CMD_KEY_SETTINGS, "KeySettings", L"ショートカットキーの設定(&K)...", "Ctrl+K"},
+    {CMD_INDEXER_TOGGLE, "Indexer", L"バックグラウンドの解析を始める(&B)", ""},
+    {CMD_INDEXER_AUTOSTART, "IndexerAutoStart", L"Windows と一緒にバックグラウンドの解析を始める(&W)", ""},
     {CMD_CHECK_UPDATE, "CheckUpdate", L"アップデートを確認(&U)", ""},
     {CMD_RELEASES, "Releases", L"最新版のページを開く(&R)", ""},
     {CMD_HELP, "Help", L"使い方(&H)", "F1"},

@@ -498,6 +498,16 @@ static void testDb() {
         CHECK(st.step() && st.i64(0) == 0);
     }
 
+    // GUI と indexer のやりとり
+    setRoots(db, {"D:\\写真", "E:\\Backup"});
+    CHECK((getRoots(db) == std::vector<std::string>{"D:\\写真", "E:\\Backup"}));
+    setRoots(db, {});
+    CHECK(getRoots(db).empty());
+    addCommand(db, "rescan");
+    addCommand(db, "quit");
+    CHECK((takeCommands(db) == std::vector<std::string>{"rescan", "quit"}));
+    CHECK(takeCommands(db).empty());
+
     // 前の版のキャッシュの取り込み
     Cache c;
     Entry e;

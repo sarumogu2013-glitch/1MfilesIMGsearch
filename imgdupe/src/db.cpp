@@ -608,6 +608,51 @@ std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version
     return out;
 }
 
+// ---------------------------------------------------------------- GUI と indexer のやりとり
+
+void setRoots(Db& db, const std::vector<std::string>& roots) {
+    std::string joined;
+    for (const auto& r : roots) joined += r + "\n";
+    db.setSetting("roots", joined);
+}
+
+std::vector<std::string> getRoots(Db& db) {
+    std::vector<std::string> out;
+    const std::string s = db.setting("roots");
+    size_t a = 0;
+    while (a < s.size()) {
+        size_t b = s.find('\n', a);
+        if (b == std::string::npos) b = s.size();
+        if (b > a) out.push_back(s.substr(a, b - a));
+        a = b + 1;
+    }
+    return out;
+}
+
+void addCommand(Db& db, const std::string& command, const std::string& target) {
+    Stmt st(db.handle(), "INSERT INTO commands(command,target,state,created) VALUES(?,?,'pending',?)");
+    st.bind(1, command).bind(2, target).bind(3, nowUnix());
+    st.step();
+}
+
+std::vector<std::string> takeCommands(Db& db) {
+    std::vector<std::string> out;
+    db.begin();
+    try {
+        {
+            Stmt st(db.handle(), "SELECT command FROM commands WHERE state='pending' ORDER BY id");
+            while (st.step()) out.push_back(st.text(0));
+        }
+        db.exec("UPDATE commands SET state='done' WHERE state='pending'");
+        db.exec("DELETE FROM commands WHERE state='done' AND created < strftime('%s','now') - 86400");
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- 古いキャッシュ
 
 size_t importCache(Db& db, const Cache& cache, int hashVersion) {

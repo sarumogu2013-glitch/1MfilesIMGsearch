@@ -30,6 +30,7 @@
 #include "db.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
+#include "indexer_win.hpp"
 #include "keymap_win.hpp"
 #include "resource.h"
 #include "update_win.hpp"
@@ -210,6 +211,7 @@ std::vector<std::wstring> folderList() {
 
 void saveSettings() {
     const auto f = folderList();
+    indexer::setRoots(app.dataDir, f);  // バックグラウンドの解析も同じフォルダを見る
     WritePrivateProfileSectionW(L"folders", L"\0", iniPath().c_str());
     for (size_t i = 0; i < f.size(); ++i)
         WritePrivateProfileStringW(L"folders", std::to_wstring(i + 1).c_str(), f[i].c_str(), iniPath().c_str());
@@ -1196,7 +1198,7 @@ void appendMainMenus(HMENU root) {
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
-    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -1410,6 +1412,24 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
+                case CMD_INDEXER_TOGGLE:
+                    saveSettings();  // 調べるフォルダを DB に書いてから
+                    if (indexer::isRunning()) {
+                        indexer::requestQuit(app.dataDir);
+                        setText(app.status, L"バックグラウンドの解析を止めました");
+                    } else if (indexer::start()) {
+                        setText(app.status, L"バックグラウンドの解析を始めました（タスクトレイに常駐します）");
+                    }
+                    break;
+                case CMD_INDEXER_AUTOSTART: {
+                    const bool on = !indexer::autoStartEnabled();
+                    indexer::setAutoStart(on);
+                    if (on && !indexer::isRunning()) {
+                        saveSettings();
+                        indexer::start();
+                    }
+                    break;
+                }
                 case CMD_HELP: showHelp(); break;
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_ABOUT:
@@ -1425,6 +1445,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_NOTIFY:
             return onNotify(reinterpret_cast<NMHDR*>(lp));
+        case WM_INITMENUPOPUP: {
+            HMENU m = reinterpret_cast<HMENU>(wp);
+            const bool on = indexer::isRunning();
+            std::wstring text = on ? L"バックグラウンドの解析を止める(&B)" : L"バックグラウンドの解析を始める(&B)";
+            const std::string key = keyLabel(app.keys, CMD_INDEXER_TOGGLE);
+            if (!key.empty()) text += L"\t" + widen(key);
+            ModifyMenuW(m, CMD_INDEXER_TOGGLE, MF_BYCOMMAND | MF_STRING, CMD_INDEXER_TOGGLE, text.c_str());
+            CheckMenuItem(m, CMD_INDEXER_AUTOSTART, MF_BYCOMMAND | (indexer::autoStartEnabled() ? MF_CHECKED : MF_UNCHECKED));
+            return 0;
+        }
         case WM_TIMER:
             if (wp == kProgressTimer) updateProgress();
             if (wp == kExitTimer) DestroyWindow(hwnd);  // 確認に時間がかかりすぎたら、そのまま終わる
@@ -1649,6 +1679,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--indexer") == 0) {
+        LocalFree(argv);
+        const int code = indexer::runResident(inst, app.dataDir);
+        CoUninitialize();
+        return code;
+    }
     if (argv && argc >= 2 && (lstrcmpiW(argv[1], L"--cli") == 0 || lstrcmpiW(argv[1], L"--index") == 0)) {
         const int code = lstrcmpiW(argv[1], L"--cli") == 0 ? runCli(argc, argv) : runIndexCli(argc, argv);
         LocalFree(argv);

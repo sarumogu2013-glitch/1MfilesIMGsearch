@@ -45,7 +45,7 @@ sqlite_obj "$CC" out/sqlite3_win.o
 # shellcheck disable=SC2086
 "$CXX" -std=c++17 -O2 -mpopcnt -s -Wall -Wextra -Wno-missing-field-initializers -municode -mwindows -static \
   -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DIMGDUPE_VERSION="\"$VERSION\"" -Isrc -Ithird_party/sqlite \
-  $CORE_SRC src/platform_win.cpp src/image_win.cpp src/update_win.cpp src/keymap_win.cpp src/main_win.cpp \
+  $CORE_SRC src/platform_win.cpp src/image_win.cpp src/update_win.cpp src/keymap_win.cpp src/indexer_win.cpp src/main_win.cpp \
   out/sqlite3_win.o out/app.res.o \
   -o out/imgdupe.exe \
   -lwindowscodecs -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lshlwapi -lole32 -loleaut32 -luuid -lgdi32 -luser32

@@ -124,6 +124,17 @@ void setStage(Db& db, int64_t imageId, const std::string& stage, StageState stat
 // その段階が version で済んでいない画像（新しく追加されたものから）
 std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version, size_t limit = 0);
 
+// ---------------------------------------------------------------- GUI と indexer のやりとり
+
+// 調べるフォルダ（settings の "roots"、改行区切り）
+void setRoots(Db& db, const std::vector<std::string>& roots);
+std::vector<std::string> getRoots(Db& db);
+
+// GUI から indexer への指示（commands テーブル）。"quit" / "rescan" / "pause" / "resume"
+void addCommand(Db& db, const std::string& command, const std::string& target = "");
+// まだ済んでいない指示を古い順に取り出し、済みにする
+std::vector<std::string> takeCommands(Db& db);
+
 // 古いキャッシュ（imgdupe_cache.bin）を読み込む。取り込んだ数を返す
 size_t importCache(Db& db, const Cache& cache, int hashVersion);
 
