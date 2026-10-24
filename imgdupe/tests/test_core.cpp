@@ -14,6 +14,8 @@
 #include "indexer.hpp"
 #include "meta.hpp"
 #include "search.hpp"
+#include "links.hpp"
+#include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
@@ -1040,6 +1042,78 @@ static void testSearch() {
     fs::remove_all(dir);
 }
 
+static void testLinks() {
+    CHECK(safeFolderName("a/b:c*?") == "a_b_c__");
+    CHECK(safeFolderName("  . ") == "検索結果");
+    CHECK(safeFolderName("夏 ") == "夏");
+    CHECK(driveOf("D:\\x\\y.jpg") == "D:" && driveOf("\\\\srv\\share\\a.jpg") == "\\\\srv\\share");
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-links-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "src" / "a");
+    fs::create_directories(dir / "src" / "b");
+    auto write = [](const fs::path& p, const std::string& s) {
+        FILE* f = std::fopen(p.string().c_str(), "wb");
+        std::fwrite(s.data(), 1, s.size(), f);
+        std::fclose(f);
+    };
+    const std::string p1 = (dir / "src" / "a" / "x.jpg").string(), p2 = (dir / "src" / "b" / "x.jpg").string(),
+                      p3 = (dir / "src" / "a" / "y.jpg").string(), p4 = (dir / "src" / "a" / "gone.jpg").string();
+    write(p1, "one");
+    write(p2, "two");
+    write(p3, "three");
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{p1, 3, 1}, {p2, 3, 2}, {p3, 5, 3}, {p4, 1, 4}});
+    CHECK(vfolderRoot(db, "D:") == "D:\\_vfolders" && vfolderRoot(db, "/") == "/_vfolders");
+    const std::string root = (dir / "vf").string();
+    setVfolderRoot(db, "/", root + "/");
+    CHECK(vfolderRoot(db, "/") == root);
+    CHECK((customVfolderRoots(db) == std::vector<std::string>{root}));
+
+    // 展開: 同じ名前のファイルは ID を頭に付ける。無い画像は失敗に数える
+    ExpandResult e = expandLinks(db, {id[p1], id[p2], id[p3], id[p4]}, "ミク/1", true);
+    CHECK(e.created == 3 && e.failed == 1 && e.firstFailure == p4);
+    const fs::path out = fs::path(root) / "ミク_1";
+    CHECK((e.folders == std::vector<std::string>{out.string()}));
+    CHECK(fs::exists(out / "x.jpg") && fs::exists(out / (std::to_string(id[p2]) + "_x.jpg")) && fs::exists(out / "y.jpg"));
+    FileIdentity a, b;
+    CHECK(fileIdentity(p1, a) && fileIdentity((out / "x.jpg").string(), b) && a.same(b) && a.links == 2);
+    auto folders = linkFolders(db);
+    CHECK(folders.size() == 1 && folders[0].dir == out.string() && folders[0].count == 3 && folders[0].temporary == 3);
+
+    // 同じ名前でもう一度 = 作り直し（今の結果だけになる）
+    e = expandLinks(db, {id[p3]}, "ミク/1", true);
+    CHECK(e.created == 1 && e.removed == 3 && !fs::exists(out / "x.jpg") && fs::exists(out / "y.jpg"));
+    CHECK(fs::exists(p1) && fs::exists(p2));  // 元画像はそのまま
+
+    // 固定にしたものは、一時リンクの後片付けでは消えない
+    e = expandLinks(db, {id[p1], id[p2]}, "keep", true);
+    const fs::path keep = fs::path(root) / "keep";
+    setFolderTemporary(db, keep.string(), false);
+    RemoveResult rr = removeLinks(db, "", true);
+    CHECK(rr.removed == 1 && !fs::exists(out));  // 空になったフォルダも消す
+    CHECK(fs::exists(keep / "x.jpg") && fs::exists(fs::path(root)));
+    folders = linkFolders(db);
+    CHECK(folders.size() == 1 && folders[0].temporary == 0 && folders[0].count == 2);
+
+    // 別のファイルに置き換わったリンクは消さない（記録だけ消す）
+    fs::remove(keep / "x.jpg");
+    write(keep / "x.jpg", "user file");
+    // 元画像が消えて、データがリンクにしか無いものは消さずに知らせる
+    fs::remove(p2);
+    CHECK((orphanLinks(db) == std::vector<std::string>{(keep / (std::to_string(id[p2]) + "_x.jpg")).string()}));
+    rr = removeLinks(db, keep.string(), false);
+    CHECK(rr.removed == 0 && rr.gone == 1 && rr.kept == 1);
+    CHECK(fs::exists(keep / "x.jpg") && fs::exists(keep / (std::to_string(id[p2]) + "_x.jpg")));
+    CHECK(linkFolders(db).size() == 1 && linkFolders(db)[0].count == 1);
+    // リンクが消えていたら記録だけ消す
+    fs::remove(keep / (std::to_string(id[p2]) + "_x.jpg"));
+    rr = removeLinks(db, "", false);
+    CHECK(rr.gone == 1 && linkFolders(db).empty());
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1073,6 +1147,7 @@ int main() {
     testIndexer();
     testMeta();
     testSearch();
+    testLinks();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

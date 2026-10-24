@@ -21,6 +21,7 @@
 #include "db.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
+#include "links.hpp"
 #include "resource.h"
 #include "win_util.hpp"
 
@@ -144,6 +145,11 @@ void runOnce(const std::vector<std::wstring>& roots) {
     opt.dbFile = dbFileOf(g->dataDir);
     opt.packDir = narrow(g->dataDir);
     opt.threads = userIdle() ? 0 : 1;  // 操作中は 1 スレッドだけ
+    try {
+        Db db;
+        if (db.open(opt.dbFile)) imgwin::setScanExcludes(customVfolderRoots(db));
+    } catch (const std::exception&) {
+    }
     std::atomic<uint64_t>& found = g->prog.prog.total;
     IndexCallbacks cb;
     cb.scan = [&found](const std::string& root, std::vector<ScannedFile>& files) {

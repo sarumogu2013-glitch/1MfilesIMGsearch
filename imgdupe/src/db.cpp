@@ -203,6 +203,17 @@ CREATE TABLE IF NOT EXISTS smart_folders(
 );
 )SQL";
 
+
+bool underRoot(const std::string& path, const std::string& root) {
+    if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0) return false;
+    const char last = root.empty() ? '/' : root.back();
+    return last == '/' || last == '\\' || path[root.size()] == '/' || path[root.size()] == '\\';
+}
+
+int64_t packColor(const Features& f) { return (int64_t(f.r) << 16) | (int64_t(f.g) << 8) | f.b; }
+
+}  // namespace
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -214,16 +225,6 @@ std::string driveOf(const std::string& path) {
     }
     return "/";
 }
-
-bool underRoot(const std::string& path, const std::string& root) {
-    if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0) return false;
-    const char last = root.empty() ? '/' : root.back();
-    return last == '/' || last == '\\' || path[root.size()] == '/' || path[root.size()] == '\\';
-}
-
-int64_t packColor(const Features& f) { return (int64_t(f.r) << 16) | (int64_t(f.g) << 8) | f.b; }
-
-}  // namespace
 
 int64_t nowUnix() { return static_cast<int64_t>(std::time(nullptr)); }
 

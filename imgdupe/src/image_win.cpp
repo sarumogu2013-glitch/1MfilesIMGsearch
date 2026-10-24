@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <mutex>
 
 #include "win_util.hpp"
 
@@ -491,8 +492,30 @@ bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& m) {
     return true;
 }
 
+namespace {
+std::mutex excludeMutex;
+std::vector<std::wstring> excludeDirs;  // 小文字
+
+std::wstring lowerPath(std::wstring s) {
+    for (auto& c : s) c = c == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(c));
+    while (s.size() > 3 && s.back() == L'\\') s.pop_back();
+    return s;
+}
+}  // namespace
+
+void setScanExcludes(const std::vector<std::string>& dirs) {
+    std::lock_guard<std::mutex> lock(excludeMutex);
+    excludeDirs.clear();
+    for (const auto& d : dirs) excludeDirs.push_back(lowerPath(winutil::widen(d)));
+}
+
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,
                 const std::atomic<bool>& cancel) {
+    std::vector<std::wstring> excludes;
+    {
+        std::lock_guard<std::mutex> lock(excludeMutex);
+        excludes = excludeDirs;
+    }
     std::vector<std::wstring> stack{root};
     while (!stack.empty() && !cancel) {
         std::wstring dir = std::move(stack.back());
@@ -507,7 +530,12 @@ void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out
             const std::wstring name = fd.cFileName;
             if (name == L"." || name == L"..") continue;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) stack.push_back(prefix + name);
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+                // ハードリンクの展開先（中身は元画像と同じファイルなので、読むと重複になる）
+                if (_wcsicmp(name.c_str(), L"_vfolders") == 0) continue;
+                const std::wstring sub = prefix + name;
+                if (!excludes.empty() && std::find(excludes.begin(), excludes.end(), lowerPath(sub)) != excludes.end()) continue;
+                stack.push_back(sub);
                 continue;
             }
             std::string path = winutil::narrow(prefix + name);

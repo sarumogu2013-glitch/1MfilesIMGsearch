@@ -31,7 +31,10 @@ bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>
 // ファイルが無ければ false
 bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& out);
 
-// root 以下の画像を out に追加する（リパースポイントのフォルダはたどらない）
+// 走査から外すフォルダ（ハードリンクの生成先を設定で変えたもの）。名前が _vfolders のフォルダはいつも外す
+void setScanExcludes(const std::vector<std::string>& dirs);
+
+// root 以下の画像を out に追加する（リパースポイントのフォルダ、_vfolders、外すフォルダはたどらない）
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,
                 const std::atomic<bool>& cancel);
 

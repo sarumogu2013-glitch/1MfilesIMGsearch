@@ -37,6 +37,7 @@
 #include "keymap_win.hpp"
 #include "resource.h"
 #include "search.hpp"
+#include "links.hpp"
 #include "update_win.hpp"
 #include "version.hpp"
 #include "win_util.hpp"
@@ -55,6 +56,7 @@ constexpr UINT WM_APP_THUMB = WM_APP + 2;  // lParam: ThumbResult*
 constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: CheckMode, lParam: upd::CheckResult*
 constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // wParam: CheckMode, lParam: upd::DownloadResult*
 constexpr UINT WM_APP_SEARCHED = WM_APP + 5;  // lParam: SearchDone*
+constexpr UINT WM_APP_EXPANDED = WM_APP + 6;  // lParam: ExpandDone*
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
@@ -102,6 +104,7 @@ enum : int {
     IDC_S_SMART,
     IDC_S_SMART_SAVE,
     IDC_S_SMART_DELETE,
+    IDC_S_EXPAND,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -165,7 +168,7 @@ struct App {
     // 検索の画面
     struct SearchCtl {
         HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, minW, minKb, maxKb, path, download,
-            sort, desc, clear, count, results, smart, smartSave, smartDelete;
+            sort, desc, clear, count, results, smart, smartSave, smartDelete, expand;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
     std::vector<HWND> searchPage;
@@ -179,6 +182,7 @@ struct App {
     std::set<std::string> uncheckedSources;  // 外した出どころ
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
+    bool expanding = false;              // フォルダに展開している最中
 
     // メニューとショートカットキー
     HMENU menuBar = nullptr;
@@ -195,6 +199,7 @@ struct App {
     int thumbSize = 160;
     ThumbView views[kViewCount];
     std::thread thumbThread;
+    std::thread expandThread;
     std::mutex thumbMutex;
     std::condition_variable thumbCv;
     struct ThumbJob {
@@ -989,6 +994,14 @@ void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT
 void copyOut(LVITEMW& item, const std::wstring& s);
 
 void applyQueryToUi(const SearchQuery& q);
+void expandLinksUi();
+void showLinksWindow();
+void cleanupTemporaryLinks();
+struct ExpandDone {
+    ExpandResult result;
+    std::wstring name, error;
+};
+void onExpanded(ExpandDone* p);
 void saveSmartFolderUi();
 void deleteSmartFolderUi();
 void refreshSmartFolders(const std::wstring& select);
@@ -1453,6 +1466,306 @@ void deleteSmartFolderUi() {
     refreshSmartFolders(L"");
 }
 
+// ---------------------------------------------------------------- ハードリンク展開
+
+std::wstring trimmed(std::wstring s) {
+    while (!s.empty() && iswspace(s.back())) s.pop_back();
+    while (!s.empty() && iswspace(s.front())) s.erase(s.begin());
+    return s;
+}
+
+std::wstring localTimeText(int64_t t) {
+    const time_t tt = static_cast<time_t>(t);
+    struct tm lt {};
+    if (localtime_s(&lt, &tt) != 0) return L"";
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%04d-%02d-%02d %02d:%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+    return buf;
+}
+
+std::atomic<bool> expandCancel{false};
+
+void cleanupTemporaryLinks() {
+    Db* db = uiDb();
+    if (!db) return;
+    try {
+        removeLinks(*db, "", true);
+    } catch (const std::exception&) {
+    }
+}
+
+void expandLinksUi() {
+    if (app.expanding) {
+        MessageBoxW(app.hwnd, L"フォルダに展開しています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    if (!app.searchTotal) {
+        MessageBoxW(app.hwnd, L"展開する検索結果がありません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+    const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"検索結果";
+    auto input = promptText(L"フォルダに展開", L"フォルダの名前（画像のあるドライブごとに、_vfolders の下に作ります）", initial);
+    if (!input || trimmed(*input).empty()) return;
+    const std::string name = safeFolderName(narrow(trimmed(*input)));
+    std::wstring msg = withCommas(app.searchTotal) + L" 枚を、ハードリンクで「" + widen(name) + L"」フォルダに並べます。\r\n\r\n" +
+                       L"・容量は増えません。リンク側の画像を編集すると、元の画像も変わります。\r\n" +
+                       L"・このソフトを終了すると消えます（残す時は「展開したフォルダ」で固定にします）。\r\n" +
+                       L"・同じ名前で前に展開したフォルダは、今の結果で作り直します。";
+    if (app.searchTotal > 10000) msg += L"\r\n\r\n枚数が多いので、少し時間がかかります。";
+    if (MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return;
+
+    SearchQuery q = searchQueryFromUi();
+    const std::string db = narrow(dbPath());
+    HWND hwnd = app.hwnd;
+    app.expanding = true;
+    expandCancel = false;
+    setText(app.s.count, L"フォルダに展開しています…");
+    EnableWindow(app.s.expand, FALSE);
+    if (app.expandThread.joinable()) app.expandThread.join();
+    app.expandThread = std::thread([q, db, name, hwnd]() mutable {
+        auto* done = new ExpandDone;
+        done->name = widen(name);
+        try {
+            Db d;
+            if (!d.open(db)) throw std::runtime_error(d.error());
+            q.limit = 0;
+            done->result = expandLinks(d, search(d, q).ids, name, true, &expandCancel);
+        } catch (const std::exception& e) {
+            done->error = widen(e.what());
+        }
+        if (!PostMessageW(hwnd, WM_APP_EXPANDED, 0, reinterpret_cast<LPARAM>(done))) delete done;
+    });
+}
+
+void onExpanded(ExpandDone* p) {
+    std::unique_ptr<ExpandDone> done(p);
+    app.expanding = false;
+    EnableWindow(app.s.expand, TRUE);
+    setText(app.s.count, withCommas(app.searchTotal) + L" 件");
+    if (!done->error.empty()) {
+        MessageBoxW(app.hwnd, (L"展開できませんでした: " + done->error).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    const ExpandResult& r = done->result;
+    std::wstring msg = withCommas(r.created) + L" 個のリンクを作りました。";
+    for (const auto& f : r.folders) msg += L"\r\n" + widen(f);
+    if (r.failed)
+        msg += L"\r\n\r\n作れなかった画像: " + withCommas(r.failed) +
+               L" 枚（元の画像が無い、ネットワークや FAT32 / exFAT のドライブなど）\r\n例: " + widen(r.firstFailure);
+    if (!r.created) {
+        MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_ICONWARNING);
+        return;
+    }
+    msg += L"\r\n\r\nフォルダを開きますか？";
+    if (MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+        for (const auto& f : r.folders) openPath(widen(f));
+}
+
+// 展開したフォルダの一覧（固定にする・削除する・生成先を変える）
+struct LinksWindow {
+    HWND wnd = nullptr, list = nullptr, note = nullptr;
+    std::vector<LinkFolder> folders;
+    bool done = false;
+} linksWin;
+
+enum { IDC_L_LIST = 100, IDC_L_OPEN, IDC_L_KEEP, IDC_L_TEMP, IDC_L_DELETE, IDC_L_ROOT };
+
+void refreshLinksWindow() {
+    LinksWindow& w = linksWin;
+    Db* db = uiDb();
+    w.folders.clear();
+    std::wstring note;
+    if (db) {
+        try {
+            w.folders = linkFolders(*db);
+            const auto orphans = orphanLinks(*db);
+            if (!orphans.empty())
+                note += L"元の画像が消えて、データがリンクにしか無いファイルが " + withCommas(orphans.size()) +
+                        L" 個あります（リンクを消すまで容量は空きません）。例: " + widen(orphans[0]) + L"\r\n";
+            const auto roots = customVfolderRoots(*db);
+            note += L"生成先: 各ドライブの \\_vfolders";
+            for (const auto& r : roots) note += L"、" + widen(r);
+        } catch (const std::exception& e) {
+            note = widen(e.what());
+        }
+    }
+    setText(w.note, note);
+    ListView_DeleteAllItems(w.list);
+    for (size_t i = 0; i < w.folders.size(); ++i) {
+        const LinkFolder& f = w.folders[i];
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = static_cast<int>(i);
+        const std::wstring dir = widen(f.dir);
+        it.pszText = const_cast<wchar_t*>(dir.c_str());
+        ListView_InsertItem(w.list, &it);
+        const std::wstring count = withCommas(f.count);
+        const std::wstring kind = f.temporary == f.count ? L"一時" : f.temporary ? L"一部一時" : L"固定";
+        const std::wstring when = f.created ? localTimeText(f.created) : L"";
+        ListView_SetItemText(w.list, static_cast<int>(i), 1, const_cast<wchar_t*>(count.c_str()));
+        ListView_SetItemText(w.list, static_cast<int>(i), 2, const_cast<wchar_t*>(kind.c_str()));
+        ListView_SetItemText(w.list, static_cast<int>(i), 3, const_cast<wchar_t*>(when.c_str()));
+    }
+    if (!w.folders.empty()) ListView_SetItemState(w.list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+}
+
+void linksCommand(int id) {
+    LinksWindow& w = linksWin;
+    Db* db = uiDb();
+    if (id == IDCANCEL) {
+        w.done = true;
+        return;
+    }
+    if (!db) return;
+    if (id == IDC_L_ROOT) {
+        Com<IFileOpenDialog> dlg;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dlg.put())))) return;
+        DWORD opt = 0;
+        dlg->GetOptions(&opt);
+        dlg->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        dlg->SetTitle(L"展開先を作るフォルダを選ぶ（その下に _vfolders を作ります）");
+        Com<IShellItem> item;
+        PWSTR p = nullptr;
+        if (FAILED(dlg->Show(w.wnd)) || FAILED(dlg->GetResult(item.put())) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)))
+            return;
+        std::wstring base = p;
+        CoTaskMemFree(p);
+        while (base.size() > 3 && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
+        const std::wstring root = base + (base.back() == L'\\' ? L"" : L"\\") + widen(kVfolderDirName);
+        const std::string drive = driveOf(narrow(base));
+        if (MessageBoxW(w.wnd, (widen(drive) + L" の画像は、これから\r\n" + root + L"\r\nの下に展開します。").c_str(), L"imgdupe",
+                        MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+            return;
+        try {
+            setVfolderRoot(*db, drive, narrow(root));
+            imgwin::setScanExcludes(customVfolderRoots(*db));
+        } catch (const std::exception& e) {
+            MessageBoxW(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        }
+        refreshLinksWindow();
+        return;
+    }
+    const int sel = ListView_GetNextItem(w.list, -1, LVNI_SELECTED);
+    if (sel < 0 || sel >= static_cast<int>(w.folders.size())) return;
+    const LinkFolder f = w.folders[sel];
+    try {
+        switch (id) {
+            case IDC_L_OPEN: openPath(widen(f.dir)); return;
+            case IDC_L_KEEP: setFolderTemporary(*db, f.dir, false); break;
+            case IDC_L_TEMP: setFolderTemporary(*db, f.dir, true); break;
+            case IDC_L_DELETE: {
+                if (MessageBoxW(w.wnd, (L"「" + widen(f.dir) + L"」のリンク " + withCommas(f.count) + L" 個を削除しますか？\r\n（元の画像は消えません）").c_str(),
+                                L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+                    return;
+                const RemoveResult r = removeLinks(*db, f.dir, false);
+                std::wstring msg;
+                if (r.failed) msg += withCommas(r.failed) + L" 個は開かれていて消せませんでした（次に起動した時にまた消します）。\r\n";
+                if (r.kept) msg += withCommas(r.kept) + L" 個は元の画像が消えていて、データがリンクにしか無いので残しました。\r\n";
+                if (!msg.empty()) MessageBoxW(w.wnd, msg.c_str(), L"imgdupe", MB_ICONINFORMATION);
+                break;
+            }
+            default: return;
+        }
+    } catch (const std::exception& e) {
+        MessageBoxW(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+    }
+    refreshLinksWindow();
+    if (sel < ListView_GetItemCount(w.list)) ListView_SetItemState(w.list, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+}
+
+void showLinksWindow() {
+    LinksWindow& w = linksWin;
+    if (w.wnd) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            switch (msg) {
+                case WM_COMMAND: linksCommand(LOWORD(wp)); return 0;
+                case WM_CLOSE: linksWin.done = true; return 0;
+                case WM_NOTIFY: {
+                    auto* nm = reinterpret_cast<NMHDR*>(lp);
+                    if (nm->idFrom == IDC_L_LIST && nm->code == NM_DBLCLK) linksCommand(IDC_L_OPEN);
+                    return 0;
+                }
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeLinks";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int cw = px(720), ch = px(400), m = px(10), bw = px(100), bh = px(28);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, cw, ch};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    w = LinksWindow{};
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeLinks", L"展開したフォルダ", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                            app.inst, nullptr);
+    if (!w.wnd) return;
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int listW = cw - 3 * m - bw, noteH = px(40);
+    w.list = child(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, IDC_L_LIST, m, m, listW,
+                   ch - 3 * m - noteH, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(w.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    const struct {
+        const wchar_t* title;
+        int width;
+        int fmt;
+    } cols[] = {{L"フォルダ", 330, LVCFMT_LEFT}, {L"数", 60, LVCFMT_RIGHT}, {L"種類", 60, LVCFMT_LEFT}, {L"作った日時", 120, LVCFMT_LEFT}};
+    for (int i = 0; i < 4; ++i) {
+        LVCOLUMNW c{};
+        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+        c.fmt = cols[i].fmt;
+        c.cx = px(cols[i].width);
+        c.pszText = const_cast<wchar_t*>(cols[i].title);
+        ListView_InsertColumn(w.list, i, &c);
+    }
+    w.note = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, ch - m - noteH, cw - 2 * m, noteH);
+    const int bx = cw - m - bw;
+    int by = m;
+    for (auto [id, text] : std::initializer_list<std::pair<int, const wchar_t*>>{
+             {IDC_L_OPEN, L"開く"}, {IDC_L_KEEP, L"固定にする"}, {IDC_L_TEMP, L"一時にする"}, {IDC_L_DELETE, L"削除"}}) {
+        child(WC_BUTTONW, text, WS_TABSTOP, id, bx, by, bw, bh);
+        by += bh + px(6);
+    }
+    by += px(12);
+    child(WC_BUTTONW, L"生成先…", WS_TABSTOP, IDC_L_ROOT, bx, by, bw, bh);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, bx, ch - 2 * m - noteH - bh, bw, bh);
+    refreshLinksWindow();
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(w.wnd, SW_SHOW);
+    SetFocus(w.list);
+    MSG msg;
+    while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            w.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(w.wnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(w.wnd);
+    w.wnd = nullptr;
+    SetActiveWindow(app.hwnd);
+}
+
 void layout();
 
 void switchTab(int t) {
@@ -1547,7 +1860,8 @@ void layoutSearch(int y, int W, int bottom) {
 
     // 右: 件数・条件をクリア・結果
     const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m), cw = px(110), top = rowH + px(4);
-    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, rw - cw - gap), labelH, TRUE);
+    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, rw - 2 * (cw + gap)), labelH, TRUE);
+    MoveWindow(app.s.expand, rx + rw - 2 * cw - gap, y, cw, rowH, TRUE);
     MoveWindow(app.s.clear, rx + rw - cw, y, cw, rowH, TRUE);
     MoveWindow(app.s.results, rx, y + top, rw, std::max(0, bottom - y - top), TRUE);
 }
@@ -1620,6 +1934,8 @@ void createSearchControls() {
                                     L"タイトル", L"確度（1 つ目のタグ）"});
     app.s.desc = makeControl(WC_BUTTONW, L"降順", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DESC);
     app.s.clear = makeControl(WC_BUTTONW, L"条件をクリア", WS_TABSTOP, IDC_S_CLEAR);
+    app.s.expand = makeControl(WC_BUTTONW, L"フォルダに展開…", WS_TABSTOP, IDC_S_EXPAND);
+    app.searchPage.push_back(app.s.expand);
     app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
     app.searchPage.insert(app.searchPage.end(), {app.s.desc, app.s.clear, app.s.count});
 
@@ -1729,6 +2045,9 @@ bool onSearchCommand(WPARAM wp) {
             return true;
         case IDC_S_SMART_SAVE:
             saveSmartFolderUi();
+            return true;
+        case IDC_S_EXPAND:
+            expandLinksUi();
             return true;
         case IDC_S_SMART_DELETE:
             deleteSmartFolderUi();
@@ -2128,7 +2447,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART});
+    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
@@ -2241,6 +2560,9 @@ void selectGroupRelative(int delta) {
 void shutdown() {
     app.cancel = true;
     if (app.worker.joinable()) app.worker.join();
+    expandCancel = true;
+    if (app.expandThread.joinable()) app.expandThread.join();
+    cleanupTemporaryLinks();  // 一時リンクは終了時に消す（仕様）
     {
         std::lock_guard<std::mutex> lock(app.thumbMutex);
         app.thumbQuit = true;
@@ -2374,6 +2696,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (app.tab != 1) switchTab(1);
                     deleteSmartFolderUi();
                     break;
+                case CMD_EXPAND_LINKS:
+                    if (app.tab != 1) switchTab(1);
+                    expandLinksUi();
+                    break;
+                case CMD_LINKS: showLinksWindow(); break;
                 case CMD_INDEXER_TOGGLE:
                     saveSettings();  // 調べるフォルダを DB に書いてから
                     if (indexer::isRunning()) {
@@ -2424,6 +2751,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_SEARCHED:
             onSearched(reinterpret_cast<SearchDone*>(lp));
+            return 0;
+        case WM_APP_EXPANDED:
+            onExpanded(reinterpret_cast<ExpandDone*>(lp));
             return 0;
         case WM_APP_DONE:
             if (app.closing) {  // 終了しようとして中止した検索
@@ -2715,6 +3045,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ShowWindow(hwnd, show);
     }
     loadSearchSettings();
+    cleanupTemporaryLinks();  // 前回、異常終了などで残った一時リンク
+    if (Db* db = uiDb()) {
+        try {
+            imgwin::setScanExcludes(customVfolderRoots(*db));
+        } catch (const std::exception&) {
+        }
+    }
     app.thumbThread = std::thread(thumbLoop);
     switchTab(std::clamp(iniInt(L"tab", 0), 0, 1));
     UpdateWindow(hwnd);

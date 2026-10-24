@@ -1,6 +1,7 @@
 // platform.hpp の Windows 版
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "platform.hpp"
@@ -26,5 +27,57 @@ int64_t fileSize(const std::string& path) {
     if (!GetFileAttributesExW(winutil::widen(path).c_str(), GetFileExInfoStandard, &d)) return -1;
     return (static_cast<int64_t>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
 }
+
+bool fileIdentity(const std::string& path, FileIdentity& out) {
+    HANDLE h = CreateFileW(winutil::widen(path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION fi;
+    const bool ok = GetFileInformationByHandle(h, &fi) && !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    CloseHandle(h);
+    if (!ok) return false;
+    out.volume = fi.dwVolumeSerialNumber;
+    out.index = (static_cast<uint64_t>(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+    out.links = fi.nNumberOfLinks;
+    return true;
+}
+
+bool pathExists(const std::string& path) { return GetFileAttributesW(winutil::widen(path).c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+bool createHardLink(const std::string& existing, const std::string& link) {
+    return CreateHardLinkW(winutil::widen(link).c_str(), winutil::widen(existing).c_str(), nullptr) != 0;
+}
+
+bool removeFile(const std::string& path) {
+    const std::wstring w = winutil::widen(path);
+    if (DeleteFileW(w.c_str())) return true;
+    // 読み取り専用なら外してもう一度（属性はリンクどうしで共通なので、消せなければ戻す）
+    const DWORD attr = GetFileAttributesW(w.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_READONLY)) return false;
+    SetFileAttributesW(w.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    if (DeleteFileW(w.c_str())) return true;
+    SetFileAttributesW(w.c_str(), attr);
+    return false;
+}
+
+bool makeDirs(const std::string& dir) {
+    const std::wstring w = winutil::widen(dir);
+    for (size_t i = 1; i <= w.size(); ++i) {
+        if (i < w.size() && w[i] != L'\\' && w[i] != L'/') continue;
+        const std::wstring part = w.substr(0, i);
+        if (part.size() <= 3 && part.size() >= 2 && part[1] == L':') continue;  // ドライブ（C:、C:\）
+        if (part.size() >= 2 && part[0] == L'\\' && part[1] == L'\\' && std::count(part.begin(), part.end(), L'\\') < 4)
+            continue;  // \\server\share
+        const DWORD attr = GetFileAttributesW(part.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES) {
+            if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
+        } else if (!CreateDirectoryW(part.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool removeEmptyDir(const std::string& dir) { return RemoveDirectoryW(winutil::widen(dir).c_str()) != 0; }
 
 }  // namespace imgdupe

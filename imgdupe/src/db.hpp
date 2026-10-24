@@ -126,6 +126,9 @@ std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version
 
 // ---------------------------------------------------------------- GUI と indexer のやりとり
 
+// パスのドライブ（"D:"、"\\server\share"、"/"）
+std::string driveOf(const std::string& path);
+
 // 調べるフォルダ（settings の "roots"、改行区切り）
 void setRoots(Db& db, const std::vector<std::string>& roots);
 std::vector<std::string> getRoots(Db& db);
