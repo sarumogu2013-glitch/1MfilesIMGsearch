@@ -1372,19 +1372,23 @@ void showSearchInfo(int item) {
     if (info->rating > 0) line += L"　" + stars(info->rating);
     if (info->taken) line += L"　撮影 " + dateText(info->taken);
     if (!info->title.empty()) line += L"　「" + widen(info->title) + L"」";
-    // タグごとに、出どころの確度を合成して出す（手動で確定したものはその値）
-    std::wstring tags;
+    // ファイルに書き込まれているタグ（実体。出どころ embedded）と、DB にだけある検索用のタグを分けて出す。
+    // 検索用のタグは、出どころの確度を合成した値（手動で確定したものはその値）
+    std::wstring fileTags, tags;
     if (Db* db = uiDb()) {
         try {
             struct Agg {
                 std::vector<double> ps;
                 std::wstring detail;
-                int manual = -1;  // 手動で確定した値（-1 = なし）
+                int manual = -1;     // 手動で確定した値（-1 = なし）
+                bool dbOnly = false;  // ファイル以外の出どころがある（検索用タグの行に出す）
             };
             std::vector<std::pair<std::string, Agg>> agg;
             for (const auto& t : tagsOf(*db, info->id)) {
+                if (t.source == kSourceEmbedded) fileTags += (fileTags.empty() ? L"ファイルのタグ: " : L"、") + widen(t.tag);
                 auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return a.first == t.tag; });
                 if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{}});
+                if (t.source != kSourceEmbedded) it->second.dbOnly = true;
                 wchar_t c[16];
                 swprintf(c, 16, L" %.2f", t.confidence);
                 it->second.detail += (it->second.detail.empty() ? L"" : L"・") + sourceLabel(t.source) + c;
@@ -1393,18 +1397,21 @@ void showSearchInfo(int item) {
             }
             std::vector<std::pair<double, std::wstring>> lines;
             for (const auto& [tag, a] : agg) {
+                if (!a.dbOnly) continue;  // ファイルのタグだけのものは上の行に出ている
                 const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
                 wchar_t c[16];
                 swprintf(c, 16, L" %.2f", p);
                 lines.emplace_back(p, widen(tag) + c + L"（" + a.detail + L"）");
             }
             std::stable_sort(lines.begin(), lines.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-            for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"タグ: " : L"　") + lines[i].second;
+            for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"検索用タグ: " : L"　") + lines[i].second;
             if (lines.size() > 8) tags += L"　ほか " + std::to_wstring(lines.size() - 8) + L" 個";
         } catch (const std::exception&) {
         }
     }
-    setText(app.info, widen(info->path) + L"\r\n" + line + (tags.empty() ? L"" : L"\r\n" + tags));
+    if (fileTags.empty()) fileTags = L"ファイルのタグ: なし";
+    if (tags.empty()) tags = L"検索用タグ: なし";
+    setText(app.info, widen(info->path) + L"\r\n" + line + L"\r\n" + fileTags + L"\r\n" + tags);
 }
 
 void clearSearchConditions() {
@@ -2034,6 +2041,162 @@ void undoTagEdit() {
     scheduleSearch(10);
 }
 
+// ---------------------------------------------------------------- 設定の画面（imgdupe.ini と同じ内容を画面から変える）
+
+struct SettingsWindow {
+    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, gpu = nullptr, aiStatus = nullptr;
+    bool done = false;
+    int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
+} settingsWin;
+
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
+
+// 画面の内容を imgdupe.ini などに書く
+void applySettings() {
+    SettingsWindow& w = settingsWin;
+    iniSet(L"autoUpdateCheck", Button_GetCheck(w.autoUpdate) == BST_CHECKED ? L"1" : L"0");
+    const bool autostart = Button_GetCheck(w.autostart) == BST_CHECKED;
+    if (autostart != indexer::autoStartEnabled()) {
+        indexer::setAutoStart(autostart);
+        if (autostart && !indexer::isRunning()) {
+            saveSettings();
+            indexer::start();
+        }
+    }
+    const int tagger = Button_GetCheck(w.tagger) == BST_CHECKED ? 1 : 0;
+    const int cpu = Button_GetCheck(w.gpu) == BST_CHECKED ? 0 : 1;
+    const bool changed = tagger != iniInt(L"taggerEnabled", 1) || cpu != iniInt(L"taggerCpu", 0);
+    iniSet(L"taggerEnabled", std::to_wstring(tagger));
+    iniSet(L"taggerCpu", std::to_wstring(cpu));
+    if (changed) restartIndexerAfterUpdate();  // 動いているバックグラウンドの解析に新しい設定を使わせる
+}
+
+void settingsCommand(int id, int code) {
+    SettingsWindow& w = settingsWin;
+    switch (id) {
+        case IDOK:
+            applySettings();
+            w.done = true;
+            break;
+        case IDCANCEL: w.done = true; break;
+        case IDC_ST_TAGGER:
+            if (code == BN_CLICKED) EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED);
+            break;
+        // 別の画面を開くものは、設定を保存して閉じてから開く
+        case IDC_ST_MODELS: applySettings(); w.after = CMD_MODELS; w.done = true; break;
+        case IDC_ST_LINKS: applySettings(); w.after = CMD_LINKS; w.done = true; break;
+        case IDC_ST_KEYS: applySettings(); w.after = CMD_KEY_SETTINGS; w.done = true; break;
+        case IDC_ST_INI:
+            applySettings();
+            ShellExecuteW(w.wnd, L"open", L"notepad.exe", (L"\"" + iniPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+            break;
+    }
+}
+
+void showSettingsWindow() {
+    SettingsWindow& w = settingsWin;
+    if (w.wnd) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            if (msg == WM_COMMAND) {
+                settingsCommand(LOWORD(wp), HIWORD(wp));
+                return 0;
+            }
+            if (msg == WM_CLOSE) {
+                settingsWin.done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeSettings";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int cw = px(520), ch = px(392), m = px(12);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, cw, ch};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    w = SettingsWindow{};
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeSettings", L"設定", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                            app.inst, nullptr);
+    if (!w.wnd) return;
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy) {
+        HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int gw = cw - 2 * m, in = m + px(12), iw = gw - px(24), rowH = px(22), bh = px(28);
+    int y = m;
+    auto group = [&](const wchar_t* title, int h) {
+        child(WC_BUTTONW, title, BS_GROUPBOX, -1, m, y, gw, h);
+        const int top = y + px(22);
+        y += h + px(8);
+        return top;
+    };
+    int gy = group(L"アップデート", px(52));
+    w.autoUpdate = child(WC_BUTTONW, L"終了する時に新しい版を確かめる（1 日 1 回）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOUPDATE,
+                         in, gy, iw, rowH);
+    gy = group(L"バックグラウンドの解析", px(52));
+    w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
+    gy = group(L"AI 解析", px(126));
+    w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
+                     WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
+    w.gpu = child(WC_BUTTONW, L"GPU（DirectML）を使う（調子が悪い時は外すと CPU だけで動きます）", WS_TABSTOP | BS_AUTOCHECKBOX,
+                  IDC_ST_GPU, in, gy + rowH + px(2), iw, rowH);
+    w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 2 * (rowH + px(2)) + px(6), iw - px(150), px(36));
+    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 2 * (rowH + px(2)) + px(4), px(140), bh);
+    gy = group(L"そのほか", px(60));
+    const int b3 = (iw - 2 * px(8)) / 3;
+    child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
+    child(WC_BUTTONW, L"展開したフォルダ…", WS_TABSTOP, IDC_ST_LINKS, in + b3 + px(8), gy, b3, bh);
+    child(WC_BUTTONW, L"設定ファイルを開く", WS_TABSTOP, IDC_ST_INI, in + 2 * (b3 + px(8)), gy, b3, bh);
+    child(WC_BUTTONW, L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, cw - m - px(208), ch - m - bh, px(100), bh);
+    child(WC_BUTTONW, L"キャンセル", WS_TABSTOP, IDCANCEL, cw - m - px(100), ch - m - bh, px(100), bh);
+
+    // 今の設定を出す
+    Button_SetCheck(w.autoUpdate, iniInt(L"autoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.gpu, iniInt(L"taggerCpu", 0) ? BST_UNCHECKED : BST_CHECKED);
+    EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED);
+    {
+        const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
+        auto wd = installed.find("wd14");
+        setText(w.aiStatus, wd != installed.end() && installed.count("onnxruntime")
+                                ? L"WD14 タガーが入っています（版 " + widen(wd->second.version) + L"）"
+                                : L"AI 解析の部品はまだ入っていません");
+    }
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(w.wnd, SW_SHOW);
+    SetFocus(w.autoUpdate);
+    MSG msg;
+    while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            w.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(w.wnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(w.wnd);
+    w.wnd = nullptr;
+    SetActiveWindow(app.hwnd);
+    if (w.after) PostMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(w.after), 0);
+}
+
 void layout();
 
 void switchTab(int t) {
@@ -2409,7 +2572,7 @@ void layout() {
     const int tabH = px(26);
     MoveWindow(app.tabs, m, y, W - 2 * m, tabH, TRUE);
     y += tabH + px(6);
-    const int infoH = px(54);
+    const int infoH = px(72);  // 4 行（パス・画像の情報・ファイルのタグ・検索用タグ）
     const int bottom = H - m - infoH - px(4);
     MoveWindow(app.info, m, bottom + px(4), W - 2 * m, infoH, TRUE);
     if (app.tab == 1) {
@@ -2627,7 +2790,7 @@ void createControls() {
     app.views[kDupView].lv = app.thumbs;
     resetView(kDupView, 0);
 
-    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);  // 3 行まで（省略の指定をすると 1 行になる）
+    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);  // 4 行まで（省略の指定をすると 1 行になる）
     app.dupPage = {app.foldersLabel, app.folders, app.add,      app.remove,   app.thresholdCaption, app.threshold,
                    app.thresholdLabel, app.exact, app.flat,     app.progress, app.status,           app.groups,
                    app.thumbs};
@@ -2747,7 +2910,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -3033,6 +3196,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     break;
                 }
+                case CMD_SETTINGS: showSettingsWindow(); break;
                 case CMD_HELP: showHelp(); break;
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_ABOUT:

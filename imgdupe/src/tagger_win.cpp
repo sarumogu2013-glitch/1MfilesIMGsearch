@@ -169,6 +169,8 @@ private:
 }  // namespace
 
 int stageVersion(const std::wstring& dataDir) {
+    // 設定で切ってあれば使わない（imgdupe.ini の [imgdupe] taggerEnabled=0）
+    if (!GetPrivateProfileIntW(L"imgdupe", L"taggerEnabled", 1, (dataDir + L"\\imgdupe.ini").c_str())) return 0;
     const imgdupe::Installed installed = models::loadInstalled(dataDir);
     auto wd = installed.find("wd14");
     if (wd == installed.end() || !installed.count("onnxruntime")) return 0;

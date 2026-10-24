@@ -58,6 +58,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_BULK_TAG, "BulkTag", L"選んだ画像にタグを付ける・外す(&T)...", "Ctrl+T"},
     {CMD_REVIEW, "ReviewQueue", L"確認キュー（迷っている順に並べる）(&R)", "Ctrl+R"},
     {CMD_UNDO, "Undo", L"タグの操作を元に戻す(&U)", "Ctrl+Z"},
+    {CMD_SETTINGS, "Settings", L"設定(&S)...", ""},
     {CMD_KEY_SETTINGS, "KeySettings", L"ショートカットキーの設定(&K)...", "Ctrl+K"},
     {CMD_INDEXER_TOGGLE, "Indexer", L"バックグラウンドの解析を始める(&B)", ""},
     {CMD_INDEXER_AUTOSTART, "IndexerAutoStart", L"Windows と一緒にバックグラウンドの解析を始める(&W)", ""},

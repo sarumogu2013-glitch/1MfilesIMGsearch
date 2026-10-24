@@ -22,7 +22,7 @@ struct LoadResult {
 LoadResult load(const std::wstring& dataDir, int cpuThreads = 0, std::function<void()> threadInit = {},
                 std::function<void()> threadExit = {});
 
-// 段階 tagger の版（入っているモデルの版から。入っていなければ 0）。モデルを読まずにすぐ返る
+// 段階 tagger の版（入っているモデルの版から。入っていないか、設定で切ってあれば 0）。モデルを読まずにすぐ返る
 int stageVersion(const std::wstring& dataDir);
 
 }  // namespace tagger
