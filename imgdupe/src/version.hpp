@@ -6,4 +6,5 @@
 #define IMGDUPE_VERSION "dev"
 #endif
 
-#define APP_RELEASES_URL L"https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest"
+#define APP_REPOSITORY L"sarumogu2013-glitch/1MfilesIMGsearch"
+#define APP_RELEASES_URL L"https://github.com/" APP_REPOSITORY L"/releases/latest"

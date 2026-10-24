@@ -8,6 +8,7 @@
 #include <random>
 
 #include "core.hpp"
+#include "update_logic.hpp"
 
 using namespace imgdupe;
 namespace fs = std::filesystem;
@@ -303,6 +304,25 @@ static void testExifOrientation() {
     CHECK(jpegExifOrientation(png, sizeof(png)) == 0);
 }
 
+static void testUpdateLogic() {
+    CHECK(parseVersion("v1.2.30").patch == 30);
+    CHECK(parseVersion("dev").major == 0);
+    CHECK(compareVersion("v1.0.3", "v1.0.3") == VersionCompare::Latest);
+    CHECK(compareVersion("dev", "v1.0.0") == VersionCompare::RemoteNewer);
+    CHECK(compareVersion("v1.0.9", "v1.0.10") == VersionCompare::RemoteNewer);
+    CHECK(compareVersion("v1.1.0", "v1.0.15") == VersionCompare::LocalNewer);
+    const std::string json =
+        R"({"tag_name":"v1.0.4","assets":[{"name":"imgdupe.zip","url":"https://api.github.com/a/1"},)"
+        R"({"name":"imgdupe.exe","url":"https://api.github.com/a/2","digest":"sha256:ABCdef01"}]})";
+    ReleaseInfo info;
+    CHECK(parseLatestRelease(json, "imgdupe.exe", info));
+    CHECK(info.tag == "v1.0.4" && info.hasAsset && info.assetUrl == "https://api.github.com/a/2");
+    CHECK(info.sha256 == "abcdef01");
+    CHECK(!parseLatestRelease("{broken", "imgdupe.exe", info));
+    CHECK(httpErrorMessage(200).empty());
+    CHECK(!httpErrorMessage(404).empty());
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -331,6 +351,7 @@ int main() {
     testSimilarMatchesBruteForce();
     testRun();
     testExifOrientation();
+    testUpdateLogic();
     testMisc();
     if (failures) {
         std::fprintf(stderr, "%d 件失敗\n", failures);

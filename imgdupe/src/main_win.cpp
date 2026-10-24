@@ -28,6 +28,7 @@
 #include "core.hpp"
 #include "image_win.hpp"
 #include "resource.h"
+#include "update_win.hpp"
 #include "version.hpp"
 #include "win_util.hpp"
 
@@ -42,6 +43,8 @@ namespace {
 
 constexpr UINT WM_APP_DONE = WM_APP + 1;   // lParam: Outcome*
 constexpr UINT WM_APP_THUMB = WM_APP + 2;  // lParam: ThumbResult*
+constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: 自動の確認なら 1, lParam: upd::CheckResult*
+constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // lParam: upd::DownloadResult*
 constexpr UINT_PTR kProgressTimer = 1;
 
 enum : int {
@@ -62,11 +65,13 @@ enum : int {
     IDC_INFO,
     IDC_FOLDERS_LABEL,
     IDC_THRESHOLD_CAPTION,
+    IDC_TOOLBAR,
     ID_OPEN = 200,
     ID_EXPLORER,
     ID_COPY_PATH,
     ID_HELP,
     ID_RELEASES,
+    ID_CHECK_UPDATE,
     ID_ABOUT,
     ID_EXIT,
 };
@@ -93,7 +98,7 @@ struct App {
     HWND hwnd = nullptr;
     HWND folders = nullptr, add = nullptr, remove = nullptr, foldersLabel = nullptr;
     HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr;
-    HWND start = nullptr, queryBtn = nullptr, exportBtn = nullptr;
+    HWND toolbar = nullptr;
     HWND progress = nullptr, status = nullptr;
     HWND groups = nullptr, thumbs = nullptr, info = nullptr;
     HFONT font = nullptr;
@@ -108,6 +113,10 @@ struct App {
     bool runningQuery = false;
     Progress prog;
     ULONGLONG startTick = 0;
+
+    // アップデート
+    bool updating = false;                   // 確認・ダウンロード中
+    std::unique_ptr<imgdupe::ReleaseInfo> pendingUpdate;  // 検索中に見つかった新しい版（検索が終わったら聞く）
 
     // 結果
     Result result;
@@ -131,6 +140,17 @@ struct App {
 App app;
 
 int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
+
+// ---------------------------------------------------------------- ツールバー
+
+void tbEnable(int id, bool on) { SendMessageW(app.toolbar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0)); }
+
+void tbSetText(int id, const wchar_t* text) {
+    TBBUTTONINFOW bi{sizeof(bi)};
+    bi.dwMask = TBIF_TEXT;
+    bi.pszText = const_cast<wchar_t*>(text);
+    SendMessageW(app.toolbar, TB_SETBUTTONINFOW, id, reinterpret_cast<LPARAM>(&bi));
+}
 
 // ---------------------------------------------------------------- 設定
 
@@ -391,6 +411,7 @@ const Entry* memberEntry(int item, uint8_t* dist = nullptr) {
 void showInfo(int item) {
     uint8_t dist = 0;
     const Entry* e = memberEntry(item, &dist);
+    for (int id : {ID_OPEN, ID_EXPLORER, ID_COPY_PATH}) tbEnable(id, e != nullptr);
     if (!e) {
         const Group* g = currentGroup();
         setText(app.info, g ? L"画像をダブルクリックすると開きます。右クリックで「エクスプローラーで表示」などができます。" : L"");
@@ -442,7 +463,7 @@ void showResult(Result&& r, bool query) {
         ListView_SetItemState(app.groups, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(app.groups, 0, FALSE);
     }
-    EnableWindow(app.exportBtn, !app.result.groups.empty());
+    tbEnable(IDC_EXPORT, !app.result.groups.empty());
 
     std::wstring s;
     if (query) {
@@ -472,10 +493,10 @@ void showResult(Result&& r, bool query) {
 
 void setRunning(bool on) {
     app.running = on;
-    setText(app.start, on ? L"中止" : L"検索開始");
-    for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat, app.queryBtn})
-        EnableWindow(h, !on);
-    EnableWindow(app.exportBtn, !on && !app.result.groups.empty());
+    tbSetText(IDC_START, on ? L"検索を中止" : L"検索開始");
+    for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat}) EnableWindow(h, !on);
+    for (int id : {IDC_ADD, IDC_QUERY}) tbEnable(id, !on);
+    tbEnable(IDC_EXPORT, !on && !app.result.groups.empty());
     SendMessageW(app.progress, PBM_SETPOS, 0, 0);
     if (on) {
         app.startTick = GetTickCount64();
@@ -622,6 +643,8 @@ void onDone(Outcome* out) {
         SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     }
     setRunning(false);
+    // 検索中に見つかった新しい版は、結果を出してから聞く
+    if (app.pendingUpdate) PostMessageW(app.hwnd, WM_APP_CHECKED, 2, 0);
     if (!o->error.empty()) {
         setText(app.status, o->error);
         MessageBoxW(app.hwnd, o->error.c_str(), L"imgdupe", MB_ICONWARNING);
@@ -635,6 +658,98 @@ void onDone(Outcome* out) {
     for (const auto& f : folderList()) app.resultRoots.push_back(narrow(f));
     app.haveFiles = true;
     showResult(std::move(o->result), o->query);
+}
+
+// ---------------------------------------------------------------- アップデート
+
+std::wstring today() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t buf[16];
+    swprintf(buf, 16, L"%04d-%02d-%02d", t.wYear, t.wMonth, t.wDay);
+    return buf;
+}
+
+void startCheck(bool automatic) {
+    if (app.updating) return;
+    app.updating = true;
+    tbEnable(ID_CHECK_UPDATE, false);
+    if (automatic) iniSet(L"lastUpdateCheck", today());
+    HWND hwnd = app.hwnd;
+    std::thread([hwnd, automatic] {
+        auto* r = new upd::CheckResult(upd::checkLatest());
+        if (!PostMessageW(hwnd, WM_APP_CHECKED, automatic ? 1 : 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void startDownload(const imgdupe::ReleaseInfo& info) {
+    app.updating = true;
+    tbEnable(ID_CHECK_UPDATE, false);
+    setText(app.status, L"新しい版 " + widen(info.tag) + L" をダウンロードしています…");
+    HWND hwnd = app.hwnd;
+    std::thread([hwnd, info] {
+        auto* r = new upd::DownloadResult(upd::downloadAndReplace(info));
+        if (!PostMessageW(hwnd, WM_APP_DOWNLOADED, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void askUpdate(const imgdupe::ReleaseInfo& info) {
+    const std::wstring text = L"新しい版があります。\r\n\r\n新しい版: " + widen(info.tag) + L"\r\n今の版: " +
+                              widen(IMGDUPE_VERSION) +
+                              L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます）";
+    if (MessageBoxW(app.hwnd, text.c_str(), L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION) == IDYES)
+        startDownload(info);
+}
+
+void onChecked(bool automatic, const upd::CheckResult& r) {
+    app.updating = false;
+    tbEnable(ID_CHECK_UPDATE, true);
+    const std::wstring err = r.error();
+    const auto cmp = err.empty() ? compareVersion(IMGDUPE_VERSION, r.info.tag) : VersionCompare::Latest;
+    if (automatic) {
+        // 自動の確認では、新しい版がある時だけ知らせる（検索中なら終わってから）
+        if (!err.empty() || cmp != VersionCompare::RemoteNewer) return;
+        if (app.running) app.pendingUpdate = std::make_unique<imgdupe::ReleaseInfo>(r.info);
+        else askUpdate(r.info);
+        return;
+    }
+    const std::wstring cur = widen(IMGDUPE_VERSION);
+    if (!err.empty()) {
+        MessageBoxW(app.hwnd, (L"アップデートを確認できませんでした。\r\n\r\n" + err + L"\r\n\r\n今の版: " + cur).c_str(),
+                    L"imgdupe のアップデート", MB_ICONWARNING);
+        return;
+    }
+    if (cmp != VersionCompare::RemoteNewer) {
+        MessageBoxW(app.hwnd,
+                    (L"最新の版です。\r\n\r\n今の版: " + cur + L"\r\n最新のリリース: " + widen(r.info.tag)).c_str(),
+                    L"imgdupe のアップデート", MB_ICONINFORMATION);
+        return;
+    }
+    askUpdate(r.info);
+}
+
+void onDownloaded(const upd::DownloadResult& r) {
+    app.updating = false;
+    tbEnable(ID_CHECK_UPDATE, true);
+    if (!r.ok) {
+        setText(app.status, L"更新できませんでした");
+        MessageBoxW(app.hwnd, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
+                    MB_ICONWARNING);
+        return;
+    }
+    // 新しい exe を起動して、今のウィンドウを閉じる
+    saveSettings();
+    std::wstring cmd = L"\"" + upd::exePath() + L"\"";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        MessageBoxW(app.hwnd, L"更新しました。次に起動した時から新しい版になります。", L"imgdupe のアップデート",
+                    MB_ICONINFORMATION);
+    }
+    DestroyWindow(app.hwnd);
 }
 
 // ---------------------------------------------------------------- 操作
@@ -708,7 +823,10 @@ void layout() {
     GetClientRect(app.hwnd, &rc);
     const int W = rc.right, H = rc.bottom;
     const int m = px(8), btnW = px(150), btnH = px(28), rowH = px(26);
-    int y = m;
+    SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
+    RECT tr;
+    GetWindowRect(app.toolbar, &tr);
+    int y = (tr.bottom - tr.top) + px(4);
     MoveWindow(app.foldersLabel, m, y, W - 2 * m, px(18), TRUE);
     y += px(20);
     const int listH = px(70);
@@ -727,13 +845,7 @@ void layout() {
     MoveWindow(app.exact, x, y + px(2), px(110), rowH, TRUE);
     x += px(114);
     MoveWindow(app.flat, x, y + px(2), px(200), rowH, TRUE);
-    int bx = W - m - btnW;
-    MoveWindow(app.exportBtn, bx, y, btnW, btnH, TRUE);
-    bx -= btnW + px(6);
-    MoveWindow(app.queryBtn, bx, y, btnW, btnH, TRUE);
-    bx -= btnW + px(6);
-    MoveWindow(app.start, std::max(x + px(204), bx), y, btnW, btnH, TRUE);
-    y += btnH + px(8);
+    y += rowH + px(10);
 
     MoveWindow(app.progress, m, y + px(3), px(220), px(16), TRUE);
     MoveWindow(app.status, m + px(228), y + px(1), W - 2 * m - px(228), px(20), TRUE);
@@ -763,7 +875,59 @@ void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT
     ListView_InsertColumn(lv, i, &c);
 }
 
+void createToolbar() {
+    app.toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
+                                  WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS | CCS_TOP,
+                                  0, 0, 0, 0, app.hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR)),
+                                  app.inst, nullptr);
+    SendMessageW(app.toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessageW(app.toolbar, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+    // Windows に入っている標準の絵（高 DPI では大きい方）
+    const bool large = app.scale >= 1.5;
+    TBADDBITMAP stdBmp{HINST_COMMCTRL, static_cast<UINT_PTR>(large ? IDB_STD_LARGE_COLOR : IDB_STD_SMALL_COLOR)};
+    const int stdBase = static_cast<int>(SendMessageW(app.toolbar, TB_ADDBITMAP, 0, reinterpret_cast<LPARAM>(&stdBmp)));
+    TBADDBITMAP viewBmp{HINST_COMMCTRL, static_cast<UINT_PTR>(large ? IDB_VIEW_LARGE_COLOR : IDB_VIEW_SMALL_COLOR)};
+    const int viewBase = static_cast<int>(SendMessageW(app.toolbar, TB_ADDBITMAP, 0, reinterpret_cast<LPARAM>(&viewBmp)));
+
+    struct Def {
+        int id, image;
+        const wchar_t* text;
+        bool enabled;
+    };
+    const Def defs[] = {
+        {IDC_ADD, stdBase + STD_FILEOPEN, L"フォルダを追加", true},
+        {IDC_START, stdBase + STD_FIND, L"検索開始", true},
+        {IDC_QUERY, stdBase + STD_PRINTPRE, L"1 枚で検索", true},
+        {IDC_EXPORT, stdBase + STD_FILESAVE, L"結果を保存", false},
+        {0, 0, nullptr, false},
+        {ID_OPEN, stdBase + STD_FILENEW, L"開く", false},
+        {ID_EXPLORER, viewBase + VIEW_PARENTFOLDER, L"フォルダを表示", false},
+        {ID_COPY_PATH, stdBase + STD_COPY, L"パスをコピー", false},
+        {0, 0, nullptr, false},
+        {ID_CHECK_UPDATE, stdBase + STD_REDOW, L"アップデート", true},
+        {ID_HELP, stdBase + STD_HELP, L"使い方", true},
+    };
+    std::vector<TBBUTTON> buttons;
+    for (const Def& d : defs) {
+        TBBUTTON b{};
+        if (!d.id) {
+            b.fsStyle = BTNS_SEP;
+        } else {
+            b.iBitmap = d.image;
+            b.idCommand = d.id;
+            b.fsState = d.enabled ? TBSTATE_ENABLED : 0;
+            b.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+            b.iString = reinterpret_cast<INT_PTR>(d.text);
+        }
+        buttons.push_back(b);
+    }
+    SendMessageW(app.toolbar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
+    SendMessageW(app.toolbar, TB_ADDBUTTONSW, buttons.size(), reinterpret_cast<LPARAM>(buttons.data()));
+    SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
+}
+
 void createControls() {
+    createToolbar();
     app.foldersLabel = makeControl(WC_STATICW, L"検索するフォルダ（ウィンドウにドラッグ＆ドロップしても追加できます）", 0,
                                    IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
@@ -777,9 +941,6 @@ void createControls() {
     app.thresholdLabel = makeControl(WC_STATICW, L"", 0, IDC_THRESHOLD_LABEL);
     app.exact = makeControl(WC_BUTTONW, L"完全一致だけ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_EXACT);
     app.flat = makeControl(WC_BUTTONW, L"単色に近い画像も比べる", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_FLAT);
-    app.start = makeControl(WC_BUTTONW, L"検索開始", WS_TABSTOP, IDC_START);
-    app.queryBtn = makeControl(WC_BUTTONW, L"1 枚で検索…", WS_TABSTOP, IDC_QUERY);
-    app.exportBtn = makeControl(WC_BUTTONW, L"結果を保存…", WS_TABSTOP | WS_DISABLED, IDC_EXPORT);
     app.progress = makeControl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
     SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     app.status = makeControl(WC_STATICW, L"フォルダを追加して「検索開始」を押してください。", SS_ENDELLIPSIS | SS_NOPREFIX,
@@ -915,7 +1076,8 @@ void createMenu() {
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"ファイル(&F)");
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, ID_HELP, L"使い方(&H)");
-    AppendMenuW(help, MF_STRING, ID_RELEASES, L"最新版のページを開く(&U)");
+    AppendMenuW(help, MF_STRING, ID_CHECK_UPDATE, L"アップデートを確認(&U)");
+    AppendMenuW(help, MF_STRING, ID_RELEASES, L"最新版のページを開く(&R)");
     AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, ID_ABOUT, L"バージョン情報(&A)");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"ヘルプ(&H)");
@@ -986,6 +1148,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case IDC_START:
+                    if (app.updating && !app.running) break;  // 更新のダウンロード中
                     if (app.running) {
                         app.cancel = true;
                         setText(app.status, L"中止しています…");
@@ -1001,6 +1164,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case IDC_EXPORT:
                     if (!app.running) exportResult();
+                    break;
+                case ID_OPEN: openItem(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case ID_EXPLORER: showInExplorer(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case ID_COPY_PATH: copyPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case ID_CHECK_UPDATE:
+                    if (app.running)
+                        MessageBoxW(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
+                    else
+                        startCheck(false);
                     break;
                 case ID_HELP: showHelp(); break;
                 case ID_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
@@ -1023,6 +1195,23 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_DONE:
             onDone(reinterpret_cast<Outcome*>(lp));
             return 0;
+        case WM_APP_CHECKED:
+            if (wp == 2) {  // 検索が終わった後で、待っていたアップデートを聞く
+                if (app.pendingUpdate && !app.running) {
+                    const imgdupe::ReleaseInfo info = *app.pendingUpdate;
+                    app.pendingUpdate.reset();
+                    askUpdate(info);
+                }
+            } else {
+                std::unique_ptr<upd::CheckResult> r(reinterpret_cast<upd::CheckResult*>(lp));
+                onChecked(wp == 1, *r);
+            }
+            return 0;
+        case WM_APP_DOWNLOADED: {
+            std::unique_ptr<upd::DownloadResult> r(reinterpret_cast<upd::DownloadResult*>(lp));
+            onDownloaded(*r);
+            return 0;
+        }
         case WM_APP_THUMB: {
             std::unique_ptr<ThumbResult> r(reinterpret_cast<ThumbResult*>(lp));
             bool current;
@@ -1039,6 +1228,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CLOSE:
+            if (app.updating) {
+                MessageBoxW(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
+                return 0;
+            }
             if (app.running &&
                 MessageBoxW(hwnd, L"検索中です。中止して終了しますか？\r\n（読み込んだ分はキャッシュに残します）", L"imgdupe",
                             MB_YESNO | MB_ICONQUESTION) != IDYES)
@@ -1160,6 +1353,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     app.inst = inst;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     app.dataDir = findDataDir();
+    upd::cleanupOldExe();
 
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1224,6 +1418,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     app.thumbThread = std::thread(thumbLoop);
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
+    // 1 日 1 回、裏でアップデートを確認する（imgdupe.ini の autoUpdateCheck=0 で止められる）
+    wchar_t last[32];
+    GetPrivateProfileStringW(L"imgdupe", L"lastUpdateCheck", L"", last, 32, iniPath().c_str());
+    if (iniInt(L"autoUpdateCheck", 1) && today() != last && std::string(IMGDUPE_VERSION) != "dev") startCheck(true);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
