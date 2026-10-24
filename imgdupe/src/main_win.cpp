@@ -182,7 +182,8 @@ std::wstring findDataDir() {
 }
 
 std::wstring iniPath() { return app.dataDir + L"\\imgdupe.ini"; }
-std::wstring cachePath() { return app.dataDir + L"\\imgdupe_cache.bin"; }
+std::wstring cachePath() { return app.dataDir + L"\\imgdupe_cache.bin"; }  // 前の版のキャッシュ（DB に取り込む）
+std::wstring dbPath() { return app.dataDir + L"\\imgdupe.db"; }
 
 int iniInt(const wchar_t* key, int def) { return GetPrivateProfileIntW(L"imgdupe", key, def, iniPath().c_str()); }
 void iniSet(const wchar_t* key, const std::wstring& v) {
@@ -522,7 +523,8 @@ void startSearch(const std::wstring& queryPath) {
     opt.threshold = static_cast<int>(SendMessageW(app.threshold, TBM_GETPOS, 0, 0));
     opt.exactOnly = Button_GetCheck(app.exact) == BST_CHECKED;
     opt.includeFlat = Button_GetCheck(app.flat) == BST_CHECKED;
-    opt.cacheFile = narrow(cachePath());
+    opt.dbFile = narrow(dbPath());
+    opt.legacyCacheFile = narrow(cachePath());
     const bool query = !queryPath.empty();
     opt.featuresOnly = query;
 
@@ -1506,7 +1508,8 @@ const wchar_t kCliUsage[] =
 int runCli(int argc, wchar_t** argv) {
     Console con;
     RunOptions opt;
-    opt.cacheFile = narrow(app.dataDir + L"\\imgdupe_cache.bin");
+    opt.dbFile = narrow(dbPath());
+    opt.legacyCacheFile = narrow(cachePath());
     std::wstring out = L"imgdupe_result", queryPath;
     for (int i = 2; i < argc; ++i) {
         const std::wstring a = argv[i];
@@ -1516,7 +1519,7 @@ int runCli(int argc, wchar_t** argv) {
         else if (a == L"--exact-only") opt.exactOnly = true;
         else if (a == L"--include-flat") opt.includeFlat = true;
         else if (a == L"-q") queryPath = next();
-        else if (a == L"--db") opt.cacheFile = narrow(next());
+        else if (a == L"--db") opt.dbFile = narrow(next());
         else if (a == L"-j") opt.threads = static_cast<unsigned>(std::max(1, _wtoi(next().c_str())));
         else if (a == L"-h" || a == L"--help") {
             con.print(kCliUsage);

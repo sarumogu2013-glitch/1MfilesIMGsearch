@@ -7,10 +7,13 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 
+#include "analyzer.hpp"
+#include "db.hpp"
 #include "platform.hpp"
 
 namespace imgdupe {
@@ -637,12 +640,6 @@ void finishGroup(Group& g, const std::vector<Entry>& files) {
 
 namespace {
 
-bool underRoot(const std::string& path, const std::string& root) {
-    if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0) return false;
-    const char last = root.empty() ? '/' : root.back();
-    return last == '/' || last == '\\' || path[root.size()] == '/' || path[root.size()] == '\\';
-}
-
 double secondsSince(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -671,15 +668,22 @@ Result run(const RunOptions& opt, const Callbacks& cb, Progress& prog, const std
         return res;
     }
 
-    // ハッシュ化（キャッシュに無いもの・変わったものだけ）
-    Cache cache;
-    if (!opt.cacheFile.empty()) cache.load(opt.cacheFile);
-    std::vector<uint32_t> todo;
-    for (uint32_t i = 0; i < scanned.size(); ++i) {
-        auto it = cache.entries.find(scanned[i].path);
-        if (it == cache.entries.end() || it->second.size != scanned[i].size || it->second.mtime != scanned[i].mtime)
-            todo.push_back(i);
+    // DB に登録（新しいファイル・変わったファイルは特徴量と段階を消す）
+    Db db;
+    if (!db.open(opt.dbFile.empty() ? ":memory:" : opt.dbFile))
+        throw std::runtime_error("画像の情報（DB）を開けません: " + db.error());
+    if (!opt.legacyCacheFile.empty() && db.setting("legacyCacheImported").empty()) {
+        Cache old;
+        if (old.load(opt.legacyCacheFile)) importCache(db, old, kHashVersion);
+        db.setSetting("legacyCacheImported", "1");
     }
+    std::unordered_map<std::string, int64_t> ids = upsertScanned(db, scanned);
+    std::unordered_map<std::string, ImageRow> known = loadHashedImages(db, kHashVersion);
+
+    // ハッシュ化（段階 "hash" が今の版で済んでいないものだけ）
+    std::vector<uint32_t> todo;
+    for (uint32_t i = 0; i < scanned.size(); ++i)
+        if (!known.count(scanned[i].path)) todo.push_back(i);
     prog.stage = static_cast<int>(Stage::Hash);
     prog.done = 0;
     prog.total = todo.size();
@@ -692,49 +696,45 @@ Result run(const RunOptions& opt, const Callbacks& cb, Progress& prog, const std
         prog.done.fetch_add(1, std::memory_order_relaxed);
     });
     res.secHash = secondsSince(t0);
-    for (size_t k = 0; k < todo.size(); ++k) {
-        if (!finished[k]) continue;
-        const auto& s = scanned[todo[k]];
-        Entry e;
-        e.path = s.path;
-        e.size = s.size;
-        e.mtime = s.mtime;
-        e.f = feats[k];
-        cache.entries[s.path] = std::move(e);
-        ++res.hashed;
-    }
-    // 消えたファイルをキャッシュから除く（今回のフォルダの下だけ）
     {
-        std::unordered_set<std::string> alive;
-        alive.reserve(scanned.size());
-        for (const auto& s : scanned) alive.insert(s.path);
-        for (auto it = cache.entries.begin(); it != cache.entries.end();) {
-            bool drop = false;
-            if (!alive.count(it->first))
-                for (const auto& r : opt.roots)
-                    if (underRoot(it->first, r)) drop = true;
-            it = drop ? cache.entries.erase(it) : std::next(it);
+        std::vector<std::pair<int64_t, Features>> rows;
+        for (size_t k = 0; k < todo.size(); ++k) {
+            if (!finished[k]) continue;
+            const auto& s = scanned[todo[k]];
+            ImageRow r;
+            r.id = ids.at(s.path);
+            r.e.path = s.path;
+            r.e.size = s.size;
+            r.e.mtime = s.mtime;
+            r.e.f = feats[k];
+            rows.emplace_back(r.id, r.e.f);
+            known[s.path] = std::move(r);
+            ++res.hashed;
         }
+        saveFeatures(db, rows, kHashVersion);  // 中止しても、読み込んだ分は残す
     }
-    auto saveCache = [&] {
-        if (!opt.cacheFile.empty()) cache.save(opt.cacheFile);
-    };
+    // 消えたファイルを DB から除く（今回のフォルダの下だけ）
+    removeMissing(db, opt.roots, ids);
     if (cancel) {
-        saveCache();
         res.cancelled = true;
         return res;
     }
 
     res.files.reserve(scanned.size());
+    res.ids.reserve(scanned.size());
     for (const auto& s : scanned) {
-        auto it = cache.entries.find(s.path);
-        if (it != cache.entries.end() && it->second.size == s.size && it->second.mtime == s.mtime)
-            res.files.push_back(it->second);
+        auto it = known.find(s.path);
+        if (it == known.end()) continue;
+        res.files.push_back(it->second.e);
+        res.ids.push_back(it->second.id);
     }
+    // ここから先は走査結果を使わないので、メモリを返す（100 万枚だと数百 MB になる）
+    known = {};
+    ids = {};
+    scanned = {};
     for (const auto& e : res.files)
         if (!e.f.ok) ++res.unreadable;
     if (opt.featuresOnly) {
-        saveCache();
         prog.stage = static_cast<int>(Stage::Done);
         return res;
     }
@@ -760,20 +760,16 @@ Result run(const RunOptions& opt, const Callbacks& cb, Progress& prog, const std
         shaOk[k] = sha256File(e.path, e.sha);
         prog.done.fetch_add(1, std::memory_order_relaxed);
     });
-    for (size_t k = 0; k < need.size(); ++k) {
-        if (!shaOk[k]) continue;
-        Entry& e = res.files[need[k]];
-        e.hasSha = true;
-        auto it = cache.entries.find(e.path);
-        if (it != cache.entries.end()) {
-            it->second.hasSha = true;
-            it->second.sha = e.sha;
+    {
+        std::vector<std::pair<int64_t, Sha256>> rows;
+        for (size_t k = 0; k < need.size(); ++k) {
+            if (!shaOk[k]) continue;
+            Entry& e = res.files[need[k]];
+            e.hasSha = true;
+            rows.emplace_back(res.ids[need[k]], e.sha);
         }
+        saveSha(db, rows);
     }
-    saveCache();
-    // ここから先はキャッシュも走査結果も使わないので、メモリを返す（100 万枚だと数百 MB になる）
-    cache.entries = {};
-    scanned = {};
     if (cancel) {
         res.cancelled = true;
         return res;
@@ -849,6 +845,7 @@ Result run(const RunOptions& opt, const Callbacks& cb, Progress& prog, const std
         std::stable_sort(res.groups.begin(), res.groups.end(),
                          [](const Group& a, const Group& b) { return a.reclaim > b.reclaim; });
     }
+    replaceDuplicateGroups(db, res, res.ids);
     prog.stage = static_cast<int>(Stage::Done);
     return res;
 }

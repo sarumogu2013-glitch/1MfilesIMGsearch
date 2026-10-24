@@ -153,11 +153,13 @@ struct RunOptions {
     bool includeFlat = false;  // 単色に近い画像も見た目で比べる
     int flatContrast = 6;      // contrast がこれ未満なら単色に近いとみなす
     unsigned threads = 0;
-    std::string cacheFile;     // 空ならキャッシュを使わない
+    std::string dbFile;        // 画像の情報を残す DB（SQLite）。空ならメモリの中だけ
+    std::string legacyCacheFile;  // 前の版のキャッシュ（imgdupe_cache.bin）。あれば最初の 1 回だけ DB に取り込む
 };
 
 struct Result {
     std::vector<Entry> files;   // 見つかった画像（読めなかったものも含む）
+    std::vector<int64_t> ids;   // files と同じ並びの、DB の画像 ID
     std::vector<Group> groups;
     uint64_t unreadable = 0;
     uint64_t flatSkipped = 0;

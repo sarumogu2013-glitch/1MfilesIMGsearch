@@ -5,9 +5,12 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <random>
 
+#include "analyzer.hpp"
 #include "commands.hpp"
+#include "db.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
 
@@ -197,7 +200,7 @@ static void testRun() {
 
     RunOptions opt;
     opt.roots = {pics.string()};
-    opt.cacheFile = (root / "cache.bin").string();
+    opt.dbFile = (root / "imgdupe.db").string();
     opt.threads = 2;
     int decodes = 0;
     const Callbacks cb = fakeCallbacks(decodes);
@@ -221,7 +224,17 @@ static void testRun() {
     }
     CHECK(prog.stage == static_cast<int>(Stage::Done));
 
-    // 2 回目はキャッシュを使う。消したファイルはキャッシュからも消える
+    // 重複のまとまりは DB の groups にも残る
+    {
+        Db db;
+        CHECK(db.open(opt.dbFile));
+        Stmt g(db.handle(), "SELECT COUNT(*) FROM groups");
+        CHECK(g.step() && g.i64(0) == 4);
+        Stmt m(db.handle(), "SELECT COUNT(*), SUM(representative) FROM group_members");
+        CHECK(m.step() && m.i64(0) == 9 && m.i64(1) == 4);  // グループごとに代表が 1 枚
+    }
+
+    // 2 回目は DB の結果を使う。消したファイルは DB からも消える
     fs::remove(pics / "c.jpg");
     writeRaw(pics / "e.jpg", pattern(5));
     decodes = 0;
@@ -229,11 +242,23 @@ static void testRun() {
     CHECK(decodes == 1);
     CHECK(r.hashed == 1);
     CHECK(r.files.size() == 11);
-    Cache cache;
-    CHECK(cache.load(opt.cacheFile));
-    CHECK(cache.entries.size() == 11);
-    CHECK(!cache.entries.count((pics / "c.jpg").string()));
-    CHECK(cache.entries.at((pics / "a.jpg").string()).hasSha);
+    CHECK(r.ids.size() == r.files.size());
+    {
+        Db db;
+        CHECK(db.open(opt.dbFile));
+        const auto known = loadHashedImages(db, kHashVersion);
+        CHECK(known.size() == 11);
+        CHECK(!known.count((pics / "c.jpg").string()));
+        CHECK(known.at((pics / "a.jpg").string()).e.hasSha);
+    }
+
+    // 中身を書き換えたファイル（更新日時が変わる）は読み直す
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    writeRaw(pics / "e.jpg", pattern(6));
+    fs::last_write_time(pics / "e.jpg", fs::last_write_time(pics / "e.jpg") + std::chrono::seconds(5));
+    decodes = 0;
+    r = run(opt, cb, prog, cancel);
+    CHECK(decodes == 1);
 
     // 単色に近い画像も比べる
     opt.includeFlat = true;
@@ -358,6 +383,126 @@ static void testKeys() {
     for (const auto& c : allCommands()) CHECK(findCommand(c.name) == &c && findCommand(c.id) == &c);
 }
 
+// 画像のパスに "fail" があれば失敗、それ以外はパスの文字数をタグにする解析器
+class FakeAnalyzer : public Analyzer {
+public:
+    explicit FakeAnalyzer(int v) : v_(v) {}
+    std::string stageName() const override { return stage::kTagger; }
+    int version() const override { return v_; }
+    AnalyzerOutput analyze(const AnalyzerInput& in) override {
+        calls.fetch_add(1);
+        AnalyzerOutput out;
+        out.ok = in.path.find("fail") == std::string::npos;
+        if (out.ok) out.tags.push_back({"len" + std::to_string(in.path.size()), "general", "", 0.5, false});
+        return out;
+    }
+    std::atomic<int> calls{0};
+
+private:
+    int v_;
+};
+
+static void testDb() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-db-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string path = (dir / "t.db").string();
+    Db db;
+    CHECK(db.open(path));
+    CHECK(db.schemaVersion() == kSchemaVersion);
+    for (const char* t : {"images", "stages", "tags", "tag_dict", "embeddings", "groups", "group_members", "sources",
+                          "links", "history", "commands", "settings", "file_meta"}) {
+        Stmt st(db.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?");
+        st.bind(1, std::string(t));
+        CHECK(st.step() && st.i64(0) == 1);
+    }
+    {
+        Stmt st(db.handle(), "PRAGMA journal_mode");
+        CHECK(st.step() && st.text(0) == "wal");
+    }
+    db.setSetting("a", "1");
+    db.setSetting("a", "2");
+    CHECK(db.setting("a") == "2");
+    CHECK(db.setting("none", "def") == "def");
+
+    // 登録と、変わったファイルの段階のやり直し
+    std::vector<ScannedFile> files = {{"/p/a.jpg", 10, 100}, {"/p/b.jpg", 20, 200}, {"/p/fail.jpg", 30, 300}};
+    auto ids = upsertScanned(db, files);
+    CHECK(ids.size() == 3);
+    CHECK(pendingImages(db, stage::kHash, kHashVersion).size() == 3);
+    Features f;
+    f.ok = true;
+    f.dh = 0xFFFFFFFFFFFFFFFFull;  // 符号付きで保存しても戻る
+    f.r = 1, f.g = 2, f.b = 3;
+    saveFeatures(db, {{ids["/p/a.jpg"], f}}, kHashVersion);
+    auto known = loadHashedImages(db, kHashVersion);
+    CHECK(known.size() == 1);
+    CHECK(known.at("/p/a.jpg").e.f.dh == 0xFFFFFFFFFFFFFFFFull && known.at("/p/a.jpg").e.f.b == 3);
+    CHECK(loadHashedImages(db, kHashVersion + 1).empty());  // 版が変われば使わない
+    files[0].mtime = 101;
+    CHECK(upsertScanned(db, files)["/p/a.jpg"] == ids["/p/a.jpg"]);  // 同じ ID のまま
+    CHECK(loadHashedImages(db, kHashVersion).empty());
+
+    // 解析器: 済んだ画像は飛ばし、版が上がったらやり直す。失敗は同じ版では再挑戦しない
+    std::atomic<bool> cancel{false};
+    FakeAnalyzer a1(1);
+    StageReport rep = runStage(db, a1, 2, cancel, nullptr, 2);
+    CHECK(rep.processed == 3 && rep.failed == 1 && a1.calls == 3);
+    CHECK(tagsOf(db, ids["/p/b.jpg"]).size() == 1);
+    CHECK(tagsOf(db, ids["/p/b.jpg"])[0].source == stage::kTagger);
+    rep = runStage(db, a1, 2, cancel);
+    CHECK(rep.processed == 0 && a1.calls == 3);
+    FakeAnalyzer a2(2);
+    rep = runStage(db, a2, 2, cancel);
+    CHECK(rep.processed == 3);
+    CHECK(tagsOf(db, ids["/p/b.jpg"]).size() == 1);  // 同じ出どころのタグは置き換わる
+
+    // 手動で確定したタグは解析器に上書きされない
+    {
+        Stmt st(db.handle(), "UPDATE tags SET manual=1, confidence=1.0 WHERE image_id=?");
+        st.bind(1, ids["/p/b.jpg"]);
+        st.step();
+    }
+    replaceTags(db, ids["/p/b.jpg"], stage::kTagger, {{"len9", "general", "", 0.1, false}});
+    for (const auto& t : tagsOf(db, ids["/p/b.jpg"]))
+        if (t.manual) CHECK(t.confidence == 1.0);
+
+    // 消えたファイル（フォルダの下だけ）。段階・タグも一緒に消える
+    std::unordered_map<std::string, int64_t> alive = {{"/p/a.jpg", ids["/p/a.jpg"]}};
+    CHECK(removeMissing(db, {"/other"}, alive) == 0);
+    CHECK(removeMissing(db, {"/p"}, alive) == 2);
+    {
+        Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE image_id=?");
+        st.bind(1, ids["/p/b.jpg"]);
+        CHECK(st.step() && st.i64(0) == 0);
+    }
+
+    // 前の版のキャッシュの取り込み
+    Cache c;
+    Entry e;
+    e.path = "/q/x.png";
+    e.size = 5;
+    e.mtime = 6;
+    e.f.ok = true;
+    e.f.dv = 42;
+    c.entries[e.path] = e;
+    CHECK(importCache(db, c, kHashVersion) == 1);
+    CHECK(importCache(db, c, kHashVersion) == 0);
+    CHECK(loadHashedImages(db, kHashVersion).at("/q/x.png").e.f.dv == 42);
+    db.close();
+
+    // 新しい版の imgdupe で作った DB は開かない
+    {
+        Db d2;
+        CHECK(d2.open(path));
+        d2.exec("PRAGMA user_version=999");
+    }
+    Db d3;
+    CHECK(!d3.open(path));
+    CHECK(!d3.error().empty());
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -385,6 +530,7 @@ int main() {
     testShrinker();
     testSimilarMatchesBruteForce();
     testRun();
+    testDb();
     testExifOrientation();
     testUpdateLogic();
     testKeys();
