@@ -1,0 +1,27 @@
+{
+  "_説明": "AI 解析で使う部品。ここを変えて main に入れると、リリースの models.json が変わり、アプリの「アップデートを確認」で入れ替わる。version を変えた部品だけがダウンロードし直しになる（Hugging Face の部品は revision のコミットが版になる）。",
+  "components": [
+    {
+      "id": "onnxruntime",
+      "name": "ONNX Runtime（DirectML）",
+      "description": "AI のモデルを動かす部品。GPU があれば DirectML で使う",
+      "nuget": [
+        {"package": "Microsoft.ML.OnnxRuntime.DirectML", "version": "1.24.4",
+         "files": {"runtimes/win-x64/native/onnxruntime.dll": "onnxruntime.dll"}},
+        {"package": "Microsoft.AI.DirectML", "version": "1.15.4",
+         "files": {"bin/x64-win/DirectML.dll": "DirectML.dll"}}
+      ]
+    },
+    {
+      "id": "wd14",
+      "name": "WD14 タガー（wd-eva02-large-tagger-v3）",
+      "description": "画像にキャラ・作品・一般のタグを付ける",
+      "requires": ["onnxruntime"],
+      "huggingface": {
+        "repo": "SmilingWolf/wd-eva02-large-tagger-v3",
+        "revision": "main",
+        "files": {"model.onnx": "wd14/model.onnx", "selected_tags.csv": "wd14/selected_tags.csv"}
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+// インストーラーのリソース。101 は中に入れる imgdupe.exe（build.sh が先に作る）
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+101 RCDATA "../out/imgdupe.exe"

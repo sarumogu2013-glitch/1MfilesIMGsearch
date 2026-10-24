@@ -16,6 +16,7 @@
 #include "search.hpp"
 #include "links.hpp"
 #include "names.hpp"
+#include "models.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1267,6 +1268,55 @@ static void testNames() {
     fs::remove_all(dir);
 }
 
+static void testModels() {
+    const std::string h1(64, 'a'), h2(64, 'b');
+    const std::string json = R"({"version":1,"components":[
+      {"id":"onnxruntime","name":"ONNX Runtime","version":"1.24.4","files":[
+        {"path":"onnxruntime.dll","url":"https://example.com/o.dll","sha256":")" + h1 + R"(","size":100},
+        {"path":"DirectML.dll","url":"https://example.com/d.dll","sha256":")" + h1 + R"(","size":50}]},
+      {"id":"wd14","name":"WD14","version":"abc","requires":["onnxruntime"],"files":[
+        {"path":"wd14/model.onnx","url":"https://example.com/m.onnx","sha256":")" + std::string(64, 'B') + R"(","size":1000}]}]})";
+    Manifest m;
+    CHECK(parseManifest(json, m) && m.components.size() == 2);
+    CHECK(m.find("wd14") && m.find("wd14")->totalSize() == 1000 && m.find("wd14")->files[0].sha256 == h2);
+    CHECK(m.find("onnxruntime")->totalSize() == 150 && !m.find("x"));
+
+    auto ids = [](const std::vector<const Component*>& v) {
+        std::vector<std::string> out;
+        for (auto* c : v) out.push_back(c->id);
+        return out;
+    };
+    using V = std::vector<std::string>;
+    Installed none;
+    CHECK((ids(planInstall(m, none, {"wd14"})) == V{"onnxruntime", "wd14"}));  // 要る部品を先に
+    CHECK(planUpdate(m, none).empty());
+    Installed in;
+    in["onnxruntime"] = {"1.24.4", {"onnxruntime.dll", "DirectML.dll"}};
+    in["wd14"] = {"old", {"wd14/model-old.onnx", "wd14/selected_tags.csv"}};
+    CHECK((ids(planUpdate(m, in)) == V{"wd14"}));  // 版が変わったものだけ
+    CHECK((ids(planInstall(m, in, {"wd14", "nothing"})) == V{"wd14"}));
+    CHECK((staleFiles(in["wd14"], *m.find("wd14")) == V{"wd14/model-old.onnx", "wd14/selected_tags.csv"}));
+    in.erase("onnxruntime");
+    CHECK((ids(planUpdate(m, in)) == V{"onnxruntime", "wd14"}));  // 要る部品が足りない
+
+    Installed back;
+    CHECK(parseInstalled(installedToJson(in), back) && back.size() == 1 && back["wd14"].version == "old" &&
+          back["wd14"].files.size() == 2);
+
+    // 危ないもの
+    CHECK(safeRelativePath("a/b.onnx") && !safeRelativePath("../x") && !safeRelativePath("a/../b") &&
+          !safeRelativePath("C:\\x") && !safeRelativePath("/etc/x") && !safeRelativePath("a//b"));
+    auto bad = [&](const std::string& path, const std::string& url, const std::string& sha) {
+        Manifest x;
+        return !parseManifest(R"({"components":[{"id":"a","version":"1","files":[{"path":")" + path + R"(","url":")" + url +
+                                  R"(","sha256":")" + sha + R"("}]}]})",
+                              x);
+    };
+    CHECK(bad("../a", "https://x/a", h1) && bad("a", "http://x/a", h1) && bad("a", "https://x/a", "abc"));
+    CHECK(!bad("a", "http://127.0.0.1:8000/a", h1));  // 手元のテスト用サーバーだけ http 可
+    CHECK(!parseManifest("[]", m) && !parseManifest(R"({"components":[{"id":"a","version":"1","files":[]}]})", m));
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1302,6 +1352,7 @@ int main() {
     testSearch();
     testLinks();
     testNames();
+    testModels();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

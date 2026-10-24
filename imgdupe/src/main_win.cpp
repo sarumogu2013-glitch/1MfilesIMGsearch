@@ -34,7 +34,9 @@
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "indexer_win.hpp"
+#include "install_win.hpp"
 #include "keymap_win.hpp"
+#include "models_win.hpp"
 #include "resource.h"
 #include "search.hpp"
 #include "links.hpp"
@@ -57,6 +59,9 @@ constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: CheckMode, lParam: up
 constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // wParam: CheckMode, lParam: upd::DownloadResult*
 constexpr UINT WM_APP_SEARCHED = WM_APP + 5;  // lParam: SearchDone*
 constexpr UINT WM_APP_EXPANDED = WM_APP + 6;  // lParam: ExpandDone*
+constexpr UINT WM_APP_MODELS = WM_APP + 7;     // lParam: models::ManifestResult*（AI の部品の一覧が届いた）
+constexpr UINT WM_APP_MODEL_PROGRESS = WM_APP + 8;  // lParam: std::wstring*
+constexpr UINT WM_APP_MODELS_DONE = WM_APP + 9;     // lParam: std::wstring*（失敗の理由。空なら成功）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
@@ -163,6 +168,9 @@ struct App {
 
     // アップデート
     bool updating = false;                   // 確認・ダウンロード中
+    bool modelsDownloading = false;          // AI の部品をダウンロード中
+    bool closeAfterModels = false;           // ダウンロードを中止したら閉じる
+    std::atomic<bool> modelsCancel{false};
     bool closing = false;                    // 終了時のアップデート確認中（ウィンドウは隠してある）
 
     // 画面の切り替え（0: 重複を探す、1: 検索）
@@ -806,6 +814,132 @@ void startCheck(CheckMode mode) {
     }).detach();
 }
 
+// ---------------------------------------------------------------- AI の部品（ONNX Runtime・モデル）
+
+enum class ModelsAsk { UpdatesOnly, Offer };  // アップデートの確認から / メニュー「AI 解析の部品」から
+ModelsAsk modelsAsk = ModelsAsk::UpdatesOnly;
+
+void startModelsCheck(ModelsAsk ask) {
+    if (app.modelsDownloading) {
+        MessageBoxW(app.hwnd, L"AI の部品をダウンロードしています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    modelsAsk = ask;
+    HWND hwnd = app.hwnd;
+    std::thread([hwnd] {
+        auto* r = new models::ManifestResult(models::fetchManifest());
+        if (!PostMessageW(hwnd, WM_APP_MODELS, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+std::wstring componentLines(const std::vector<const imgdupe::Component*>& comps, uint64_t& total) {
+    std::wstring lines;
+    total = 0;
+    for (const auto* c : comps) {
+        lines += L"・" + widen(c->name) + L"（" + widen(c->version) + L"、約 " + models::sizeText(c->totalSize()) + L"）\r\n";
+        total += c->totalSize();
+    }
+    return lines;
+}
+
+void startModelsDownload(std::vector<const imgdupe::Component*> comps, imgdupe::Manifest manifest) {
+    app.modelsDownloading = true;
+    app.modelsCancel = false;
+    tbEnable(CMD_CHECK_UPDATE, false);
+    HWND hwnd = app.hwnd;
+    const std::wstring dir = app.dataDir;
+    // comps は manifest の中を指すので、manifest ごとスレッドに渡す
+    auto shared = std::make_shared<imgdupe::Manifest>(std::move(manifest));
+    std::vector<std::string> ids;
+    for (const auto* c : comps) ids.push_back(c->id);
+    std::thread([hwnd, dir, shared, ids] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::vector<const imgdupe::Component*> list;
+        for (const auto& id : ids)
+            if (const auto* c = shared->find(id)) list.push_back(c);
+        DWORD last = 0;
+        const std::wstring err = models::install(dir, list, [&](const std::wstring& name, uint64_t done, uint64_t total) {
+            const DWORD now = GetTickCount();
+            if (now - last > 300 || done == total) {
+                last = now;
+                auto* text = new std::wstring(name + L" をダウンロードしています… " + models::sizeText(done) + L" / " +
+                                              models::sizeText(total) + L"（" + std::to_wstring(total ? done * 100 / total : 0) + L"%）");
+                if (!PostMessageW(hwnd, WM_APP_MODEL_PROGRESS, 0, reinterpret_cast<LPARAM>(text))) delete text;
+            }
+            return !app.modelsCancel.load();
+        });
+        CoUninitialize();
+        auto* r = new std::wstring(err);
+        if (!PostMessageW(hwnd, WM_APP_MODELS_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void onModelsChecked(const models::ManifestResult& r) {
+    if (!r.ok) {
+        if (modelsAsk == ModelsAsk::Offer)
+            MessageBoxW(app.hwnd, r.error.c_str(), L"AI 解析の部品", MB_ICONWARNING);
+        return;  // アップデートの確認からなら、本体の結果を出した後なので何も言わない
+    }
+    const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
+    uint64_t total = 0;
+    const auto updates = imgdupe::planUpdate(r.manifest, installed);
+    if (!updates.empty()) {
+        const std::wstring lines = componentLines(updates, total);
+        if (MessageBoxW(app.hwnd,
+                        (L"AI 解析の部品に新しい版があります。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
+                         L"。ダウンロードして入れ替えますか？")
+                            .c_str(),
+                        L"AI 解析の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
+            startModelsDownload(updates, r.manifest);
+        return;
+    }
+    if (modelsAsk == ModelsAsk::UpdatesOnly) return;
+    // まだ入れていない部品（ほかの部品から要るだけのものは出さない）
+    std::vector<std::string> wanted;
+    for (const auto& c : r.manifest.components) {
+        bool dependency = false;
+        for (const auto& o : r.manifest.components)
+            for (const auto& q : o.requires_)
+                if (q == c.id) dependency = true;
+        if (!dependency) wanted.push_back(c.id);
+    }
+    const auto missing = imgdupe::planInstall(r.manifest, installed, wanted);
+    if (missing.empty()) {
+        std::wstring lines;
+        for (const auto& [id, c] : installed)
+            if (const auto* m = r.manifest.find(id)) lines += L"・" + widen(m->name) + L"（" + widen(c.version) + L"）\r\n";
+        MessageBoxW(app.hwnd, (L"AI 解析の部品はすべて最新です。\r\n\r\n" + lines).c_str(), L"AI 解析の部品", MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring lines = componentLines(missing, total);
+    if (MessageBoxW(app.hwnd,
+                    (L"次の部品を入れます。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
+                     L"。ダウンロードしますか？\r\n（入れる場所: " + models::modelsDir(app.dataDir) + L"）")
+                        .c_str(),
+                    L"AI 解析の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
+        startModelsDownload(missing, r.manifest);
+}
+
+void restartIndexerAfterUpdate();
+
+void onModelsDone(const std::wstring& err) {
+    app.modelsDownloading = false;
+    tbEnable(CMD_CHECK_UPDATE, true);
+    SetWindowTextW(app.hwnd, (L"imgdupe - 重複画像検索 " + widen(IMGDUPE_VERSION)).c_str());
+    if (app.closeAfterModels) {
+        PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (!err.empty()) {
+        setText(app.status, L"AI 解析の部品を入れられませんでした");
+        MessageBoxW(app.hwnd, (L"AI 解析の部品を入れられませんでした。\r\n\r\n" + err).c_str(), L"AI 解析の部品", MB_ICONWARNING);
+        return;
+    }
+    restartIndexerAfterUpdate();  // 新しいモデルで解析し直す
+    setText(app.status, L"AI 解析の部品を入れました");
+    MessageBoxW(app.hwnd, L"AI 解析の部品を入れました。", L"AI 解析の部品", MB_ICONINFORMATION);
+}
+
 void startDownload(CheckMode mode, const imgdupe::ReleaseInfo& info) {
     app.updating = true;
     tbEnable(CMD_CHECK_UPDATE, false);
@@ -855,11 +989,13 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
         MessageBoxW(app.hwnd,
                     (L"最新の版です。\r\n\r\n今の版: " + cur + L"\r\n最新のリリース: " + widen(r.info.tag)).c_str(),
                     L"imgdupe のアップデート", MB_ICONINFORMATION);
+        startModelsCheck(ModelsAsk::UpdatesOnly);  // 本体が最新なら、AI の部品の版も確かめる
         return;
     }
     if (MessageBoxW(app.hwnd,
                     (L"新しい版があります。\r\n\r\n" + versions +
-                     L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます）")
+                     L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます。AI 解析の部品の更新は、"
+                     L"再起動した後にもう一度「アップデートを確認」で確かめます）")
                         .c_str(),
                     L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION) == IDYES)
         startDownload(kManual, r.info);
@@ -2610,7 +2746,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -2820,6 +2956,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     else
                         startCheck(kManual);
                     break;
+                case CMD_MODELS: startModelsCheck(ModelsAsk::Offer); break;
                 case CMD_PREV_GROUP: selectGroupRelative(-1); break;
                 case CMD_NEXT_GROUP: selectGroupRelative(1); break;
                 case CMD_TOGGLE_EXACT:
@@ -2939,6 +3076,24 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             onDone(reinterpret_cast<Outcome*>(lp));
             return 0;
+        case WM_APP_MODELS: {
+            std::unique_ptr<models::ManifestResult> r(reinterpret_cast<models::ManifestResult*>(lp));
+            onModelsChecked(*r);
+            return 0;
+        }
+        case WM_APP_MODEL_PROGRESS: {
+            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
+            if (app.modelsDownloading && !app.modelsCancel) {
+                setText(app.status, *text);
+                SetWindowTextW(hwnd, (L"imgdupe - " + *text).c_str());
+            }
+            return 0;
+        }
+        case WM_APP_MODELS_DONE: {
+            std::unique_ptr<std::wstring> err(reinterpret_cast<std::wstring*>(lp));
+            onModelsDone(*err);
+            return 0;
+        }
         case WM_APP_CHECKED: {
             std::unique_ptr<upd::CheckResult> r(reinterpret_cast<upd::CheckResult*>(lp));
             onChecked(static_cast<CheckMode>(wp), *r);
@@ -2969,6 +3124,14 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (app.closing) return 0;
             if (app.updating) {
                 MessageBoxW(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
+                return 0;
+            }
+            if (app.modelsDownloading) {
+                if (MessageBoxW(hwnd, L"AI 解析の部品をダウンロードしています。中止して終了しますか？\r\n（入れ終わった部品はそのまま使えます）",
+                                L"imgdupe", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    app.closeAfterModels = true;
+                    app.modelsCancel = true;
+                }
                 return 0;
             }
             if (app.running &&
@@ -3113,6 +3276,63 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
 }
 
 // imgdupe.exe --index <フォルダ>...: 走査して DB に登録し、ハッシュとサムネイルを作る
+// アンインストール（「アプリと機能」から imgdupe.exe --uninstall で呼ばれる）
+int runUninstall() {
+    const wchar_t* title = L"imgdupe のアンインストール";
+    if (MessageBoxW(nullptr, L"imgdupe をアンインストールしますか？\r\n（画像は消えません）", title, MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return 1;
+    const int data = MessageBoxW(nullptr,
+                                 L"設定と画像の情報（imgdupe.db・サムネイル・imgdupe.ini）も消しますか？\r\n"
+                                 L"「いいえ」なら残します（入れ直した時にそのまま使えます）。",
+                                 title, MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (data == IDCANCEL) return 1;
+    // バックグラウンドの解析を止め、自動起動をやめる
+    if (indexer::isRunning()) {
+        indexer::requestQuit(app.dataDir);
+        for (int i = 0; i < 100 && indexer::isRunning(); ++i) Sleep(100);
+    }
+    indexer::setAutoStart(false);
+    // 一時リンク（固定にしたものは残す）
+    {
+        Db db;
+        if (db.open(narrow(dbPath()))) {
+            try {
+                removeLinks(db, "", true);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    install::removeShortcuts();
+    install::unregisterUninstall();
+    models::removeAll(app.dataDir);
+    if (data == IDYES) {
+        for (const wchar_t* f : {L"imgdupe.db", L"imgdupe.db-wal", L"imgdupe.db-shm", L"imgdupe.ini", L"imgdupe_cache.bin"})
+            DeleteFileW((app.dataDir + L"\\" + f).c_str());
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((app.dataDir + L"\\thumbs_*.pack").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do DeleteFileW((app.dataDir + L"\\" + fd.cFileName).c_str());
+            while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        if (app.dataDir != exeDir()) RemoveDirectoryW(app.dataDir.c_str());
+    }
+    MessageBoxW(nullptr, L"imgdupe をアンインストールしました。", title, MB_ICONINFORMATION);
+    // 動いている exe は自分では消せないので、終わってから cmd に消してもらう（消えるまで 1 秒ごとに最大 20 回。フォルダは空の時だけ消える）
+    const std::wstring exe = upd::exePath(), dir = exeDir();
+    std::wstring cmd = L"cmd.exe /c for /l %i in (1,1,20) do (if exist \"" + exe + L"\" (ping -n 2 127.0.0.1 >nul & del /f /q \"" +
+                       exe + L"\" \"" + exe + L".old\" 2>nul)) & rmdir \"" + dir + L"\" 2>nul";
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    return 0;
+}
+
 int runIndexCli(int argc, wchar_t** argv) {
     Console con;
     IndexOptions opt;
@@ -3155,6 +3375,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--uninstall") == 0) {
+        LocalFree(argv);
+        const int code = runUninstall();
+        CoUninitialize();
+        return code;
+    }
+    if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--restart-indexer") == 0) {
+        // インストーラーから: 動いているバックグラウンドの解析を、この exe で動かし直す
+        LocalFree(argv);
+        if (indexer::isRunning()) {
+            indexer::requestQuit(app.dataDir);
+            indexer::start(true);
+        }
+        CoUninitialize();
+        return 0;
+    }
+    install::syncDisplayVersion(upd::exePath(), widen(IMGDUPE_VERSION));
     if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--indexer") == 0) {
         const bool waitForOld = argc >= 3 && lstrcmpiW(argv[2], L"--restart") == 0;
         LocalFree(argv);

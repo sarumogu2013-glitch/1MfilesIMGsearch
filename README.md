@@ -1,9 +1,20 @@
 # imgdupe（重複画像検索）
 
 ディスクの中から **同じ画像** と **見た目が同じ画像** を探す Windows 用ツールです。
-100 万枚規模でも動くよう C++ で作っています（インストール不要。`imgdupe.zip` を展開して `imgdupe.exe` を起動）。
+100 万枚規模でも動くよう C++ で作っています。
 
-**ダウンロード:** [最新版の imgdupe.zip](https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest)
+**ダウンロード:** [最新版のリリース](https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest) から `imgdupe_setup.exe` を落として実行します。
+
+## インストール
+
+- `imgdupe_setup.exe` を実行し、「インストール」を押します。**管理者の権限は要りません**（`%LOCALAPPDATA%\Programs\imgdupe` に入れます。場所は変えられます）。
+- **AI 解析の部品**（ONNX Runtime と WD14 タガーのモデル。合わせて約 1.3 GB）は、チェックを入れるとインストールの途中でダウンロードします。
+  外しておいて、後から「その他 → AI 解析の部品…」で入れることもできます。
+- 使うモデルが変わった時は、「アップデートを確認」を押すと（本体が最新なら続けて）AI 解析の部品の新しい版を確かめ、
+  変わった部品だけをダウンロードして入れ替えます。ダウンロードしたファイルは SHA-256 を確かめてから使います。
+- アンインストールは、Windows の「設定 → アプリ → インストールされているアプリ」の imgdupe から。
+  設定と画像の情報（DB・サムネイル）を残すかどうかを聞きます。画像そのものは消えません。
+- インストーラーを入れ直すと、同じ場所に上書きします（設定と DB はそのまま）。
 
 画像は **読むだけ** で、移動・削除・書き換えはしません（「フォルダに展開」で作るのは、元の画像を指すハードリンクです）。
 
@@ -13,7 +24,7 @@ exe に電子署名（有料の証明書）が無いため、インターネッ�
 次のどちらかで起動できます。
 
 - 出た画面の **「詳細情報」** を押し、**「実行」** を押す（1 回やれば、その exe では次から出ません）
-- 展開する前に、`imgdupe.zip` を右クリック → **プロパティ** → 下の **「許可する」** にチェック → OK。それから展開する
+- 実行する前に、`imgdupe_setup.exe` を右クリック → **プロパティ** → 下の **「許可する」** にチェック → OK
 
 ## 使い方
 
@@ -147,7 +158,8 @@ exe に電子署名（有料の証明書）が無いため、インターネッ�
 
 ## 設定と DB の場所
 
-exe と同じフォルダに `imgdupe.ini`（設定）と `imgdupe.db`（画像の情報。SQLite）を作ります。
+exe と同じフォルダ（インストールした場所）に `imgdupe.ini`（設定）と `imgdupe.db`（画像の情報。SQLite）を作ります。
+AI 解析の部品は同じ場所の `models` フォルダに入ります（入れた版は `models\installed.json`）。
 前の版の `imgdupe_cache.bin` があれば、最初の 1 回だけ `imgdupe.db` に取り込みます（読み直しは要りません。取り込んだ後は消して構いません）。
 exe のフォルダに書き込めない時（Program Files に置いた時など）は `%LOCALAPPDATA%\imgdupe` に作ります。
 場所は「ヘルプ → バージョン情報」で確かめられます。`imgdupe.db` は消しても構いません（次回すべて読み直します）。
@@ -189,7 +201,12 @@ imgdupe/build.sh        # Windows 用の imgdupe/out/imgdupe.exe を作る（Min
 imgdupe/build.sh test   # OS に依存しない部分のテスト
 ```
 
+`imgdupe/build.sh` は `imgdupe.exe` と、それを中に入れたインストーラー `imgdupe_setup.exe` を作ります。
+
 `main` ブランチに push すると GitHub Actions がテスト・ビルドし、リリース（`v<VERSION>.<連番>`）を作ります。
+AI 解析の部品は `imgdupe/models.src.json` に書きます。リリースの時に `imgdupe/tools/make_models_json.py` が
+NuGet から ONNX Runtime を取り出し、Hugging Face のモデルをコミットに固定して、SHA-256 と大きさを入れた `models.json` を添付します。
+使うモデルを変える時は `models.src.json` を書き換えて `main` に入れます（アプリの「アップデートを確認」で入れ替わります）。
 メジャー.マイナーは `imgdupe/VERSION` で決めます。
 
 DB には SQLite（`imgdupe/third_party/sqlite`、パブリックドメイン）を使っています。

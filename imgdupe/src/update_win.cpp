@@ -12,6 +12,7 @@
 #include <bcrypt.h>
 #include <winhttp.h>
 
+#include <functional>
 #include <vector>
 
 #include "version.hpp"
@@ -74,16 +75,23 @@ Response failText(const std::wstring& text) {
 
 std::wstring userAgent() { return L"imgdupe/" + widen(IMGDUPE_VERSION); }
 
+// 受け取ったデータを渡す先（false を返したら中止）。無ければ body にためる
+using Sink = std::function<bool(const char*, size_t)>;
+
 // リダイレクトを追わずに 1 回だけ GET する。
-Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& headers, size_t maxBytes) {
+Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& headers, size_t maxBytes,
+                     const Sink* sink = nullptr) {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = static_cast<DWORD>(-1);
     uc.dwUrlPathLength = static_cast<DWORD>(-1);
     uc.dwExtraInfoLength = static_cast<DWORD>(-1);
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return fail(GetLastError());
-    if (uc.nScheme != INTERNET_SCHEME_HTTPS) return failText(L"HTTPS 以外の URL は使えません");
     const std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+    // テスト用に手元のサーバーだけ http を許す
+    const bool local = host == L"127.0.0.1" || host == L"localhost";
+    if (uc.nScheme != INTERNET_SCHEME_HTTPS && !(local && uc.nScheme == INTERNET_SCHEME_HTTP))
+        return failText(L"HTTPS 以外の URL は使えません");
     std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
     if (uc.lpszExtraInfo) path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
 
@@ -99,7 +107,8 @@ Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& h
     Handle connect(WinHttpConnect(session.h, host.c_str(), uc.nPort, 0));
     if (!connect.h) return fail(GetLastError());
     Handle request(WinHttpOpenRequest(connect.h, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                      uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0));
     if (!request.h) return fail(GetLastError());
     DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(request.h, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
@@ -135,6 +144,13 @@ Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& h
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(request.h, &avail)) return fail(GetLastError());
         if (avail == 0) break;
+        if (sink && res.status == 200) {
+            std::vector<char> buf(avail);
+            DWORD read = 0;
+            if (!WinHttpReadData(request.h, buf.data(), avail, &read)) return fail(GetLastError());
+            if (!(*sink)(buf.data(), read)) return failText(L"中止しました");
+            continue;
+        }
         if (res.body.size() + avail > maxBytes) return failText(L"受信するデータが大きすぎます");
         const size_t old = res.body.size();
         res.body.resize(old + avail);
@@ -146,9 +162,9 @@ Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& h
 }
 
 // リダイレクトを自分で追う GET（GitHub の添付ファイルは別のホストへ転送される）。
-Response get(std::wstring url, const std::vector<std::wstring>& headers, size_t maxBytes) {
+Response get(std::wstring url, const std::vector<std::wstring>& headers, size_t maxBytes, const Sink* sink = nullptr) {
     for (int i = 0; i <= kMaxRedirects; ++i) {
-        Response res = requestOnce(url, headers, maxBytes);
+        Response res = requestOnce(url, headers, maxBytes, sink);
         if (res.err || res.status < 300 || res.status >= 400 || res.location.empty()) return res;
         url = res.location;
     }
@@ -177,6 +193,37 @@ std::string sha256Hex(const std::string& data) {
     }
     return hex;
 }
+
+// 少しずつ SHA-256 を計算する
+class Sha256 {
+public:
+    Sha256() {
+        if (BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) alg_ = nullptr;
+        if (alg_ && BCryptCreateHash(alg_, &hash_, nullptr, 0, nullptr, 0, 0) != 0) hash_ = nullptr;
+    }
+    ~Sha256() {
+        if (hash_) BCryptDestroyHash(hash_);
+        if (alg_) BCryptCloseAlgorithmProvider(alg_, 0);
+    }
+    void add(const char* p, size_t n) {
+        if (hash_) BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char*>(p)), static_cast<ULONG>(n), 0);
+    }
+    std::string hex() {
+        unsigned char digest[32];
+        if (!hash_ || BCryptFinishHash(hash_, digest, sizeof(digest), 0) != 0) return {};
+        static const char* kHex = "0123456789abcdef";
+        std::string out;
+        for (unsigned char b : digest) {
+            out += kHex[b >> 4];
+            out += kHex[b & 15];
+        }
+        return out;
+    }
+
+private:
+    BCRYPT_ALG_HANDLE alg_ = nullptr;
+    BCRYPT_HASH_HANDLE hash_ = nullptr;
+};
 
 std::vector<std::wstring> apiHeaders() {
     return {L"Accept: application/vnd.github+json", L"X-GitHub-Api-Version: 2022-11-28"};
@@ -256,6 +303,63 @@ DownloadResult downloadAndReplace(const imgdupe::ReleaseInfo& info) {
         result.error = L"新しい版に差し替えられませんでした";
         return result;
     }
+    result.ok = true;
+    return result;
+}
+
+FetchResult fetchText(const std::wstring& url, size_t maxBytes) {
+    FetchResult r;
+    Response res = get(url, {}, maxBytes);
+    if (res.err) {
+        r.error = L"接続できませんでした: " + res.errText;
+        return r;
+    }
+    r.status = res.status;
+    if (res.status != 200) {
+        r.error = widen(imgdupe::httpErrorMessage(res.status));
+        return r;
+    }
+    r.ok = true;
+    r.body = std::move(res.body);
+    return r;
+}
+
+DownloadResult downloadFile(const std::wstring& url, const std::wstring& path, const std::string& sha256, uint64_t size,
+                            const std::function<bool(uint64_t)>& progress) {
+    DownloadResult result;
+    const std::wstring part = path + L".part";
+    HANDLE f = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        result.error = L"保存できませんでした: " + path;
+        return result;
+    }
+    Sha256 hash;
+    uint64_t received = 0;
+    bool writeFailed = false;
+    const Sink sink = [&](const char* p, size_t n) {
+        DWORD written = 0;
+        if (!WriteFile(f, p, static_cast<DWORD>(n), &written, nullptr) || written != n) {
+            writeFailed = true;
+            return false;
+        }
+        hash.add(p, n);
+        received += n;
+        if (size && received > size) return false;  // 一覧と大きさが違う
+        return !progress || progress(received);
+    };
+    Response res = get(url, {L"Accept: application/octet-stream"}, kMaxApiBytes, &sink);
+    CloseHandle(f);
+    auto failWith = [&](const std::wstring& msg) {
+        DeleteFileW(part.c_str());
+        result.error = msg;
+        return result;
+    };
+    if (writeFailed) return failWith(L"保存できませんでした（ディスクの空きを確認してください）: " + path);
+    if (res.err) return failWith(res.errText == L"中止しました" ? res.errText : L"ダウンロードできませんでした: " + res.errText);
+    if (res.status != 200) return failWith(L"ダウンロードできませんでした (HTTP " + std::to_wstring(res.status) + L"): " + url);
+    if (size && received != size) return failWith(L"ダウンロードしたファイルの大きさが一覧と違います: " + url);
+    if (hash.hex() != sha256) return failWith(L"ダウンロードしたファイルの SHA-256 が一致しません: " + url);
+    if (!MoveFileExW(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) return failWith(L"置き換えられませんでした（使用中かもしれません）: " + path);
     result.ok = true;
     return result;
 }

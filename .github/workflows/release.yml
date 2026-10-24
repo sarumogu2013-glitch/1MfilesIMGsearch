@@ -35,17 +35,24 @@ jobs:
         run: imgdupe/build.sh test
       - name: ビルド
         run: IMGDUPE_VERSION="$TAG" imgdupe/build.sh
-      - name: zip にまとめる
+      - name: AI の部品の一覧（models.json）を作る
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p dist/imgdupe
-          cp imgdupe/out/imgdupe.exe README.md dist/imgdupe/
-          (cd dist && zip -r -X ../imgdupe.zip imgdupe)
+          mkdir -p dist
+          if ! python3 imgdupe/tools/make_models_json.py imgdupe/models.src.json dist "$GITHUB_REPOSITORY" "$TAG"; then
+            # Hugging Face などに届かない時は、前のリリースの一覧をそのまま使う（ファイルの URL は前のリリースを指す）
+            echo "::warning::models.json を作れなかったので、前のリリースのものを使います"
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern models.json --dir dist
+          fi
       - name: リリースを作成
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp imgdupe/out/imgdupe.exe imgdupe.exe
-          gh release create "$TAG" imgdupe.zip imgdupe.exe --target "$GITHUB_SHA" \
+          cp imgdupe/out/imgdupe.exe imgdupe/out/imgdupe_setup.exe dist/
+          cd dist
+          gh release create "$TAG" *.exe models.json $(ls *.dll 2>/dev/null) --target "$GITHUB_SHA" \
             --title "imgdupe $TAG" \
-            --notes "imgdupe.zip: exe と README.md の一式。
-          imgdupe.exe: 実行ファイル単体（上書きして更新する時用）。"
+            --notes "imgdupe_setup.exe: インストーラー（管理者の権限は要りません。AI 解析の部品もここから入れられます）。
+          imgdupe.exe: 実行ファイル単体（アプリの自動更新が使います）。
+          models.json と *.dll: AI 解析の部品の一覧と ONNX Runtime（インストーラーとアプリがダウンロードします）。"
