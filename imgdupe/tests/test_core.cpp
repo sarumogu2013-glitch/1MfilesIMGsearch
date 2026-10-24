@@ -7,6 +7,7 @@
 #include <mutex>
 #include <random>
 
+#include "commands.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
 
@@ -323,6 +324,40 @@ static void testUpdateLogic() {
     CHECK(!httpErrorMessage(404).empty());
 }
 
+static void testKeys() {
+    KeyStroke k;
+    CHECK(parseKey("Ctrl+Shift+o", k) && k.mods == (KMOD_CTRL | KMOD_SHIFT) && k.code == 'O');
+    CHECK(keyName(k) == "Ctrl+Shift+O");
+    for (const char* t : {"F5", "Ctrl+Up", "Alt+Enter", "Num5", "Num+", "PageDown", "Shift+F12", "VK1F"}) {
+        KeyStroke a;
+        CHECK(parseKey(t, a));
+        CHECK(keyName(a) == t);
+    }
+    CHECK(!parseKey("Ctrl+", k));
+    CHECK(!parseKey("F99", k));
+    CHECK(!parseKey("Nothing", k));
+
+    const KeyMap def = defaultKeys();
+    KeyStroke f5;
+    parseKey("F5", f5);
+    CHECK(def.at(f5) == CMD_SEARCH);
+    CHECK(keyLabel(def, CMD_SEARCH) == "F5");
+    CHECK(keyLabel(def, CMD_ABOUT).empty());
+
+    // 保存した行から読み直すと同じ。知らない機能・キーは飛ばす
+    auto lines = keyLines(def);
+    CHECK(!lines.empty());
+    CHECK(keysFromLines(lines) == def);
+    lines.push_back("NoSuchCommand = F9");
+    lines.push_back("Help = F1, Bogus, Ctrl+H");
+    const KeyMap m = keysFromLines(lines);
+    KeyStroke ch;
+    parseKey("Ctrl+H", ch);
+    CHECK(m.at(ch) == CMD_HELP);
+    CHECK(m.size() == def.size() + 1);
+    for (const auto& c : allCommands()) CHECK(findCommand(c.name) == &c && findCommand(c.id) == &c);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -352,6 +387,7 @@ int main() {
     testRun();
     testExifOrientation();
     testUpdateLogic();
+    testKeys();
     testMisc();
     if (failures) {
         std::fprintf(stderr, "%d 件失敗\n", failures);

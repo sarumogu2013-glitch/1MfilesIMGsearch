@@ -25,8 +25,10 @@
 #include <mutex>
 #include <thread>
 
+#include "commands.hpp"
 #include "core.hpp"
 #include "image_win.hpp"
+#include "keymap_win.hpp"
 #include "resource.h"
 #include "update_win.hpp"
 #include "version.hpp"
@@ -53,15 +55,10 @@ enum CheckMode : WPARAM { kManual = 0, kOnExit = 1 };
 
 enum : int {
     IDC_FOLDERS = 100,
-    IDC_ADD,
-    IDC_REMOVE,
     IDC_THRESHOLD,
     IDC_THRESHOLD_LABEL,
     IDC_EXACT,
     IDC_FLAT,
-    IDC_START,
-    IDC_QUERY,
-    IDC_EXPORT,
     IDC_PROGRESS,
     IDC_STATUS,
     IDC_GROUPS,
@@ -70,15 +67,7 @@ enum : int {
     IDC_FOLDERS_LABEL,
     IDC_THRESHOLD_CAPTION,
     IDC_TOOLBAR,
-    ID_OPEN = 200,
-    ID_EXPLORER,
-    ID_COPY_PATH,
-    ID_HELP,
-    ID_RELEASES,
-    ID_CHECK_UPDATE,
-    ID_ABOUT,
-    ID_EXIT,
-};
+};  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
 constexpr int kMaxThreshold = 20;
@@ -121,6 +110,11 @@ struct App {
     // アップデート
     bool updating = false;                   // 確認・ダウンロード中
     bool closing = false;                    // 終了時のアップデート確認中（ウィンドウは隠してある）
+
+    // メニューとショートカットキー
+    HMENU menuBar = nullptr;
+    KeyMap keys;
+    std::vector<int> keyTmp = std::vector<int>(8, 0);  // ショートカットキーの設定画面の一時置き場
 
     // 結果
     Result result;
@@ -417,7 +411,7 @@ const Entry* memberEntry(int item, uint8_t* dist = nullptr) {
 void showInfo(int item) {
     uint8_t dist = 0;
     const Entry* e = memberEntry(item, &dist);
-    for (int id : {ID_OPEN, ID_EXPLORER, ID_COPY_PATH}) tbEnable(id, e != nullptr);
+    for (int id : {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH}) tbEnable(id, e != nullptr);
     if (!e) {
         const Group* g = currentGroup();
         setText(app.info, g ? L"画像をダブルクリックすると開きます。右クリックで「エクスプローラーで表示」などができます。" : L"");
@@ -469,7 +463,7 @@ void showResult(Result&& r, bool query) {
         ListView_SetItemState(app.groups, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(app.groups, 0, FALSE);
     }
-    tbEnable(IDC_EXPORT, !app.result.groups.empty());
+    tbEnable(CMD_EXPORT, !app.result.groups.empty());
 
     std::wstring s;
     if (query) {
@@ -499,11 +493,11 @@ void showResult(Result&& r, bool query) {
 
 void setRunning(bool on) {
     app.running = on;
-    tbSetText(IDC_START, on ? L"検索を中止" : L"検索開始");
-    SendMessageW(app.toolbar, TB_CHANGEBITMAP, IDC_START, MAKELPARAM(on ? stopImage : startImage, 0));
+    tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"検索開始");
+    SendMessageW(app.toolbar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
     for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat}) EnableWindow(h, !on);
-    for (int id : {IDC_ADD, IDC_QUERY}) tbEnable(id, !on);
-    tbEnable(IDC_EXPORT, !on && !app.result.groups.empty());
+    for (int id : {CMD_ADD_FOLDER, CMD_QUERY}) tbEnable(id, !on);
+    tbEnable(CMD_EXPORT, !on && !app.result.groups.empty());
     SendMessageW(app.progress, PBM_SETPOS, 0, 0);
     if (on) {
         app.startTick = GetTickCount64();
@@ -678,7 +672,7 @@ std::wstring today() {
 void startCheck(CheckMode mode) {
     if (app.updating) return;
     app.updating = true;
-    tbEnable(ID_CHECK_UPDATE, false);
+    tbEnable(CMD_CHECK_UPDATE, false);
     HWND hwnd = app.hwnd;
     std::thread([hwnd, mode] {
         auto* r = new upd::CheckResult(upd::checkLatest());
@@ -688,7 +682,7 @@ void startCheck(CheckMode mode) {
 
 void startDownload(CheckMode mode, const imgdupe::ReleaseInfo& info) {
     app.updating = true;
-    tbEnable(ID_CHECK_UPDATE, false);
+    tbEnable(CMD_CHECK_UPDATE, false);
     setText(app.status, L"新しい版 " + widen(info.tag) + L" をダウンロードしています…");
     HWND hwnd = app.hwnd;
     std::thread([hwnd, mode, info] {
@@ -706,7 +700,7 @@ bool shouldCheckOnExit() {
 
 void onChecked(CheckMode mode, const upd::CheckResult& r) {
     app.updating = false;
-    tbEnable(ID_CHECK_UPDATE, true);
+    tbEnable(CMD_CHECK_UPDATE, true);
     const std::wstring err = r.error();
     const auto cmp = err.empty() ? compareVersion(IMGDUPE_VERSION, r.info.tag) : VersionCompare::Latest;
     const std::wstring cur = widen(IMGDUPE_VERSION);
@@ -747,7 +741,7 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
 
 void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
     app.updating = false;
-    tbEnable(ID_CHECK_UPDATE, true);
+    tbEnable(CMD_CHECK_UPDATE, true);
     if (mode == kOnExit) {
         if (!r.ok)
             MessageBoxW(nullptr, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
@@ -835,6 +829,7 @@ void showHelp() {
                 L"・しきい値: 小さいほど厳しく（ほぼ同じものだけ）、大きいほどゆるく（似ているものまで）まとめます。\r\n"
                 L"・単色に近い画像（真っ白・真っ黒など）は見分けにくく、別の画像がまとまりやすいので、ふだんは見た目では比べません。\r\n"
                 L"・「1 枚で検索」で、選んだ画像に似た画像を探します。\r\n"
+                L"・キーの割り当ては「その他 → ショートカットキーの設定」（Ctrl+K）で変えられます。\r\n"
                 L"・2 回目からは読み込んだ結果（キャッシュ）を使うので、増えた・変わった画像だけを読み込みます。\r\n"
                 L"・このツールは画像を読むだけで、移動や削除はしません。",
                 L"imgdupe の使い方", MB_ICONINFORMATION);
@@ -960,17 +955,18 @@ struct ToolButton {
     bool enabled;
 };
 const ToolButton kToolButtons[] = {
-    {IDC_ADD, 0xE8F4, L"追", L"フォルダを追加", true},
-    {IDC_START, 0xE721, L"検", L"検索開始", true},
-    {IDC_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
-    {IDC_EXPORT, 0xE74E, L"保", L"結果を保存", false},
+    {CMD_ADD_FOLDER, 0xE8F4, L"追", L"フォルダを追加", true},
+    {CMD_SEARCH, 0xE721, L"検", L"検索開始", true},
+    {CMD_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
+    {CMD_EXPORT, 0xE74E, L"保", L"結果を保存", false},
     {0, 0, nullptr, nullptr, false},
-    {ID_OPEN, 0xE8E5, L"開", L"開く", false},
-    {ID_EXPLORER, 0xE838, L"場", L"エクスプローラーで表示", false},
-    {ID_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
+    {CMD_OPEN, 0xE8E5, L"開", L"開く", false},
+    {CMD_EXPLORER, 0xE838, L"場", L"エクスプローラーで表示", false},
+    {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
     {0, 0, nullptr, nullptr, false},
-    {ID_CHECK_UPDATE, 0xE895, L"更", L"アップデートを確認", true},
-    {ID_HELP, 0xE897, L"?", L"使い方", true},
+    {CMD_KEY_SETTINGS, 0xE765, L"鍵", L"ショートカットキーの設定", true},
+    {CMD_CHECK_UPDATE, 0xE895, L"更", L"アップデートを確認", true},
+    {CMD_HELP, 0xE897, L"?", L"使い方", true},
 };
 
 void createToolbar() {
@@ -1003,7 +999,7 @@ void createToolbar() {
             b.fsStyle = BTNS_SEP;
         } else {
             b.iBitmap = add(d.glyph, d.text);
-            if (d.id == IDC_START) startImage = b.iBitmap;
+            if (d.id == CMD_SEARCH) startImage = b.iBitmap;
             b.idCommand = d.id;
             b.fsState = d.enabled ? TBSTATE_ENABLED : 0;
             b.fsStyle = BTNS_BUTTON;
@@ -1023,8 +1019,8 @@ void createControls() {
                                    IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
                               IDC_FOLDERS, WS_EX_CLIENTEDGE);
-    app.add = makeControl(WC_BUTTONW, L"フォルダを追加…", WS_TABSTOP, IDC_ADD);
-    app.remove = makeControl(WC_BUTTONW, L"選んだフォルダを外す", WS_TABSTOP, IDC_REMOVE);
+    app.add = makeControl(WC_BUTTONW, L"フォルダを追加…", WS_TABSTOP, CMD_ADD_FOLDER);
+    app.remove = makeControl(WC_BUTTONW, L"選んだフォルダを外す", WS_TABSTOP, CMD_REMOVE_FOLDER);
     app.thresholdCaption = makeControl(WC_STATICW, L"しきい値", 0, IDC_THRESHOLD_CAPTION);
     app.threshold = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS, IDC_THRESHOLD);
     SendMessageW(app.threshold, TBM_SETRANGE, TRUE, MAKELPARAM(0, kMaxThreshold));
@@ -1140,16 +1136,16 @@ LRESULT onNotify(NMHDR* nm) {
                 if (ia->iItem < 0) break;
                 ListView_SetItemState(app.thumbs, ia->iItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, ID_OPEN, L"開く(&O)");
-                AppendMenuW(menu, MF_STRING, ID_EXPLORER, L"エクスプローラーで表示(&E)");
-                AppendMenuW(menu, MF_STRING, ID_COPY_PATH, L"パスをコピー(&C)");
+                AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
+                AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
+                AppendMenuW(menu, MF_STRING, CMD_COPY_PATH, L"パスをコピー(&C)");
                 POINT pt;
                 GetCursorPos(&pt);
                 const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
                 DestroyMenu(menu);
-                if (cmd == ID_OPEN) openItem(ia->iItem);
-                if (cmd == ID_EXPLORER) showInExplorer(ia->iItem);
-                if (cmd == ID_COPY_PATH) copyPath(ia->iItem);
+                if (cmd == CMD_OPEN) openItem(ia->iItem);
+                if (cmd == CMD_EXPLORER) showInExplorer(ia->iItem);
+                if (cmd == CMD_COPY_PATH) copyPath(ia->iItem);
                 break;
             }
         }
@@ -1157,22 +1153,122 @@ LRESULT onNotify(NMHDR* nm) {
     return 0;
 }
 
-void createMenu() {
-    HMENU bar = CreateMenu();
-    HMENU file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, IDC_ADD, L"フォルダを追加(&A)…");
-    AppendMenuW(file, MF_STRING, IDC_EXPORT, L"結果を保存(&S)…");
-    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, ID_EXIT, L"終了(&X)");
-    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"ファイル(&F)");
-    HMENU help = CreatePopupMenu();
-    AppendMenuW(help, MF_STRING, ID_HELP, L"使い方(&H)");
-    AppendMenuW(help, MF_STRING, ID_CHECK_UPDATE, L"アップデートを確認(&U)");
-    AppendMenuW(help, MF_STRING, ID_RELEASES, L"最新版のページを開く(&R)");
-    AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(help, MF_STRING, ID_ABOUT, L"バージョン情報(&A)");
-    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"ヘルプ(&H)");
-    SetMenu(app.hwnd, bar);
+std::wstring menuText(int cmd) {
+    const CmdInfo* ci = findCommand(cmd);
+    std::wstring text = ci ? ci->label : L"";
+    const std::string key = keyLabel(app.keys, cmd);
+    if (!key.empty()) text += L"\t" + widen(key);
+    return text;
+}
+
+// 本体のメニュー（ショートカットキーの設定画面で機能を選ぶメニューにも使う）
+void appendMainMenus(HMENU root) {
+    auto popup = [&](const wchar_t* title, std::initializer_list<int> cmds) {
+        HMENU m = CreatePopupMenu();
+        for (int c : cmds) {  // 0 は区切り線
+            if (c) AppendMenuW(m, MF_STRING, static_cast<UINT_PTR>(c), menuText(c).c_str());
+            else AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
+    };
+    popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
+    popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
+    popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
+    popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
+    popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
+}
+
+void syncMenuChecks() {
+    if (!app.menuBar) return;
+    CheckMenuItem(app.menuBar, CMD_TOGGLE_EXACT,
+                  MF_BYCOMMAND | (Button_GetCheck(app.exact) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(app.menuBar, CMD_TOGGLE_FLAT,
+                  MF_BYCOMMAND | (Button_GetCheck(app.flat) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+}
+
+void rebuildMenu() {
+    HMENU old = app.menuBar;
+    app.menuBar = CreateMenu();
+    appendMainMenus(app.menuBar);
+    SetMenu(app.hwnd, app.menuBar);
+    if (old) DestroyMenu(old);
+    syncMenuChecks();
+}
+
+// ---------------------------------------------------------------- ショートカットキー
+
+// 割り当ては imgdupe.ini の [Keys] に「機能 = キー, キー」で持つ。一度も保存していなければ標準の割り当て
+void loadKeys() {
+    if (!iniInt(L"keysSaved", 0)) {
+        app.keys = defaultKeys();
+    } else {
+        std::vector<wchar_t> buf(32768);
+        const DWORD n = GetPrivateProfileSectionW(L"Keys", buf.data(), static_cast<DWORD>(buf.size()), iniPath().c_str());
+        std::vector<std::string> lines;
+        for (DWORD i = 0; i < n;) {
+            const std::wstring line(&buf[i]);
+            lines.push_back(narrow(line));
+            i += static_cast<DWORD>(line.size()) + 1;
+        }
+        app.keys = keysFromLines(lines);
+    }
+    for (size_t i = 0; i < app.keyTmp.size(); ++i) {
+        wchar_t name[64];
+        GetPrivateProfileStringW(L"KeyTmp", (L"Slot" + std::to_wstring(i + 1)).c_str(), L"", name, 64, iniPath().c_str());
+        const CmdInfo* ci = findCommand(narrow(name));
+        app.keyTmp[i] = ci ? ci->id : 0;
+    }
+}
+
+void saveKeys() {
+    std::wstring section;
+    for (const auto& line : keyLines(app.keys)) section += widen(line) + L'\0';
+    section += L'\0';
+    WritePrivateProfileSectionW(L"Keys", section.c_str(), iniPath().c_str());
+    iniSet(L"keysSaved", L"1");
+    for (size_t i = 0; i < app.keyTmp.size(); ++i) {
+        const CmdInfo* ci = app.keyTmp[i] ? findCommand(app.keyTmp[i]) : nullptr;
+        WritePrivateProfileStringW(L"KeyTmp", (L"Slot" + std::to_wstring(i + 1)).c_str(),
+                                   ci ? widen(ci->name).c_str() : nullptr, iniPath().c_str());
+    }
+}
+
+class KeyHost : public KeyMapHost {
+public:
+    KeyMap& keys() override { return app.keys; }
+    void buildCommandMenu(HMENU root) override { appendMainMenus(root); }
+    void onKeysChanged() override {
+        saveKeys();
+        rebuildMenu();  // メニューのキーの表示を更新
+    }
+    std::vector<int>& keyTmp() override { return app.keyTmp; }
+};
+KeyHost keyHost;
+
+// 押されたキーに機能が割り当ててあれば、その機能を実行して true
+bool handleShortcut(const MSG& msg) {
+    if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
+    if (msg.hwnd != app.hwnd && !IsChild(app.hwnd, msg.hwnd)) return false;  // 別のウィンドウ（設定画面など）
+    const UINT vk = static_cast<UINT>(msg.wParam);
+    if (vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_MENU) return false;
+    unsigned mods = 0;
+    if (GetKeyState(VK_CONTROL) < 0) mods |= KMOD_CTRL;
+    if (GetKeyState(VK_SHIFT) < 0) mods |= KMOD_SHIFT;
+    if (GetKeyState(VK_MENU) < 0) mods |= KMOD_ALT;
+    auto it = app.keys.find(KeyStroke{mods, vk});
+    if (it == app.keys.end()) return false;
+    SendMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(it->second), 0);
+    return true;
+}
+
+void selectGroupRelative(int delta) {
+    const int n = static_cast<int>(app.result.groups.size());
+    if (!n) return;
+    const int cur = ListView_GetNextItem(app.groups, -1, LVNI_SELECTED);
+    const int next = std::clamp(cur < 0 ? 0 : cur + delta, 0, n - 1);
+    ListView_SetItemState(app.groups, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(app.groups, next, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(app.groups, next, FALSE);
 }
 
 void shutdown() {
@@ -1191,7 +1287,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE:
             app.hwnd = hwnd;
-            createMenu();
+            loadKeys();
+            rebuildMenu();
             createControls();
             DragAcceptFiles(hwnd, TRUE);
             return 0;
@@ -1222,13 +1319,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
-                case IDC_ADD:
+                case CMD_ADD_FOLDER:
                     if (!app.running) {
                         pickFolder();
                         saveSettings();
                     }
                     break;
-                case IDC_REMOVE: {
+                case CMD_REMOVE_FOLDER: {
                     const int n = ListBox_GetSelCount(app.folders);
                     if (n > 0) {
                         std::vector<int> sel(n);
@@ -1238,7 +1335,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     break;
                 }
-                case IDC_START:
+                case CMD_SEARCH:
                     if (app.updating && !app.running) break;  // 更新のダウンロード中
                     if (app.running) {
                         app.cancel = true;
@@ -1247,27 +1344,53 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         startSearch(L"");
                     }
                     break;
-                case IDC_QUERY: {
+                case CMD_QUERY: {
                     if (app.running) break;
                     const std::wstring p = pickImage();
                     if (!p.empty()) startSearch(p);
                     break;
                 }
-                case IDC_EXPORT:
+                case CMD_EXPORT:
                     if (!app.running) exportResult();
                     break;
-                case ID_OPEN: openItem(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
-                case ID_EXPLORER: showInExplorer(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
-                case ID_COPY_PATH: copyPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
-                case ID_CHECK_UPDATE:
+                case CMD_OPEN: openItem(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case CMD_EXPLORER: showInExplorer(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case CMD_COPY_PATH: copyPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case CMD_CHECK_UPDATE:
                     if (app.running)
                         MessageBoxW(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
                     else
                         startCheck(kManual);
                     break;
-                case ID_HELP: showHelp(); break;
-                case ID_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
-                case ID_ABOUT:
+                case CMD_PREV_GROUP: selectGroupRelative(-1); break;
+                case CMD_NEXT_GROUP: selectGroupRelative(1); break;
+                case CMD_TOGGLE_EXACT:
+                case CMD_TOGGLE_FLAT: {
+                    HWND box = LOWORD(wp) == CMD_TOGGLE_EXACT ? app.exact : app.flat;
+                    if (app.running) break;
+                    Button_SetCheck(box, Button_GetCheck(box) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
+                    syncMenuChecks();
+                    saveSettings();
+                    break;
+                }
+                case IDC_EXACT:
+                case IDC_FLAT:
+                    syncMenuChecks();
+                    break;
+                case CMD_THRESHOLD_DOWN:
+                case CMD_THRESHOLD_UP: {
+                    if (app.running) break;
+                    const int t = std::clamp(static_cast<int>(SendMessageW(app.threshold, TBM_GETPOS, 0, 0)) +
+                                                 (LOWORD(wp) == CMD_THRESHOLD_UP ? 1 : -1),
+                                             0, kMaxThreshold);
+                    SendMessageW(app.threshold, TBM_SETPOS, TRUE, t);
+                    setText(app.thresholdLabel, thresholdText(t));
+                    break;
+                }
+                case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
+                case CMD_HELP: showHelp(); break;
+                case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
+                case CMD_ABOUT:
                     MessageBoxW(hwnd,
                                 (L"imgdupe " + widen(IMGDUPE_VERSION) + L"\r\n重複画像検索\r\n\r\n"
                                  L"github.com/" APP_REPOSITORY L"\r\n\r\n"
@@ -1275,7 +1398,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     .c_str(),
                                 L"バージョン情報", MB_ICONINFORMATION);
                     break;
-                case ID_EXIT: SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
+                case CMD_EXIT: SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
             }
             return 0;
         case WM_NOTIFY:
@@ -1522,11 +1645,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        // Enter はダイアログの既定ボタンではなく、選んだ画像を開くのに使う
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && msg.hwnd == app.thumbs) {
-            openItem(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED));
-            continue;
-        }
+        // ショートカットキー（ダイアログの Enter・Tab などより先に見る）
+        if (handleShortcut(msg)) continue;
         if (IsDialogMessageW(hwnd, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);

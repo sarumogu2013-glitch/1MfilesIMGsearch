@@ -9,7 +9,7 @@ mkdir -p out
 
 if [ "${1:-}" = "test" ]; then
   ${CXX:-g++} -std=c++17 -O2 -Wall -Wextra -pthread -Isrc \
-    src/core.cpp src/platform_posix.cpp src/json.cpp src/update_logic.cpp tests/test_core.cpp -o out/test_core
+    src/core.cpp src/platform_posix.cpp src/json.cpp src/update_logic.cpp src/commands.cpp tests/test_core.cpp -o out/test_core
   ./out/test_core
   exit 0
 fi
@@ -28,7 +28,7 @@ fi
 # -mpopcnt: ハミング距離の計算に POPCNT 命令を使う（2008 年以降の x64 CPU はすべて対応）
 "$CXX" -std=c++17 -O2 -mpopcnt -s -Wall -Wextra -Wno-missing-field-initializers -municode -mwindows -static \
   -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DIMGDUPE_VERSION="\"$VERSION\"" -Isrc \
-  src/core.cpp src/platform_win.cpp src/image_win.cpp src/json.cpp src/update_logic.cpp src/update_win.cpp src/main_win.cpp out/app.res.o \
+  src/core.cpp src/platform_win.cpp src/image_win.cpp src/json.cpp src/update_logic.cpp src/update_win.cpp src/commands.cpp src/keymap_win.cpp src/main_win.cpp out/app.res.o \
   -o out/imgdupe.exe \
   -lwindowscodecs -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lshlwapi -lole32 -loleaut32 -luuid -lgdi32 -luser32
 echo "out/imgdupe.exe ($VERSION)"
