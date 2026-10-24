@@ -183,18 +183,27 @@ SearchResult search(Db& db, const SearchQuery& q) {
     std::string order = " ORDER BY (" + key + ") IS NULL, " + key + dir;
     if (key != "i.path") order += ", i.path";
 
-    const std::string sql = with + " SELECT i.id FROM images i LEFT JOIN file_meta f ON f.image_id=i.id" + joins + where + order;
-    Stmt st(db.handle(), sql.c_str());
-    for (size_t i = 0; i < params.size(); ++i) {
-        const int idx = static_cast<int>(i + 1);
-        if (const auto* v = std::get_if<int64_t>(&params[i])) st.bind(idx, *v);
-        else if (const auto* d = std::get_if<double>(&params[i])) st.bind(idx, *d);
-        else st.bind(idx, std::get<std::string>(params[i]));
-    }
+    const std::string from = " FROM images i LEFT JOIN file_meta f ON f.image_id=i.id" + joins + where;
+    auto bindAll = [&](Stmt& st) {
+        for (size_t i = 0; i < params.size(); ++i) {
+            const int idx = static_cast<int>(i + 1);
+            if (const auto* v = std::get_if<int64_t>(&params[i])) st.bind(idx, *v);
+            else if (const auto* d = std::get_if<double>(&params[i])) st.bind(idx, *d);
+            else st.bind(idx, std::get<std::string>(params[i]));
+        }
+    };
     SearchResult r;
-    while (st.step()) {
-        ++r.total;
-        if (!q.limit || r.ids.size() < q.limit) r.ids.push_back(st.i64(0));
+    // limit があれば、DB に上位だけを並べさせ（全部を並べ替えるより速い）、数は別に数える
+    const std::string sql = with + " SELECT i.id" + from + order + (q.limit ? " LIMIT " + std::to_string(q.limit) : "");
+    Stmt st(db.handle(), sql.c_str());
+    bindAll(st);
+    while (st.step()) r.ids.push_back(st.i64(0));
+    if (q.limit && r.ids.size() >= q.limit) {
+        Stmt count(db.handle(), (with + " SELECT COUNT(*)" + from).c_str());
+        bindAll(count);
+        r.total = count.step() ? static_cast<size_t>(count.i64(0)) : r.ids.size();
+    } else {
+        r.total = r.ids.size();
     }
     return r;
 }

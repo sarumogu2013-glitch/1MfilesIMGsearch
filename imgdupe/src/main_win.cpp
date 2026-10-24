@@ -493,6 +493,15 @@ void resetView(int view, int n) {
     InvalidateRect(v.lv, nullptr, TRUE);
 }
 
+// 一覧の数だけを n 件に増やす（表示中の項目とサムネイルはそのまま）
+void extendView(int view, int n) {
+    ThumbView& v = app.views[view];
+    if (n <= static_cast<int>(v.imageOf.size())) return;
+    v.imageOf.resize(n, -1);
+    v.requested.resize(n, 0);
+    ListView_SetItemCountEx(v.lv, n, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+}
+
 // 見えている項目のサムネイルを頼む（後から頼んだ = 今見えているものを先に読む）
 void requestThumb(int view, int item, const std::wstring& path, int64_t imageId) {
     ThumbView& v = app.views[view];
@@ -979,7 +988,10 @@ struct SearchDone {
     unsigned gen;
     SearchResult result;
     std::wstring error;
+    bool rest = false;  // 2 回目（先頭の後の残り全部）
 };
+
+constexpr size_t kFirstResults = 2000;  // まず先頭だけ並べて見せる（残りは裏で）
 
 Db* uiDb() {
     if (!app.uiDb) {
@@ -1085,21 +1097,34 @@ void scheduleSearch(UINT delayMs) {
 
 void runSearch() {
     KillTimer(app.hwnd, kSearchTimer);
-    const SearchQuery q = searchQueryFromUi();
+    SearchQuery q = searchQueryFromUi();
     const unsigned gen = ++app.searchGen;
     setText(app.s.count, L"検索中…");
     const std::string db = narrow(dbPath());
     HWND hwnd = app.hwnd;
-    std::thread([q, gen, db, hwnd] {
+    std::thread([q, gen, db, hwnd]() mutable {
+        // 1 回目: 先頭だけ（DB は上位だけを並べるので速い）と全部の数。多ければ 2 回目に残りを全部
         auto* done = new SearchDone{gen, {}, L""};
+        bool more = false;
+        Db d;
         try {
-            Db d;
             if (!d.open(db)) throw std::runtime_error(d.error());
+            q.limit = kFirstResults;
             done->result = search(d, q);
+            more = done->result.total > done->result.ids.size();
         } catch (const std::exception& e) {
             done->error = widen(e.what());
         }
         if (!PostMessageW(hwnd, WM_APP_SEARCHED, 0, reinterpret_cast<LPARAM>(done))) delete done;
+        if (!more) return;
+        auto* rest = new SearchDone{gen, {}, L"", true};
+        try {
+            q.limit = 0;
+            rest->result = search(d, q);
+        } catch (const std::exception& e) {
+            rest->error = widen(e.what());
+        }
+        if (!PostMessageW(hwnd, WM_APP_SEARCHED, 0, reinterpret_cast<LPARAM>(rest))) delete rest;
     }).detach();
 }
 
@@ -1112,11 +1137,21 @@ void onSearched(SearchDone* p) {
         setText(app.s.count, L"検索できませんでした: " + done->error);
         return;
     }
+    if (done->rest) {
+        // 先頭は同じ並びなので、表示とサムネイルはそのままにして、残りを足す
+        app.searchIds = std::move(done->result.ids);
+        extendView(kSearchView, static_cast<int>(app.searchIds.size()));
+        setText(app.s.count, withCommas(app.searchTotal) + L" 件");
+        return;
+    }
     app.searchIds = std::move(done->result.ids);
     app.searchTotal = done->result.total;
     app.infoCache.clear();
     resetView(kSearchView, static_cast<int>(app.searchIds.size()));
-    setText(app.s.count, app.searchTotal ? withCommas(app.searchTotal) + L" 件" : L"見つかりません");
+    setText(app.s.count, !app.searchTotal ? L"見つかりません"
+                         : app.searchTotal > app.searchIds.size()
+                             ? withCommas(app.searchTotal) + L" 件（残りを読み込んでいます…）"
+                             : withCommas(app.searchTotal) + L" 件");
     showSearchInfo(-1);
 }
 
