@@ -105,6 +105,10 @@ enum : int {
     IDC_S_SMART_SAVE,
     IDC_S_SMART_DELETE,
     IDC_S_EXPAND,
+    IDC_S_REVIEW,
+    IDC_S_YES,
+    IDC_S_NO,
+    IDC_S_BULK,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -168,7 +172,7 @@ struct App {
     // 検索の画面
     struct SearchCtl {
         HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, minW, minKb, maxKb, path, download,
-            sort, desc, clear, count, results, smart, smartSave, smartDelete, expand;
+            sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
     std::vector<HWND> searchPage;
@@ -183,6 +187,7 @@ struct App {
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
+    int reselect = -1;                   // 次の検索結果で選ぶ項目（タグを確定した後、同じ位置＝次の画像を選ぶ）
 
     // メニューとショートカットキー
     HMENU menuBar = nullptr;
@@ -995,6 +1000,8 @@ void copyOut(LVITEMW& item, const std::wstring& s);
 
 void applyQueryToUi(const SearchQuery& q);
 void expandLinksUi();
+void markSelected(bool correct);
+void bulkTagUi();
 void showLinksWindow();
 void cleanupTemporaryLinks();
 struct ExpandDone {
@@ -1105,6 +1112,7 @@ SearchQuery searchQueryFromUi() {
     const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
     q.sort = sorts[std::min<int>(sort, static_cast<int>(std::size(sorts)) - 1)];
     q.descending = Button_GetCheck(app.s.desc) == BST_CHECKED;
+    q.review = Button_GetCheck(app.s.review) == BST_CHECKED;
     return q;
 }
 
@@ -1167,11 +1175,19 @@ void onSearched(SearchDone* p) {
     app.searchTotal = done->result.total;
     app.infoCache.clear();
     resetView(kSearchView, static_cast<int>(app.searchIds.size()));
-    setText(app.s.count, !app.searchTotal ? L"見つかりません"
-                         : app.searchTotal > app.searchIds.size()
-                             ? withCommas(app.searchTotal) + L" 件（残りを読み込んでいます…）"
-                             : withCommas(app.searchTotal) + L" 件");
+    const bool review = Button_GetCheck(app.s.review) == BST_CHECKED;
+    setText(app.s.count, !app.searchTotal ? (review ? L"確かめる画像はありません" : L"見つかりません")
+                         : withCommas(app.searchTotal) + L" 件" +
+                               (app.searchTotal > app.searchIds.size() ? L"（残りを読み込んでいます…）"
+                                : review                              ? L"（迷っている順）"
+                                                                      : L""));
     showSearchInfo(-1);
+    if (app.reselect >= 0 && !app.searchIds.empty()) {
+        const int item = std::min(app.reselect, static_cast<int>(app.searchIds.size()) - 1);
+        ListView_SetItemState(app.s.results, item, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(app.s.results, item, FALSE);
+    }
+    app.reselect = -1;
 }
 
 const ImageInfo* resultInfo(int item) {
@@ -1259,6 +1275,7 @@ void clearSearchConditions() {
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
     Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
+    Button_SetCheck(app.s.review, BST_UNCHECKED);
     app.uncheckedSources.clear();
     refreshSources();
     ComboBox_SetCurSel(app.s.smart, 0);
@@ -1421,6 +1438,7 @@ void applyQueryToUi(const SearchQuery& q) {
     for (size_t i = 0; i < std::size(sorts); ++i)
         if (sorts[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.review, q.review ? BST_CHECKED : BST_UNCHECKED);
     scheduleSearch(10);
 }
 
@@ -1766,6 +1784,71 @@ void showLinksWindow() {
     SetActiveWindow(app.hwnd);
 }
 
+// ---------------------------------------------------------------- タグの確定（確認キュー・一括のタグ付け）
+
+std::vector<int> selectedResults() {
+    std::vector<int> out;
+    for (int i = ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED); i >= 0;
+         i = ListView_GetNextItem(app.s.results, i, LVNI_SELECTED))
+        if (i < static_cast<int>(app.searchIds.size())) out.push_back(i);
+    return out;
+}
+
+// 選んだ画像のタグを書き換えて、検索し直す（同じ位置の画像を選び直す）
+template <typename F>
+void editSelectedTags(const std::vector<int>& items, F&& edit) {
+    Db* db = uiDb();
+    if (!db || items.empty()) return;
+    try {
+        db->begin();
+        for (int i : items) edit(*db, app.searchIds[i]);
+        db->commit();
+    } catch (const std::exception& e) {
+        try {
+            db->rollback();
+        } catch (const std::exception&) {
+        }
+        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    app.reselect = items.front();
+    refreshSources();
+    scheduleSearch(10);
+}
+
+void markSelected(bool correct) {
+    std::vector<std::string> tags, exclude;
+    parseTagQuery(narrow(editText(app.s.tags)), tags, exclude);
+    if (tags.empty()) {
+        MessageBoxW(app.hwnd, L"「タグ」の欄に、確かめるタグを入れてください（1 つ目のタグを確定します）。", L"imgdupe",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    const std::vector<int> items = selectedResults();
+    if (items.empty()) return;
+    const std::string tag = tags[0];
+    editSelectedTags(items, [&](Db& db, int64_t id) { setManualTag(db, id, tag, correct); });
+}
+
+void bulkTagUi() {
+    const std::vector<int> items = selectedResults();
+    if (items.empty()) {
+        MessageBoxW(app.hwnd, L"タグを付ける画像を選んでください（Ctrl や Shift を押しながらクリックすると、いくつも選べます）。",
+                    L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    auto input = promptText(L"タグを付ける・外す",
+                            withCommas(items.size()) + L" 枚に付けるタグ（空白で区切る。-タグ で「違う」と確定）", L"");
+    if (!input) return;
+    std::vector<std::string> add, remove;
+    parseTagQuery(narrow(*input), add, remove);
+    if (add.empty() && remove.empty()) return;
+    editSelectedTags(items, [&](Db& db, int64_t id) {
+        for (const auto& t : add) setManualTag(db, id, t, true);
+        for (const auto& t : remove) setManualTag(db, id, t, false);
+    });
+}
+
 void layout();
 
 void switchTab(int t) {
@@ -1860,9 +1943,21 @@ void layoutSearch(int y, int W, int bottom) {
 
     // 右: 件数・条件をクリア・結果
     const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m), cw = px(110), top = rowH + px(4);
-    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, rw - 2 * (cw + gap)), labelH, TRUE);
-    MoveWindow(app.s.expand, rx + rw - 2 * cw - gap, y, cw, rowH, TRUE);
-    MoveWindow(app.s.clear, rx + rw - cw, y, cw, rowH, TRUE);
+    // 右から: 条件をクリア・フォルダに展開・タグ…・違う・正しい・確認キュー
+    int bx = rx + rw;
+    auto right = [&](HWND h, int w) {
+        bx -= w;
+        MoveWindow(h, bx, y, w, rowH, TRUE);
+        bx -= gap;
+    };
+    right(app.s.clear, cw);
+    right(app.s.expand, cw);
+    bx -= gap;
+    right(app.s.bulk, px(70));
+    right(app.s.no, px(56));
+    right(app.s.yes, px(56));
+    right(app.s.review, px(96));
+    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, bx - rx), labelH, TRUE);
     MoveWindow(app.s.results, rx, y + top, rw, std::max(0, bottom - y - top), TRUE);
 }
 
@@ -1935,12 +2030,16 @@ void createSearchControls() {
     app.s.desc = makeControl(WC_BUTTONW, L"降順", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DESC);
     app.s.clear = makeControl(WC_BUTTONW, L"条件をクリア", WS_TABSTOP, IDC_S_CLEAR);
     app.s.expand = makeControl(WC_BUTTONW, L"フォルダに展開…", WS_TABSTOP, IDC_S_EXPAND);
-    app.searchPage.push_back(app.s.expand);
+    app.s.review = makeControl(WC_BUTTONW, L"確認キュー", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_REVIEW);
+    app.s.yes = makeControl(WC_BUTTONW, L"正しい", WS_TABSTOP, IDC_S_YES);
+    app.s.no = makeControl(WC_BUTTONW, L"違う", WS_TABSTOP, IDC_S_NO);
+    app.s.bulk = makeControl(WC_BUTTONW, L"タグ…", WS_TABSTOP, IDC_S_BULK);
+    app.searchPage.insert(app.searchPage.end(), {app.s.expand, app.s.review, app.s.yes, app.s.no, app.s.bulk});
     app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
     app.searchPage.insert(app.searchPage.end(), {app.s.desc, app.s.clear, app.s.count});
 
     app.s.results = makeControl(WC_LISTVIEWW, L"",
-                                WS_TABSTOP | LVS_ICON | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_AUTOARRANGE,
+                                WS_TABSTOP | LVS_ICON | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_AUTOARRANGE,
                                 IDC_S_RESULTS, WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(app.s.results, LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
     ListView_SetIconSpacing(app.s.results, app.thumbSize + px(20), app.thumbSize + px(44));
@@ -2048,6 +2147,16 @@ bool onSearchCommand(WPARAM wp) {
             return true;
         case IDC_S_EXPAND:
             expandLinksUi();
+            return true;
+        case IDC_S_REVIEW:
+            scheduleSearch(30);
+            return true;
+        case IDC_S_YES:
+        case IDC_S_NO:
+            markSelected(id == IDC_S_YES);
+            return true;
+        case IDC_S_BULK:
+            bulkTagUi();
             return true;
         case IDC_S_SMART_DELETE:
             deleteSmartFolderUi();
@@ -2450,6 +2559,7 @@ void appendMainMenus(HMENU root) {
     popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
+    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG});
     popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
@@ -2701,6 +2811,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     expandLinksUi();
                     break;
                 case CMD_LINKS: showLinksWindow(); break;
+                case CMD_TAG_YES:
+                case CMD_TAG_NO:
+                    if (app.tab == 1) markSelected(LOWORD(wp) == CMD_TAG_YES);
+                    break;
+                case CMD_BULK_TAG:
+                    if (app.tab == 1) bulkTagUi();
+                    break;
+                case CMD_REVIEW:
+                    if (app.tab != 1) switchTab(1);
+                    Button_SetCheck(app.s.review, Button_GetCheck(app.s.review) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
+                    scheduleSearch(10);
+                    break;
                 case CMD_INDEXER_TOGGLE:
                     saveSettings();  // 調べるフォルダを DB に書いてから
                     if (indexer::isRunning()) {

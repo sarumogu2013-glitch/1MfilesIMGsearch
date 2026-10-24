@@ -104,6 +104,13 @@ SearchResult search(Db& db, const SearchQuery& q) {
         tagCte(n, q.tags[i]);
         joins += " JOIN " + n + " ON " + n + ".image_id=i.id";
     }
+    if (q.review && !q.tags.empty()) {
+        const auto names = aliasesOf(db, q.tags[0]);
+        where += " AND t0.conf < ? AND NOT EXISTS (SELECT 1 FROM tags m WHERE m.image_id=i.id AND m.manual=1 AND m.tag COLLATE NOCASE IN (" +
+                 placeholders(names.size()) + "))";
+        params.emplace_back(kReviewMax);
+        for (const auto& n : names) params.emplace_back(n);
+    }
     for (size_t i = 0; i < q.excludeTags.size(); ++i) {
         const std::string n = "x" + std::to_string(i);
         tagCte(n, q.excludeTags[i]);
@@ -190,6 +197,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
     const std::string dir = q.descending ? " DESC" : "";
     std::string order = " ORDER BY (" + key + ") IS NULL, " + key + dir;
     if (key != "i.path") order += ", i.path";
+    if (q.review && !q.tags.empty()) order = " ORDER BY abs(t0.conf - 0.5), i.path";
 
     const std::string from = " FROM images i LEFT JOIN file_meta f ON f.image_id=i.id" + joins + where;
     auto bindAll = [&](Stmt& st) {
@@ -233,6 +241,30 @@ bool imageInfo(Db& db, int64_t id, ImageInfo& out) {
     out.title = st.text(7);
     out.format = st.text(8);
     return true;
+}
+
+void setManualTag(Db& db, int64_t imageId, const std::string& tag, bool correct) {
+    clearManualTag(db, imageId, tag);
+    std::string kind = "general";
+    {
+        Stmt st(db.handle(), "SELECT kind FROM tags WHERE image_id=? AND tag=? COLLATE NOCASE ORDER BY confidence DESC LIMIT 1");
+        st.bind(1, imageId).bind(2, tag);
+        if (st.step()) kind = st.text(0);
+    }
+    Stmt ins(db.handle(),
+             "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'manual',1)");
+    ins.bind(1, imageId).bind(2, tag).bind(3, kind).bind(4, correct ? 1.0 : 0.0);
+    ins.step();
+}
+
+void clearManualTag(Db& db, int64_t imageId, const std::string& tag) {
+    const auto names = aliasesOf(db, tag);
+    const std::string sql =
+        "DELETE FROM tags WHERE image_id=? AND manual=1 AND tag COLLATE NOCASE IN (" + placeholders(names.size()) + ")";
+    Stmt del(db.handle(), sql.c_str());
+    del.bind(1, imageId);
+    for (size_t i = 0; i < names.size(); ++i) del.bind(static_cast<int>(i + 2), names[i]);
+    del.step();
 }
 
 namespace {
@@ -289,6 +321,7 @@ std::string queryToJson(const SearchQuery& q) {
     putBool(out, "animatedOnly", q.animatedOnly);
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
+    putBool(out, "review", q.review);
     out += ",\"sort\":\"" + std::string(kSortNames[static_cast<int>(q.sort)]) + "\"";
     putBool(out, "descending", q.descending);
     out += "}";
@@ -334,6 +367,7 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     for (size_t i = 0; i < std::size(kSortNames); ++i)
         if (sort == kSortNames[i]) q.sort = static_cast<SortKey>(i);
     flag("descending", q.descending);
+    flag("review", q.review);
     out = std::move(q);
     return true;
 }

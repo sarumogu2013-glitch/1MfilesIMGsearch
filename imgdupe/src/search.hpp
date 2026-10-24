@@ -32,6 +32,9 @@ struct SearchQuery {
     bool animatedOnly = false;
     std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
+    // 確認キュー: 1 つ目のタグをまだ手動で確定していない画像のうち、確度が kReviewMax 未満のものを、
+    // 迷っている順（確度が 0.5 に近い順）に並べる（sort は使わない）
+    bool review = false;
     // 並べ替え
     SortKey sort = SortKey::Path;
     bool descending = false;
@@ -57,6 +60,12 @@ struct ImageInfo {
     std::string title, format;
 };
 bool imageInfo(Db& db, int64_t id, ImageInfo& out);
+
+constexpr double kReviewMax = 0.9;
+
+// 手動で正誤を確定する（正しい = 1.0、違う = 0）。別名を含め、同じタグの前の確定は置き換える
+void setManualTag(Db& db, int64_t imageId, const std::string& tag, bool correct);
+void clearManualTag(Db& db, int64_t imageId, const std::string& tag);
 
 // 条件を JSON にする / JSON から戻す（スマートフォルダの保存用。知らない項目は無視、無い項目は既定値）
 std::string queryToJson(const SearchQuery& q);

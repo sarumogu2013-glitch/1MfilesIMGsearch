@@ -984,6 +984,32 @@ static void testSearch() {
     m.descending = true;
     CHECK((ids(m) == V{a, c, b, d}));  // 星なしは最後（パス順）
 
+    // 確認キュー: 手動で確定していないもの、迷っている順（0.5 に近い順）
+    SearchQuery rq;
+    rq.tags = {"hatsune_miku"};
+    rq.minConfidence = 0.2;
+    rq.review = true;
+    CHECK((ids(rq) == V{c, b}));  // c 0.3、b 0.75（a 0.9 は確度が高い、d は手動で確定済み）
+    setManualTag(db, b, "初音ミク", true);  // 別名で確定しても同じタグ
+    CHECK((ids(rq) == V{c}));
+    rq.review = false;
+    rq.minConfidence = 0.99;
+    CHECK((ids(rq) == V{b}));
+    setManualTag(db, b, "hatsune_miku", false);  // 確定し直すと前の確定は置き換わる
+    CHECK(ids(rq).empty());
+    {
+        Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE image_id=? AND manual=1");
+        st.bind(1, b);
+        CHECK(st.step() && st.i64(0) == 1);
+    }
+    clearManualTag(db, b, "hatsune_miku");
+    rq.minConfidence = 0.7;
+    CHECK((ids(rq) == V{a, b}));
+    setManualTag(db, c, "new_tag", true);  // 無かったタグも付けられる
+    SearchQuery nt;
+    nt.tags = {"new_tag"};
+    CHECK((ids(nt) == V{c}));
+
     // 条件の JSON（スマートフォルダ）
     SearchQuery full;
     full.tags = {"初音ミク", "say \"hi\""};
@@ -1006,6 +1032,7 @@ static void testSearch() {
     full.downloadContains = "pixiv";
     full.sort = SortKey::Taken;
     full.descending = true;
+    full.review = true;
     SearchQuery back;
     CHECK(queryFromJson(queryToJson(full), back));
     CHECK(back.tags == full.tags && back.excludeTags == full.excludeTags && back.excludeSources == full.excludeSources);
@@ -1013,7 +1040,7 @@ static void testSearch() {
     CHECK(back.takenFrom == full.takenFrom && back.takenTo == full.takenTo && back.noTaken && back.minWidth == 3000);
     CHECK(back.minHeight == 2000 && back.minSize == 150 && back.maxSize == 5000000000LL && back.format == "PNG");
     CHECK(back.animatedOnly && back.pathContains == full.pathContains && back.downloadContains == "pixiv");
-    CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0);
+    CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0 && back.review);
     SearchQuery def;
     CHECK(queryFromJson(queryToJson(SearchQuery{}), def) && def.minRating == -1 && def.minConfidence == 0.5 &&
           def.sort == SortKey::Path && !def.descending);
