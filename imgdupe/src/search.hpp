@@ -1,0 +1,66 @@
+// 検索（仕様「検索と確認」「メタデータでの検索・ソート」）。条件から SQL を組み立て、DB 側で絞り込みと並べ替えを行う。
+// OS に依存しない。
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "db.hpp"
+
+namespace imgdupe {
+
+enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence };
+
+struct SearchQuery {
+    // タグ（別名は tag_dict でまとめる）。tags は全部を持つもの、excludeTags はどれも持たないもの
+    std::vector<std::string> tags;
+    std::vector<std::string> excludeTags;
+    double minConfidence = 0.5;          // 確度スライダー（0〜1）
+    std::vector<std::string> sources;    // 使う出どころ（空 = すべて）。確度はこの出どころだけで合成する
+    // タイトル・件名・コメント・キーワード・PNG のテキストの部分一致
+    std::string text;
+    // メタデータ（0 / -1 / 空 = 条件なし）
+    int minRating = -1;
+    bool noRating = false;               // 星なし
+    int64_t takenFrom = 0, takenTo = 0;  // 撮影日時（Unix 秒、takenTo はその秒を含む）
+    bool noTaken = false;                // 撮影日時なし（EXIF なし）
+    int minWidth = 0, minHeight = 0;
+    int64_t minSize = 0, maxSize = 0;    // バイト
+    std::string format;                  // "JPEG" など
+    bool animatedOnly = false;
+    std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
+    std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
+    // 並べ替え
+    SortKey sort = SortKey::Path;
+    bool descending = false;
+    size_t limit = 0;                    // 0 = すべて
+};
+
+struct SearchResult {
+    std::vector<int64_t> ids;  // 並べ替えた画像 ID
+    size_t total = 0;          // 条件に合う数（limit を超えていても全部の数）
+};
+
+// タグの文字列（空白区切り。"-タグ" は除外）を分ける
+void parseTagQuery(const std::string& text, std::vector<std::string>& tags, std::vector<std::string>& exclude);
+
+SearchResult search(Db& db, const SearchQuery& q);
+
+// 一覧に出す 1 件分
+struct ImageInfo {
+    int64_t id = 0;
+    std::string path;
+    int64_t size = 0, mtime = 0, taken = 0;
+    int width = 0, height = 0, rating = -1;
+    std::string title, format;
+};
+bool imageInfo(Db& db, int64_t id, ImageInfo& out);
+
+// 出どころの一覧（タグの数の多い順）
+std::vector<std::pair<std::string, int64_t>> tagSources(Db& db);
+
+// 確度の合成: p = 1 - (1 - p1)(1 - p2)...（仕様「確度の合成」）
+double combineConfidence(const std::vector<double>& ps);
+
+}  // namespace imgdupe

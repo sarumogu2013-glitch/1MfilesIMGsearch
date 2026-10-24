@@ -74,6 +74,9 @@ void parseZoneIdentifier(const std::string& text, std::string& hostUrl, std::str
 
 // Windows の FILETIME（1601 年からの 100ns）→ Unix 秒
 int64_t fileTimeToUnix(uint64_t fileTime);
+// 年月日時分秒 ⇔ Unix 秒（どちらもタイムゾーンを考えない。撮影日時は撮った場所の時刻のまま持つ）
+int64_t civilToUnix(int y, int mo, int d, int h = 0, int mi = 0, int s = 0);
+void unixToCivil(int64_t t, int& y, int& mo, int& d, int& h, int& mi, int& s);
 // EXIF の "2024:05:01 12:34:56" → Unix 秒（ローカル時刻のまま UTC として数える。0 = 読めない）
 int64_t parseExifDate(const std::string& s);
 

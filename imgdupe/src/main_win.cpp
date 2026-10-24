@@ -22,8 +22,11 @@
 #include <deque>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
 
 #include "commands.hpp"
 #include "core.hpp"
@@ -33,6 +36,7 @@
 #include "indexer_win.hpp"
 #include "keymap_win.hpp"
 #include "resource.h"
+#include "search.hpp"
 #include "update_win.hpp"
 #include "version.hpp"
 #include "win_util.hpp"
@@ -50,7 +54,9 @@ constexpr UINT WM_APP_DONE = WM_APP + 1;   // lParam: Outcome*
 constexpr UINT WM_APP_THUMB = WM_APP + 2;  // lParam: ThumbResult*
 constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: CheckMode, lParam: upd::CheckResult*
 constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // wParam: CheckMode, lParam: upd::DownloadResult*
+constexpr UINT WM_APP_SEARCHED = WM_APP + 5;  // lParam: SearchDone*
 constexpr UINT_PTR kProgressTimer = 1;
+constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
 constexpr UINT kExitCheckTimeoutMs = 20000;  // 終了時の確認を待つのはここまで
 
@@ -70,6 +76,29 @@ enum : int {
     IDC_FOLDERS_LABEL,
     IDC_THRESHOLD_CAPTION,
     IDC_TOOLBAR,
+    IDC_TABS,
+    // 検索の画面
+    IDC_S_TAGS = 600,
+    IDC_S_CONF,
+    IDC_S_CONF_VALUE,
+    IDC_S_SOURCES,
+    IDC_S_TEXT,
+    IDC_S_RATING,
+    IDC_S_FORMAT,
+    IDC_S_FROM,
+    IDC_S_TO,
+    IDC_S_NOTAKEN,
+    IDC_S_MINW,
+    IDC_S_MINKB,
+    IDC_S_MAXKB,
+    IDC_S_PATH,
+    IDC_S_DOWNLOAD,
+    IDC_S_SORT,
+    IDC_S_DESC,
+    IDC_S_CLEAR,
+    IDC_S_COUNT,
+    IDC_S_RESULTS,
+    IDC_S_LABEL,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -84,9 +113,20 @@ struct Outcome {
 };
 
 struct ThumbResult {
+    int view;
     unsigned gen;
     int item;
     HBITMAP bmp;
+};
+
+// サムネイルを並べる一覧（重複のグループの中身・検索結果）ごとの画像リスト
+enum : int { kDupView = 0, kSearchView = 1, kViewCount = 2 };
+struct ThumbView {
+    HWND lv = nullptr;
+    HIMAGELIST images = nullptr;
+    std::vector<int> imageOf;     // 項目 → 画像リストの番号（-1: まだ）
+    std::vector<char> requested;  // 読み込みを頼んだか
+    unsigned gen = 0;             // 中身を入れ替えるたびに増やす（古い読み込みの結果は捨てる）
 };
 
 struct App {
@@ -114,6 +154,28 @@ struct App {
     bool updating = false;                   // 確認・ダウンロード中
     bool closing = false;                    // 終了時のアップデート確認中（ウィンドウは隠してある）
 
+    // 画面の切り替え（0: 重複を探す、1: 検索）
+    HWND tabs = nullptr;
+    int tab = 0;
+    std::vector<HWND> dupPage;  // 重複を探す画面だけのコントロール
+
+    // 検索の画面
+    struct SearchCtl {
+        HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, minW, minKb, maxKb, path, download,
+            sort, desc, clear, count, results;
+        std::vector<HWND> labels;  // 見出し（並べる順）
+    } s{};
+    std::vector<HWND> searchPage;
+    std::vector<int64_t> searchIds;
+    size_t searchTotal = 0;
+    unsigned searchGen = 0;
+    bool searchShown = false;  // 一度でも検索の画面を開いたか
+    std::unordered_map<int, ImageInfo> infoCache;  // 一覧の項目 → 画像の情報
+    std::unique_ptr<Db> uiDb;  // 画面の表示に使う DB の接続（UI のスレッドだけで使う）
+    std::vector<std::string> sourceNames;    // 出どころの一覧の並び
+    std::set<std::string> uncheckedSources;  // 外した出どころ
+    bool fillingSources = false;
+
     // メニューとショートカットキー
     HMENU menuBar = nullptr;
     KeyMap keys;
@@ -127,19 +189,17 @@ struct App {
 
     // サムネイル
     int thumbSize = 160;
-    HIMAGELIST images = nullptr;
-    std::vector<int> imageOf;     // 項目 → 画像リストの番号（-1: まだ）
-    std::vector<char> requested;  // 読み込みを頼んだか
+    ThumbView views[kViewCount];
     std::thread thumbThread;
     std::mutex thumbMutex;
     std::condition_variable thumbCv;
     struct ThumbJob {
+        int view;
         int item;
         std::wstring path;
         int64_t imageId;
     };
     std::deque<ThumbJob> thumbQueue;
-    unsigned thumbGen = 0;
     bool thumbQuit = false;
 };
 
@@ -209,7 +269,10 @@ std::vector<std::wstring> folderList() {
     return out;
 }
 
+void saveSearchSettings();
+
 void saveSettings() {
+    if (app.s.tags) saveSearchSettings();
     const auto f = folderList();
     indexer::setRoots(app.dataDir, f);  // バックグラウンドの解析も同じフォルダを見る
     WritePrivateProfileSectionW(L"folders", L"\0", iniPath().c_str());
@@ -361,7 +424,7 @@ void thumbLoop() {
             if (app.thumbQuit) break;
             job = std::move(app.thumbQueue.front());
             app.thumbQueue.pop_front();
-            gen = app.thumbGen;
+            gen = app.views[job.view].gen;
         }
         HBITMAP bmp = nullptr;
         ThumbData t;
@@ -370,7 +433,7 @@ void thumbLoop() {
             std::max(t.width, t.height) >= std::min(app.thumbSize, kThumbSide - 1))
             bmp = imgwin::thumbFromBytes(t.bytes, app.thumbSize, GetSysColor(COLOR_WINDOW));
         if (!bmp) bmp = imgwin::loadThumbnail(job.path, app.thumbSize, GetSysColor(COLOR_WINDOW));
-        auto* r = new ThumbResult{gen, job.item, bmp};
+        auto* r = new ThumbResult{job.view, gen, job.item, bmp};
         if (!PostMessageW(app.hwnd, WM_APP_THUMB, 0, reinterpret_cast<LPARAM>(r))) {
             if (bmp) DeleteObject(bmp);
             delete r;
@@ -401,19 +464,53 @@ HBITMAP solidBitmap(int size, COLORREF fill, COLORREF frame) {
     return bmp;
 }
 
-// 画像リストを空にして、0: 読み込み中, 1: 読めない を入れ直す
-void resetImages() {
-    if (!app.images) {
-        app.images = ImageList_Create(app.thumbSize, app.thumbSize, ILC_COLOR32, 16, 64);
-        ListView_SetImageList(app.thumbs, app.images, LVSIL_NORMAL);
+// 一覧の中身を n 件に入れ替える（画像リストを空にして、0: 読み込み中, 1: 読めない を入れ直す）
+void resetView(int view, int n) {
+    ThumbView& v = app.views[view];
+    {
+        std::lock_guard<std::mutex> lock(app.thumbMutex);
+        ++v.gen;
+        app.thumbQueue.erase(std::remove_if(app.thumbQueue.begin(), app.thumbQueue.end(),
+                                            [view](const App::ThumbJob& j) { return j.view == view; }),
+                             app.thumbQueue.end());
     }
-    ImageList_RemoveAll(app.images);
+    if (!v.images) {
+        v.images = ImageList_Create(app.thumbSize, app.thumbSize, ILC_COLOR32, 16, 64);
+        ListView_SetImageList(v.lv, v.images, LVSIL_NORMAL);
+    }
+    ImageList_RemoveAll(v.images);
     HBITMAP loading = solidBitmap(app.thumbSize, RGB(236, 238, 242), RGB(210, 214, 220));
     HBITMAP broken = solidBitmap(app.thumbSize, RGB(250, 225, 225), RGB(220, 120, 120));
-    ImageList_Add(app.images, loading, nullptr);
-    ImageList_Add(app.images, broken, nullptr);
+    ImageList_Add(v.images, loading, nullptr);
+    ImageList_Add(v.images, broken, nullptr);
     DeleteObject(loading);
     DeleteObject(broken);
+    v.imageOf.assign(n, -1);
+    v.requested.assign(n, 0);
+    ListView_SetItemCountEx(v.lv, n, 0);
+    ListView_SetItemState(v.lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    if (n) ListView_EnsureVisible(v.lv, 0, FALSE);
+    InvalidateRect(v.lv, nullptr, TRUE);
+}
+
+// 見えている項目のサムネイルを頼む（後から頼んだ = 今見えているものを先に読む）
+void requestThumb(int view, int item, const std::wstring& path, int64_t imageId) {
+    ThumbView& v = app.views[view];
+    if (item < 0 || item >= static_cast<int>(v.requested.size()) || v.requested[item]) return;
+    v.requested[item] = 1;
+    {
+        std::lock_guard<std::mutex> lock(app.thumbMutex);
+        app.thumbQueue.push_front({view, item, path, imageId});
+    }
+    app.thumbCv.notify_one();
+}
+
+// GETDISPINFO の画像の番号（まだなら読み込みを頼む）
+int thumbImage(int view, int item, const std::wstring& path, int64_t imageId) {
+    ThumbView& v = app.views[view];
+    if (item < 0 || item >= static_cast<int>(v.imageOf.size())) return 0;
+    if (v.imageOf[item] < 0) requestThumb(view, item, path, imageId);
+    return v.imageOf[item] < 0 ? 0 : v.imageOf[item];
 }
 
 const Group* currentGroup() {
@@ -443,36 +540,16 @@ void showInfo(int item) {
 
 void selectGroup(int g) {
     app.curGroup = g;
-    {
-        std::lock_guard<std::mutex> lock(app.thumbMutex);
-        ++app.thumbGen;
-        app.thumbQueue.clear();
-    }
     const Group* grp = currentGroup();
-    const int n = grp ? static_cast<int>(grp->members.size()) : 0;
-    app.imageOf.assign(n, -1);
-    app.requested.assign(n, 0);
-    resetImages();
-    ListView_SetItemCountEx(app.thumbs, n, 0);
-    ListView_SetItemState(app.thumbs, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(app.thumbs, 0, FALSE);
-    InvalidateRect(app.thumbs, nullptr, TRUE);
+    resetView(kDupView, grp ? static_cast<int>(grp->members.size()) : 0);
     showInfo(-1);
 }
 
-void requestThumb(int item) {
-    if (item < 0 || item >= static_cast<int>(app.requested.size()) || app.requested[item]) return;
-    const Entry* e = memberEntry(item);
-    if (!e) return;
-    app.requested[item] = 1;
-    {
-        std::lock_guard<std::mutex> lock(app.thumbMutex);
-        const Group* g = currentGroup();
-        const uint32_t index = g->members[item].index;
-        const int64_t id = index < app.result.ids.size() ? app.result.ids[index] : 0;
-        app.thumbQueue.push_front({item, widen(e->path), id});  // 後から頼んだ（今見えている）ものを先に
-    }
-    app.thumbCv.notify_one();
+int64_t memberImageId(int item) {
+    const Group* g = currentGroup();
+    if (!g || item < 0 || item >= static_cast<int>(g->members.size())) return 0;
+    const uint32_t index = g->members[item].index;
+    return index < app.result.ids.size() ? app.result.ids[index] : 0;
 }
 
 // ---------------------------------------------------------------- 結果の表示
@@ -804,25 +881,21 @@ void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
 
 // ---------------------------------------------------------------- 操作
 
-void openItem(int item) {
-    const Entry* e = memberEntry(item);
-    if (e) ShellExecuteW(app.hwnd, L"open", widen(e->path).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+void openPath(const std::wstring& path) {
+    if (!path.empty()) ShellExecuteW(app.hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-void showInExplorer(int item) {
-    const Entry* e = memberEntry(item);
-    if (!e) return;
-    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(widen(e->path).c_str());
+void showPathInExplorer(const std::wstring& path) {
+    if (path.empty()) return;
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(path.c_str());
     if (pidl) {
         SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
         ILFree(pidl);
     }
 }
 
-void copyPath(int item) {
-    const Entry* e = memberEntry(item);
-    if (!e || !OpenClipboard(app.hwnd)) return;
-    const std::wstring w = widen(e->path);
+void copyText(const std::wstring& w) {
+    if (w.empty() || !OpenClipboard(app.hwnd)) return;
     EmptyClipboard();
     HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
     if (mem) {
@@ -831,6 +904,35 @@ void copyPath(int item) {
         if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
     }
     CloseClipboard();
+}
+
+std::wstring memberPath(int item) {
+    const Entry* e = memberEntry(item);
+    return e ? widen(e->path) : L"";
+}
+
+const ImageInfo* resultInfo(int item);
+
+// 今の画面で選んでいる画像のパス
+std::wstring selectedPath() {
+    if (app.tab == 0) return memberPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED));
+    const ImageInfo* info = resultInfo(ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED));
+    return info ? widen(info->path) : L"";
+}
+
+// 画像の右クリックのメニュー
+void imageContextMenu(const std::wstring& path) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
+    AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
+    AppendMenuW(menu, MF_STRING, CMD_COPY_PATH, L"パスをコピー(&C)");
+    POINT pt;
+    GetCursorPos(&pt);
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd == CMD_OPEN) openPath(path);
+    if (cmd == CMD_EXPLORER) showPathInExplorer(path);
+    if (cmd == CMD_COPY_PATH) copyText(path);
 }
 
 void exportResult() {
@@ -867,7 +969,541 @@ void showHelp() {
                 L"imgdupe の使い方", MB_ICONINFORMATION);
 }
 
+// ---------------------------------------------------------------- 検索の画面
+
+HWND makeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD exStyle = 0);
+void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT_LEFT);
+void copyOut(LVITEMW& item, const std::wstring& s);
+
+struct SearchDone {
+    unsigned gen;
+    SearchResult result;
+    std::wstring error;
+};
+
+Db* uiDb() {
+    if (!app.uiDb) {
+        app.uiDb = std::make_unique<Db>();
+        if (!app.uiDb->open(narrow(dbPath()))) app.uiDb.reset();
+    }
+    return app.uiDb.get();
+}
+
+// 出どころの表示名
+std::wstring sourceLabel(const std::string& s) {
+    static const std::pair<const char*, const wchar_t*> names[] = {
+        {"manual", L"手動で確認"}, {"embedded", L"ファイル埋め込み"}, {"meta", L"メタデータ"}, {"id_lookup", L"ID 照会"},
+        {"reverse", L"逆画像検索"}, {"folder", L"フォルダ名"}, {"same_folder", L"同じフォルダからの推定"},
+        {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
+    for (const auto& [k, v] : names)
+        if (s == k) return v;
+    return widen(s);
+}
+
+std::wstring editText(HWND h) {
+    std::wstring t(static_cast<size_t>(GetWindowTextLengthW(h)), L'\0');
+    if (!t.empty()) GetWindowTextW(h, &t[0], static_cast<int>(t.size()) + 1);
+    return t;
+}
+
+// 出どころの一覧を DB から作り直す（外したものは外したまま）
+void refreshSources() {
+    Db* db = uiDb();
+    app.fillingSources = true;
+    ListView_DeleteAllItems(app.s.sources);
+    app.sourceNames.clear();
+    if (db) {
+        try {
+            for (const auto& [name, count] : tagSources(*db)) {
+                const std::wstring text = sourceLabel(name) + L"（" + withCommas(static_cast<uint64_t>(count)) + L"）";
+                LVITEMW it{};
+                it.mask = LVIF_TEXT;
+                it.iItem = static_cast<int>(app.sourceNames.size());
+                it.pszText = const_cast<wchar_t*>(text.c_str());
+                const int i = ListView_InsertItem(app.s.sources, &it);
+                ListView_SetCheckState(app.s.sources, i, app.uncheckedSources.count(name) ? FALSE : TRUE);
+                app.sourceNames.push_back(name);
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    if (app.sourceNames.empty()) {
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.pszText = const_cast<wchar_t*>(L"（タグはまだありません）");
+        ListView_InsertItem(app.s.sources, &it);
+    }
+    app.fillingSources = false;
+}
+
+std::optional<int64_t> pickerDate(HWND h, bool endOfDay) {
+    SYSTEMTIME st{};
+    if (DateTime_GetSystemtime(h, &st) != GDT_VALID) return std::nullopt;
+    return civilToUnix(st.wYear, st.wMonth, st.wDay, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
+}
+
+SearchQuery searchQueryFromUi() {
+    SearchQuery q;
+    parseTagQuery(narrow(editText(app.s.tags)), q.tags, q.excludeTags);
+    q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
+    if (!app.uncheckedSources.empty())
+        for (const auto& n : app.sourceNames)
+            if (!app.uncheckedSources.count(n)) q.sources.push_back(n);
+    if (!app.uncheckedSources.empty() && q.sources.empty()) q.sources.push_back("\x01");  // すべて外した = 何も出さない
+    q.text = narrow(editText(app.s.text));
+    const int rating = ComboBox_GetCurSel(app.s.rating);  // 0: 指定なし、1〜5: ★n 以上、6: 星なし
+    if (rating >= 1 && rating <= 5) q.minRating = rating;
+    if (rating == 6) q.noRating = true;
+    const int format = ComboBox_GetCurSel(app.s.format);
+    if (format > 0) {
+        std::wstring f(static_cast<size_t>(ComboBox_GetLBTextLen(app.s.format, format)), L'\0');
+        ComboBox_GetLBText(app.s.format, format, &f[0]);
+        if (f == L"アニメーション") q.animatedOnly = true;
+        else q.format = narrow(f.c_str());
+    }
+    if (auto t = pickerDate(app.s.from, false)) q.takenFrom = *t;
+    if (auto t = pickerDate(app.s.to, true)) q.takenTo = *t;
+    q.noTaken = Button_GetCheck(app.s.noTaken) == BST_CHECKED;
+    q.minWidth = _wtoi(editText(app.s.minW).c_str());
+    q.minSize = static_cast<int64_t>(_wtoi(editText(app.s.minKb).c_str())) * 1024;
+    q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
+    q.pathContains = narrow(editText(app.s.path));
+    q.downloadContains = narrow(editText(app.s.download));
+    static const SortKey sorts[] = {SortKey::Path,      SortKey::Modified, SortKey::Created, SortKey::Taken, SortKey::Resolution,
+                                    SortKey::Size,      SortKey::Rating,   SortKey::Title,   SortKey::Confidence};
+    const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
+    q.sort = sorts[std::min<int>(sort, static_cast<int>(std::size(sorts)) - 1)];
+    q.descending = Button_GetCheck(app.s.desc) == BST_CHECKED;
+    return q;
+}
+
+// 条件が変わったら、少し待ってから探す（スライダーを動かしている間や、文字を打っている間は探さない）
+void scheduleSearch(UINT delayMs) {
+    if (app.tab != 1) return;
+    SetTimer(app.hwnd, kSearchTimer, delayMs, nullptr);
+}
+
+void runSearch() {
+    KillTimer(app.hwnd, kSearchTimer);
+    const SearchQuery q = searchQueryFromUi();
+    const unsigned gen = ++app.searchGen;
+    setText(app.s.count, L"検索中…");
+    const std::string db = narrow(dbPath());
+    HWND hwnd = app.hwnd;
+    std::thread([q, gen, db, hwnd] {
+        auto* done = new SearchDone{gen, {}, L""};
+        try {
+            Db d;
+            if (!d.open(db)) throw std::runtime_error(d.error());
+            done->result = search(d, q);
+        } catch (const std::exception& e) {
+            done->error = widen(e.what());
+        }
+        if (!PostMessageW(hwnd, WM_APP_SEARCHED, 0, reinterpret_cast<LPARAM>(done))) delete done;
+    }).detach();
+}
+
+void showSearchInfo(int item);
+
+void onSearched(SearchDone* p) {
+    std::unique_ptr<SearchDone> done(p);
+    if (done->gen != app.searchGen) return;  // 古い条件の結果
+    if (!done->error.empty()) {
+        setText(app.s.count, L"検索できませんでした: " + done->error);
+        return;
+    }
+    app.searchIds = std::move(done->result.ids);
+    app.searchTotal = done->result.total;
+    app.infoCache.clear();
+    resetView(kSearchView, static_cast<int>(app.searchIds.size()));
+    setText(app.s.count, app.searchTotal ? withCommas(app.searchTotal) + L" 件" : L"見つかりません");
+    showSearchInfo(-1);
+}
+
+const ImageInfo* resultInfo(int item) {
+    if (item < 0 || item >= static_cast<int>(app.searchIds.size())) return nullptr;
+    auto it = app.infoCache.find(item);
+    if (it != app.infoCache.end()) return &it->second;
+    Db* db = uiDb();
+    ImageInfo info;
+    if (!db) return nullptr;
+    try {
+        if (!imageInfo(*db, app.searchIds[item], info)) return nullptr;
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+    if (app.infoCache.size() > 20000) app.infoCache.clear();
+    return &app.infoCache.emplace(item, std::move(info)).first->second;
+}
+
+std::wstring dateText(int64_t t) {
+    int y, mo, d, h, mi, se;
+    unixToCivil(t, y, mo, d, h, mi, se);
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%04d-%02d-%02d %02d:%02d", y, mo, d, h, mi);
+    return buf;
+}
+
+std::wstring stars(int rating) { return rating > 0 ? std::wstring(static_cast<size_t>(rating), L'★') : L""; }
+
+void showSearchInfo(int item) {
+    const ImageInfo* info = resultInfo(item);
+    for (int id : {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH}) tbEnable(id, info != nullptr);
+    if (!info) {
+        setText(app.info, app.searchIds.empty() ? L""
+                                                : L"画像をダブルクリックすると開きます。右クリックで「エクスプローラーで表示」などができます。");
+        return;
+    }
+    std::wstring line = std::to_wstring(info->width) + L" × " + std::to_wstring(info->height) + L"　" +
+                        sizeText(static_cast<uint64_t>(info->size));
+    if (!info->format.empty()) line += L"　" + widen(info->format);
+    if (info->rating > 0) line += L"　" + stars(info->rating);
+    if (info->taken) line += L"　撮影 " + dateText(info->taken);
+    if (!info->title.empty()) line += L"　「" + widen(info->title) + L"」";
+    // タグごとに、出どころの確度を合成して出す（手動で確定したものはその値）
+    std::wstring tags;
+    if (Db* db = uiDb()) {
+        try {
+            struct Agg {
+                std::vector<double> ps;
+                std::wstring detail;
+                int manual = -1;  // 手動で確定した値（-1 = なし）
+            };
+            std::vector<std::pair<std::string, Agg>> agg;
+            for (const auto& t : tagsOf(*db, info->id)) {
+                auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return a.first == t.tag; });
+                if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{}});
+                wchar_t c[16];
+                swprintf(c, 16, L" %.2f", t.confidence);
+                it->second.detail += (it->second.detail.empty() ? L"" : L"・") + sourceLabel(t.source) + c;
+                if (t.manual) it->second.manual = t.confidence > 0.5 ? 1 : 0;
+                else if (!app.uncheckedSources.count(t.source)) it->second.ps.push_back(t.confidence);
+            }
+            std::vector<std::pair<double, std::wstring>> lines;
+            for (const auto& [tag, a] : agg) {
+                const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
+                wchar_t c[16];
+                swprintf(c, 16, L" %.2f", p);
+                lines.emplace_back(p, widen(tag) + c + L"（" + a.detail + L"）");
+            }
+            std::stable_sort(lines.begin(), lines.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+            for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"タグ: " : L"　") + lines[i].second;
+            if (lines.size() > 8) tags += L"　ほか " + std::to_wstring(lines.size() - 8) + L" 個";
+        } catch (const std::exception&) {
+        }
+    }
+    setText(app.info, widen(info->path) + L"\r\n" + line + (tags.empty() ? L"" : L"\r\n" + tags));
+}
+
+void clearSearchConditions() {
+    for (HWND h : {app.s.tags, app.s.text, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
+        SetWindowTextW(h, L"");
+    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
+    setText(app.s.confValue, L"0.50");
+    ComboBox_SetCurSel(app.s.rating, 0);
+    ComboBox_SetCurSel(app.s.format, 0);
+    DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
+    DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
+    Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
+    app.uncheckedSources.clear();
+    refreshSources();
+    scheduleSearch(10);
+}
+
+void layout();
+
+void switchTab(int t) {
+    app.tab = t;
+    TabCtrl_SetCurSel(app.tabs, t);
+    for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
+    for (HWND h : app.searchPage) ShowWindow(h, t == 1 ? SW_SHOW : SW_HIDE);
+    layout();
+    if (t == 1) {
+        refreshSources();
+        if (!app.searchShown) {
+            app.searchShown = true;
+            scheduleSearch(10);
+        }
+        showSearchInfo(ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED));
+        SetFocus(app.s.tags);
+    } else {
+        showInfo(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED));
+    }
+}
+
+void layoutSearch(int y, int W, int bottom) {
+    const int m = px(8), panelW = px(300), rowH = px(24), labelH = px(18), gap = px(6);
+    int x = m, cy = y;
+    size_t li = 0;
+    auto label = [&](int ly, int lx, int w) {
+        if (li < app.s.labels.size()) MoveWindow(app.s.labels[li++], lx, ly, w, labelH, TRUE);
+    };
+    auto full = [&](HWND h, int height) {
+        label(cy, x, panelW);
+        cy += labelH + px(2);
+        MoveWindow(h, x, cy, panelW, height, TRUE);
+        cy += height + gap;
+    };
+    full(app.s.tags, rowH);
+    // 確度
+    label(cy, x, panelW);
+    cy += labelH;
+    MoveWindow(app.s.conf, x, cy, panelW - px(50), rowH + px(4), TRUE);
+    MoveWindow(app.s.confValue, x + panelW - px(46), cy + px(4), px(46), labelH, TRUE);
+    cy += rowH + px(4) + gap;
+    full(app.s.sources, px(96));
+    full(app.s.text, rowH);
+    // 星・形式
+    const int half = (panelW - gap) / 2;
+    label(cy, x, half);
+    label(cy, x + half + gap, half);
+    cy += labelH + px(2);
+    MoveWindow(app.s.rating, x, cy, half, px(240), TRUE);
+    MoveWindow(app.s.format, x + half + gap, cy, half, px(240), TRUE);
+    cy += rowH + gap;
+    // 撮影日
+    label(cy, x, panelW);
+    cy += labelH + px(2);
+    const int dw = (panelW - px(24)) / 2;
+    MoveWindow(app.s.from, x, cy, dw, rowH, TRUE);
+    label(cy + px(4), x + dw + px(4), px(16));
+    MoveWindow(app.s.to, x + panelW - dw, cy, dw, rowH, TRUE);
+    cy += rowH + px(2);
+    MoveWindow(app.s.noTaken, x, cy, panelW, rowH, TRUE);
+    cy += rowH + gap;
+    // 幅・ファイルサイズ
+    label(cy, x, px(90));
+    label(cy, x + px(100), panelW - px(100));
+    cy += labelH + px(2);
+    MoveWindow(app.s.minW, x, cy, px(80), rowH, TRUE);
+    MoveWindow(app.s.minKb, x + px(100), cy, px(80), rowH, TRUE);
+    label(cy + px(4), x + px(184), px(16));
+    MoveWindow(app.s.maxKb, x + px(204), cy, px(80), rowH, TRUE);
+    cy += rowH + gap;
+    full(app.s.path, rowH);
+    full(app.s.download, rowH);
+    // 並べ替え
+    label(cy, x, panelW);
+    cy += labelH + px(2);
+    MoveWindow(app.s.sort, x, cy, panelW - px(80), px(300), TRUE);
+    MoveWindow(app.s.desc, x + panelW - px(72), cy, px(72), rowH, TRUE);
+    cy += rowH + gap;
+    MoveWindow(app.s.clear, x, cy, px(140), px(28), TRUE);
+
+    const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m);
+    MoveWindow(app.s.count, rx, y, rw, labelH, TRUE);
+    MoveWindow(app.s.results, rx, y + labelH + px(4), rw, std::max(0, bottom - y - labelH - px(4)), TRUE);
+}
+
+void createSearchControls() {
+    auto label = [&](const wchar_t* text) {
+        HWND h = makeControl(WC_STATICW, text, SS_NOPREFIX, IDC_S_LABEL);
+        app.s.labels.push_back(h);
+        app.searchPage.push_back(h);
+    };
+    auto edit = [&](int id, DWORD style = 0) {
+        HWND h = makeControl(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL | style, id, WS_EX_CLIENTEDGE);
+        app.searchPage.push_back(h);
+        return h;
+    };
+    auto combo = [&](int id, std::initializer_list<const wchar_t*> items) {
+        HWND h = makeControl(WC_COMBOBOXW, L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, id);
+        for (const wchar_t* t : items) ComboBox_AddString(h, t);
+        ComboBox_SetCurSel(h, 0);
+        app.searchPage.push_back(h);
+        return h;
+    };
+    // 見出しの順は layoutSearch で並べる順と同じ
+    label(L"タグ（空白で区切る。-タグ で除外）");
+    app.s.tags = edit(IDC_S_TAGS);
+    label(L"確度（右へ動かすほど確実なものだけ）");
+    app.s.conf = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, IDC_S_CONF);
+    SendMessageW(app.s.conf, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
+    app.s.confValue = makeControl(WC_STATICW, L"0.50", SS_RIGHT, IDC_S_CONF_VALUE);
+    app.searchPage.insert(app.searchPage.end(), {app.s.conf, app.s.confValue});
+    label(L"出どころ（チェックしたものだけで確度を計算）");
+    app.s.sources = makeControl(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL,
+                                IDC_S_SOURCES, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(app.s.sources, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+    addColumn(app.s.sources, 0, L"", 270);
+    app.searchPage.push_back(app.s.sources);
+    label(L"文字（タイトル・コメント・プロンプトなど）");
+    app.s.text = edit(IDC_S_TEXT);
+    label(L"星");
+    label(L"形式");
+    app.s.rating = combo(IDC_S_RATING, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
+    app.s.format = combo(IDC_S_FORMAT, {L"すべて", L"JPEG", L"PNG", L"GIF", L"WebP", L"HEIF", L"BMP", L"TIFF", L"JPEG XR",
+                                        L"アニメーション"});
+    label(L"撮影日（チェックを入れた日だけ使う）");
+    label(L"〜");
+    app.s.from = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_FROM);
+    app.s.to = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_TO);
+    DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
+    DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
+    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日の無い画像（EXIF なし）だけ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
+    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken});
+    label(L"幅（px）以上");
+    label(L"ファイルサイズ（KB）");
+    app.s.minW = edit(IDC_S_MINW, ES_NUMBER);
+    label(L"〜");
+    app.s.minKb = edit(IDC_S_MINKB, ES_NUMBER);
+    app.s.maxKb = edit(IDC_S_MAXKB, ES_NUMBER);
+    label(L"パス（フォルダ名・ファイル名の一部）");
+    app.s.path = edit(IDC_S_PATH);
+    label(L"ダウンロード元（URL の一部。pixiv など）");
+    app.s.download = edit(IDC_S_DOWNLOAD);
+    label(L"並べ替え");
+    app.s.sort = combo(IDC_S_SORT, {L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ", L"星",
+                                    L"タイトル", L"確度（1 つ目のタグ）"});
+    app.s.desc = makeControl(WC_BUTTONW, L"降順", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DESC);
+    app.s.clear = makeControl(WC_BUTTONW, L"条件をクリア", WS_TABSTOP, IDC_S_CLEAR);
+    app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
+    app.searchPage.insert(app.searchPage.end(), {app.s.desc, app.s.clear, app.s.count});
+
+    app.s.results = makeControl(WC_LISTVIEWW, L"",
+                                WS_TABSTOP | LVS_ICON | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_AUTOARRANGE,
+                                IDC_S_RESULTS, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(app.s.results, LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
+    ListView_SetIconSpacing(app.s.results, app.thumbSize + px(20), app.thumbSize + px(44));
+    app.views[kSearchView].lv = app.s.results;
+    resetView(kSearchView, 0);
+    app.searchPage.push_back(app.s.results);
+    for (HWND h : app.searchPage) ShowWindow(h, SW_HIDE);
+}
+
+// 検索の画面の通知（処理したら true）
+bool onSearchNotify(NMHDR* nm) {
+    if (nm->hwndFrom == app.s.results) {
+        switch (nm->code) {
+            case LVN_GETDISPINFOW: {
+                auto* di = reinterpret_cast<NMLVDISPINFOW*>(nm);
+                const ImageInfo* info = resultInfo(di->item.iItem);
+                if (!info) return true;
+                if (di->item.mask & LVIF_TEXT) {
+                    std::wstring t = stars(info->rating);
+                    if (!t.empty()) t += L"  ";
+                    t += sizeText(static_cast<uint64_t>(info->size)) + L"  " + std::to_wstring(info->width) + L"×" +
+                         std::to_wstring(info->height) + L"  " + fileName(info->path);
+                    copyOut(di->item, t);
+                }
+                if (di->item.mask & LVIF_IMAGE)
+                    di->item.iImage = thumbImage(kSearchView, di->item.iItem, widen(info->path), info->id);
+                return true;
+            }
+            case LVN_GETINFOTIPW: {
+                auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(nm);
+                const ImageInfo* info = resultInfo(tip->iItem);
+                if (info && tip->pszText && tip->cchTextMax > 0) lstrcpynW(tip->pszText, widen(info->path).c_str(), tip->cchTextMax);
+                return true;
+            }
+            case LVN_ITEMCHANGED: {
+                auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+                if ((lv->uChanged & LVIF_STATE) && (lv->uNewState & LVIS_SELECTED)) showSearchInfo(lv->iItem);
+                return true;
+            }
+            case NM_DBLCLK: {
+                const ImageInfo* info = resultInfo(reinterpret_cast<NMITEMACTIVATE*>(nm)->iItem);
+                if (info) openPath(widen(info->path));
+                return true;
+            }
+            case NM_RCLICK: {
+                auto* ia = reinterpret_cast<NMITEMACTIVATE*>(nm);
+                const ImageInfo* info = resultInfo(ia->iItem);
+                if (!info) return true;
+                ListView_SetItemState(app.s.results, ia->iItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                imageContextMenu(widen(info->path));
+                return true;
+            }
+        }
+        return false;
+    }
+    if (nm->hwndFrom == app.s.sources && nm->code == LVN_ITEMCHANGED && !app.fillingSources) {
+        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+        if ((lv->uChanged & LVIF_STATE) && ((lv->uNewState ^ lv->uOldState) & LVIS_STATEIMAGEMASK) && lv->iItem >= 0 &&
+            lv->iItem < static_cast<int>(app.sourceNames.size())) {
+            const std::string& name = app.sourceNames[lv->iItem];
+            if (ListView_GetCheckState(app.s.sources, lv->iItem)) app.uncheckedSources.erase(name);
+            else app.uncheckedSources.insert(name);
+            scheduleSearch(80);
+        }
+        return true;
+    }
+    if ((nm->hwndFrom == app.s.from || nm->hwndFrom == app.s.to) && nm->code == DTN_DATETIMECHANGE) {
+        scheduleSearch(150);
+        return true;
+    }
+    if (nm->hwndFrom == app.tabs && nm->code == TCN_SELCHANGE) {
+        switchTab(TabCtrl_GetCurSel(app.tabs));
+        return true;
+    }
+    return false;
+}
+
+// 検索の画面のコマンド（処理したら true）
+bool onSearchCommand(WPARAM wp) {
+    const int id = LOWORD(wp), code = HIWORD(wp);
+    switch (id) {
+        case IDC_S_TAGS: case IDC_S_TEXT: case IDC_S_MINW: case IDC_S_MINKB: case IDC_S_MAXKB: case IDC_S_PATH:
+        case IDC_S_DOWNLOAD:
+            if (code == EN_CHANGE) scheduleSearch(300);  // 打ち終わるのを少し待つ
+            return true;
+        case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_SORT:
+            if (code == CBN_SELCHANGE) scheduleSearch(30);
+            return true;
+        case IDC_S_NOTAKEN: case IDC_S_DESC:
+            scheduleSearch(30);
+            return true;
+        case IDC_S_CLEAR:
+            clearSearchConditions();
+            return true;
+    }
+    return false;
+}
+
+void saveSearchSettings() {
+    WritePrivateProfileStringW(L"Search", L"tags", editText(app.s.tags).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"text", editText(app.s.text).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"confidence",
+                               std::to_wstring(SendMessageW(app.s.conf, TBM_GETPOS, 0, 0)).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"sort", std::to_wstring(ComboBox_GetCurSel(app.s.sort)).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"descending", Button_GetCheck(app.s.desc) == BST_CHECKED ? L"1" : L"0",
+                               iniPath().c_str());
+    std::wstring unchecked;
+    for (const auto& n : app.uncheckedSources) unchecked += widen(n) + L"|";
+    WritePrivateProfileStringW(L"Search", L"uncheckedSources", unchecked.empty() ? nullptr : unchecked.c_str(),
+                               iniPath().c_str());
+    iniSet(L"tab", std::to_wstring(app.tab));
+}
+
+void loadSearchSettings() {
+    wchar_t buf[4096];
+    GetPrivateProfileStringW(L"Search", L"tags", L"", buf, 4096, iniPath().c_str());
+    SetWindowTextW(app.s.tags, buf);
+    GetPrivateProfileStringW(L"Search", L"text", L"", buf, 4096, iniPath().c_str());
+    SetWindowTextW(app.s.text, buf);
+    const int conf = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"confidence", 50, iniPath().c_str())), 0, 100);
+    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, conf);
+    wchar_t v[16];
+    swprintf(v, 16, L"%.2f", conf / 100.0);
+    setText(app.s.confValue, v);
+    ComboBox_SetCurSel(app.s.sort, std::max(0, static_cast<int>(GetPrivateProfileIntW(L"Search", L"sort", 0, iniPath().c_str()))));
+    Button_SetCheck(app.s.desc, GetPrivateProfileIntW(L"Search", L"descending", 0, iniPath().c_str()) ? BST_CHECKED : BST_UNCHECKED);
+    GetPrivateProfileStringW(L"Search", L"uncheckedSources", L"", buf, 4096, iniPath().c_str());
+    app.uncheckedSources.clear();
+    std::wstring all = buf;
+    size_t a = 0;
+    while (a < all.size()) {
+        size_t b = all.find(L'|', a);
+        if (b == std::wstring::npos) b = all.size();
+        if (b > a) app.uncheckedSources.insert(narrow(all.substr(a, b - a)));
+        a = b + 1;
+    }
+}
+
 // ---------------------------------------------------------------- 画面
+
+void layoutSearch(int y, int W, int bottom);
 
 void layout() {
     RECT rc;
@@ -877,7 +1513,18 @@ void layout() {
     SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
     RECT tr;
     GetWindowRect(app.toolbar, &tr);
-    int y = (tr.bottom - tr.top) + px(4);
+    int y = (tr.bottom - tr.top) + px(2);
+    // 画面の切り替えのタブ（タブの見出しだけを使う）
+    const int tabH = px(26);
+    MoveWindow(app.tabs, m, y, W - 2 * m, tabH, TRUE);
+    y += tabH + px(6);
+    const int infoH = px(54);
+    const int bottom = H - m - infoH - px(4);
+    MoveWindow(app.info, m, bottom + px(4), W - 2 * m, infoH, TRUE);
+    if (app.tab == 1) {
+        layoutSearch(y, W, bottom);
+        return;
+    }
     MoveWindow(app.foldersLabel, m, y, W - 2 * m, px(18), TRUE);
     y += px(20);
     const int listH = px(70);
@@ -902,22 +1549,19 @@ void layout() {
     MoveWindow(app.status, m + px(228), y + px(1), W - 2 * m - px(228), px(20), TRUE);
     y += px(26);
 
-    const int infoH = px(40);
     const int listW = std::max(px(260), (W - 3 * m) * 2 / 5);
-    const int bottom = H - m - infoH - px(4);
     MoveWindow(app.groups, m, y, listW, std::max(0, bottom - y), TRUE);
     MoveWindow(app.thumbs, 2 * m + listW, y, std::max(0, W - 3 * m - listW), std::max(0, bottom - y), TRUE);
-    MoveWindow(app.info, m, bottom + px(4), W - 2 * m, infoH, TRUE);
 }
 
-HWND makeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD exStyle = 0) {
+HWND makeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD exStyle) {
     HWND h = CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, app.hwnd,
                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
     return h;
 }
 
-void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT_LEFT) {
+void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt) {
     LVCOLUMNW c{};
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
     c.fmt = fmt;
@@ -1045,8 +1689,17 @@ void createToolbar() {
     SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
 }
 
+void createSearchControls();
+
 void createControls() {
     createToolbar();
+    app.tabs = makeControl(WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, IDC_TABS);
+    for (const wchar_t* t : {L"重複を探す", L"検索"}) {
+        TCITEMW it{};
+        it.mask = TCIF_TEXT;
+        it.pszText = const_cast<wchar_t*>(t);
+        TabCtrl_InsertItem(app.tabs, TabCtrl_GetItemCount(app.tabs), &it);
+    }
     app.foldersLabel = makeControl(WC_STATICW, L"検索するフォルダ（ウィンドウにドラッグ＆ドロップしても追加できます）", 0,
                                    IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
@@ -1080,9 +1733,14 @@ void createControls() {
                              IDC_THUMBS, WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(app.thumbs, LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
     ListView_SetIconSpacing(app.thumbs, app.thumbSize + px(20), app.thumbSize + px(44));
-    resetImages();
+    app.views[kDupView].lv = app.thumbs;
+    resetView(kDupView, 0);
 
-    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX | SS_PATHELLIPSIS, IDC_INFO);
+    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);  // 3 行まで（省略の指定をすると 1 行になる）
+    app.dupPage = {app.foldersLabel, app.folders, app.add,      app.remove,   app.thresholdCaption, app.threshold,
+                   app.thresholdLabel, app.exact, app.flat,     app.progress, app.status,           app.groups,
+                   app.thumbs};
+    createSearchControls();
 }
 
 std::wstring groupFolderText(const Group& g) {
@@ -1097,7 +1755,10 @@ void copyOut(LVITEMW& item, const std::wstring& s) {
     if (item.pszText && item.cchTextMax > 0) lstrcpynW(item.pszText, s.c_str(), item.cchTextMax);
 }
 
+bool onSearchNotify(NMHDR* nm);
+
 LRESULT onNotify(NMHDR* nm) {
+    if (onSearchNotify(nm)) return 0;
     if (nm->hwndFrom == app.groups) {
         switch (nm->code) {
             case LVN_GETDISPINFOW: {
@@ -1135,10 +1796,7 @@ LRESULT onNotify(NMHDR* nm) {
                     copyOut(di->item, L"距離" + std::to_wstring(dist) + L"  " + sizeText(e->size) + L"  " +
                                           std::to_wstring(e->f.width) + L"×" + std::to_wstring(e->f.height) + L"  " +
                                           fileName(e->path));
-                if (di->item.mask & LVIF_IMAGE) {
-                    if (app.imageOf[i] < 0) requestThumb(i);
-                    di->item.iImage = app.imageOf[i] < 0 ? 0 : app.imageOf[i];
-                }
+                if (di->item.mask & LVIF_IMAGE) di->item.iImage = thumbImage(kDupView, i, widen(e->path), memberImageId(i));
                 break;
             }
             case LVN_GETINFOTIPW: {
@@ -1160,24 +1818,14 @@ LRESULT onNotify(NMHDR* nm) {
             }
             case NM_DBLCLK: {
                 auto* ia = reinterpret_cast<NMITEMACTIVATE*>(nm);
-                openItem(ia->iItem);
+                openPath(memberPath(ia->iItem));
                 break;
             }
             case NM_RCLICK: {
                 auto* ia = reinterpret_cast<NMITEMACTIVATE*>(nm);
                 if (ia->iItem < 0) break;
                 ListView_SetItemState(app.thumbs, ia->iItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-                HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
-                AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
-                AppendMenuW(menu, MF_STRING, CMD_COPY_PATH, L"パスをコピー(&C)");
-                POINT pt;
-                GetCursorPos(&pt);
-                const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
-                DestroyMenu(menu);
-                if (cmd == CMD_OPEN) openItem(ia->iItem);
-                if (cmd == CMD_EXPLORER) showInExplorer(ia->iItem);
-                if (cmd == CMD_COPY_PATH) copyPath(ia->iItem);
+                imageContextMenu(memberPath(ia->iItem));
                 break;
             }
         }
@@ -1204,6 +1852,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
+    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
@@ -1287,6 +1936,13 @@ bool handleShortcut(const MSG& msg) {
     if (GetKeyState(VK_CONTROL) < 0) mods |= KMOD_CTRL;
     if (GetKeyState(VK_SHIFT) < 0) mods |= KMOD_SHIFT;
     if (GetKeyState(VK_MENU) < 0) mods |= KMOD_ALT;
+    // 文字の入力欄では、文字・カーソル移動・コピーなどのキーはそのまま入力欄に渡す
+    wchar_t cls[32] = L"";
+    GetClassNameW(msg.hwnd, cls, 32);
+    if (lstrcmpiW(cls, L"Edit") == 0 && !(mods & KMOD_ALT) && !(vk >= VK_F1 && vk <= VK_F24)) {
+        const bool ctrlLetter = (mods & KMOD_CTRL) && vk >= 'A' && vk <= 'Z' && !wcschr(L"ACVXYZ", static_cast<wchar_t>(vk));
+        if (!ctrlLetter) return false;
+    }
     auto it = app.keys.find(KeyStroke{mods, vk});
     if (it == app.keys.end()) return false;
     SendMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(it->second), 0);
@@ -1346,10 +2002,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_HSCROLL:
+            if (reinterpret_cast<HWND>(lp) == app.s.conf) {
+                wchar_t v[16];
+                swprintf(v, 16, L"%.2f", SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0);
+                setText(app.s.confValue, v);
+                scheduleSearch(LOWORD(wp) == TB_THUMBTRACK ? 100 : 50);  // 止まってから少しして探す
+                return 0;
+            }
             if (reinterpret_cast<HWND>(lp) == app.threshold)
                 setText(app.thresholdLabel, thresholdText(static_cast<int>(SendMessageW(app.threshold, TBM_GETPOS, 0, 0))));
             return 0;
         case WM_COMMAND:
+            if (onSearchCommand(wp)) return 0;
             switch (LOWORD(wp)) {
                 case CMD_ADD_FOLDER:
                     if (!app.running) {
@@ -1369,6 +2033,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case CMD_SEARCH:
                     if (app.updating && !app.running) break;  // 更新のダウンロード中
+                    if (app.tab != 0) switchTab(0);
                     if (app.running) {
                         app.cancel = true;
                         setText(app.status, L"中止しています…");
@@ -1385,9 +2050,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_EXPORT:
                     if (!app.running) exportResult();
                     break;
-                case CMD_OPEN: openItem(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
-                case CMD_EXPLORER: showInExplorer(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
-                case CMD_COPY_PATH: copyPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED)); break;
+                case CMD_OPEN: openPath(selectedPath()); break;
+                case CMD_EXPLORER: showPathInExplorer(selectedPath()); break;
+                case CMD_COPY_PATH: copyText(selectedPath()); break;
                 case CMD_CHECK_UPDATE:
                     if (app.running)
                         MessageBoxW(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
@@ -1420,6 +2085,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
+                case CMD_TAB_DUPES: switchTab(0); break;
+                case CMD_TAB_SEARCH: switchTab(1); break;
                 case CMD_INDEXER_TOGGLE:
                     saveSettings();  // 調べるフォルダを DB に書いてから
                     if (indexer::isRunning()) {
@@ -1465,7 +2132,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == kProgressTimer) updateProgress();
+            if (wp == kSearchTimer) runSearch();
             if (wp == kExitTimer) DestroyWindow(hwnd);  // 確認に時間がかかりすぎたら、そのまま終わる
+            return 0;
+        case WM_APP_SEARCHED:
+            onSearched(reinterpret_cast<SearchDone*>(lp));
             return 0;
         case WM_APP_DONE:
             if (app.closing) {  // 終了しようとして中止した検索
@@ -1487,15 +2158,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_APP_THUMB: {
             std::unique_ptr<ThumbResult> r(reinterpret_cast<ThumbResult*>(lp));
+            ThumbView& v = app.views[r->view];
             bool current;
             {
                 std::lock_guard<std::mutex> lock(app.thumbMutex);
-                current = r->gen == app.thumbGen;
+                current = r->gen == v.gen;
             }
-            if (current && r->item < static_cast<int>(app.imageOf.size())) {
-                app.imageOf[r->item] = r->bmp ? ImageList_Add(app.images, r->bmp, nullptr) : 1;
-                if (app.imageOf[r->item] < 0) app.imageOf[r->item] = 1;
-                ListView_RedrawItems(app.thumbs, r->item, r->item);
+            if (current && r->item < static_cast<int>(v.imageOf.size())) {
+                v.imageOf[r->item] = r->bmp ? ImageList_Add(v.images, r->bmp, nullptr) : 1;
+                if (v.imageOf[r->item] < 0) v.imageOf[r->item] = 1;
+                ListView_RedrawItems(v.lv, r->item, r->item);
             }
             if (r->bmp) DeleteObject(r->bmp);
             return 0;
@@ -1707,7 +2379,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     for (int i = 1; argv && i < argc; ++i) argFolders.emplace_back(argv[i]);
     if (argv) LocalFree(argv);
 
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS};
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS |
+                                              ICC_DATE_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&icc);
     HDC screen = GetDC(nullptr);
     app.scale = GetDeviceCaps(screen, LOGPIXELSX) / 96.0;
@@ -1754,7 +2427,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     } else {
         ShowWindow(hwnd, show);
     }
+    loadSearchSettings();
     app.thumbThread = std::thread(thumbLoop);
+    switchTab(std::clamp(iniInt(L"tab", 0), 0, 1));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
 

@@ -13,6 +13,7 @@
 #include "db.hpp"
 #include "indexer.hpp"
 #include "meta.hpp"
+#include "search.hpp"
 #include "pack.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
@@ -799,6 +800,15 @@ static void testMeta() {
     CHECK(fileTimeToUnix(116444736000000000ull + 10000000ull * 86400) == 86400);
     CHECK(parseExifDate("2024:05:01 12:34:56") == 1714566896);
     CHECK(parseExifDate("garbage") == 0);
+    {
+        int y, mo, d, h, mi, se;
+        unixToCivil(1714566896, y, mo, d, h, mi, se);
+        CHECK(y == 2024 && mo == 5 && d == 1 && h == 12 && mi == 34 && se == 56);
+        unixToCivil(civilToUnix(1999, 12, 31, 23, 59, 59), y, mo, d, h, mi, se);
+        CHECK(y == 1999 && mo == 12 && d == 31 && h == 23 && se == 59);
+        unixToCivil(civilToUnix(1960, 2, 29), y, mo, d, h, mi, se);  // 1970 年より前
+        CHECK(y == 1960 && mo == 2 && d == 29);
+    }
 
     // DB に書いて、全文検索・タグ・出典で引ける
     const fs::path dir = fs::temp_directory_path() / "imgdupe-meta-test";
@@ -854,6 +864,127 @@ static void testMeta() {
     fs::remove_all(dir);
 }
 
+static void testSearch() {
+    std::vector<std::string> inc, exc;
+    parseTagQuery("hatsune_miku  -1boy\u3000風景,-", inc, exc);
+    CHECK((inc == std::vector<std::string>{"hatsune_miku", "風景"}));
+    CHECK((exc == std::vector<std::string>{"1boy"}));
+    CHECK(std::abs(combineConfidence({0.5, 0.5}) - 0.75) < 1e-9);
+    CHECK(combineConfidence({}) == 0);
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-search-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{"/p/a.jpg", 100, 10}, {"/p/b.jpg", 200, 20}, {"/p/c.png", 300, 30}, {"/q/d.jpg", 400, 40}});
+    const int64_t a = id["/p/a.jpg"], b = id["/p/b.jpg"], c = id["/p/c.png"], d = id["/q/d.jpg"];
+    auto tag = [&](int64_t img, const std::string& t, const std::string& src, double conf, bool manual = false) {
+        Stmt st(db.handle(), "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,?,?)");
+        st.bind(1, img).bind(2, t).bind(3, std::string("character")).bind(4, conf).bind(5, src);
+        st.bind(6, static_cast<int64_t>(manual));
+        st.step();
+    };
+    tag(a, "hatsune_miku", "tagger", 0.9);
+    tag(b, "hatsune_miku", "tagger", 0.5);
+    tag(b, "hatsune_miku", "folder", 0.5);  // 合成すると 0.75
+    tag(c, "Hatsune_Miku", "tagger", 0.3);
+    tag(c, "1boy", "tagger", 0.8);
+    tag(d, "hatsune_miku", "tagger", 0.95);
+    tag(d, "hatsune_miku", "manual", 0.0, true);  // 手動で「違う」と確定
+    {
+        Stmt st(db.handle(), "INSERT INTO tag_dict(tag,alias_of) VALUES('初音ミク','hatsune_miku')");
+        st.step();
+    }
+    FileMeta fa;
+    fa.rating = 5;
+    fa.taken = 1714566896;
+    fa.title = "夏の空と海";
+    fa.format = "JPEG";
+    storeMeta(db, a, "/p/a.jpg", fa);
+    FileMeta fc;
+    fc.rating = 2;
+    fc.format = "PNG";
+    fc.zoneUrl = "https://i.pximg.net/x.png";
+    storeMeta(db, c, "/p/c.png", fc);
+    {
+        Stmt st(db.handle(), "UPDATE images SET width=4000,height=3000 WHERE id=?");
+        st.bind(1, b);
+        st.step();
+    }
+    auto ids = [&](SearchQuery q) { return search(db, q).ids; };
+    using V = std::vector<int64_t>;
+
+    SearchQuery q;
+    q.tags = {"hatsune_miku"};
+    q.minConfidence = 0.7;
+    CHECK((ids(q) == V{a, b}));                 // b は合成で 0.75。d は手動で否定
+    q.sources = {"tagger"};
+    CHECK((ids(q) == V{a}));                    // 出どころを絞ると b は 0.5
+    q.sources.clear();
+    q.minConfidence = 0.2;
+    CHECK((ids(q) == V{a, b, c}));              // 大文字小文字は区別しない
+    q.tags = {"初音ミク"};
+    CHECK((ids(q) == V{a, b, c}));              // 別名
+    q.excludeTags = {"1boy"};
+    CHECK((ids(q) == V{a, b}));
+    q.sort = SortKey::Confidence;
+    q.descending = true;
+    CHECK((ids(q) == V{a, b}));                 // 0.9 > 0.75
+    q.limit = 1;
+    SearchResult r = search(db, q);
+    CHECK(r.ids.size() == 1 && r.total == 2);
+
+    SearchQuery m;
+    CHECK(search(db, m).total == 4);
+    m.minRating = 3;
+    CHECK((ids(m) == V{a}));
+    m = SearchQuery{};
+    m.noRating = true;
+    CHECK((ids(m) == V{b, d}));
+    m = SearchQuery{};
+    m.takenFrom = 1714500000;
+    m.takenTo = 1714600000;
+    CHECK((ids(m) == V{a}));
+    m = SearchQuery{};
+    m.noTaken = true;
+    CHECK(ids(m).size() == 3);
+    m = SearchQuery{};
+    m.minWidth = 3000;
+    CHECK((ids(m) == V{b}));
+    m = SearchQuery{};
+    m.minSize = 150;
+    m.maxSize = 350;
+    CHECK((ids(m) == V{b, c}));
+    m = SearchQuery{};
+    m.format = "PNG";
+    CHECK((ids(m) == V{c}));
+    m = SearchQuery{};
+    m.pathContains = "/Q/";
+    CHECK((ids(m) == V{d}));
+    m = SearchQuery{};
+    m.downloadContains = "PXIMG";
+    CHECK((ids(m) == V{c}));
+    m = SearchQuery{};
+    m.text = "空と海";
+    CHECK((ids(m) == V{a}));
+    m.text = "海";
+    CHECK((ids(m) == V{a}));
+    m = SearchQuery{};
+    m.sort = SortKey::Size;
+    m.descending = true;
+    CHECK((ids(m) == V{d, c, b, a}));
+    m.sort = SortKey::Rating;
+    m.descending = true;
+    CHECK((ids(m) == V{a, c, b, d}));  // 星なしは最後（パス順）
+
+    ImageInfo info;
+    CHECK(imageInfo(db, a, info) && info.path == "/p/a.jpg" && info.rating == 5 && info.title == "夏の空と海");
+    const auto srcs = tagSources(db);
+    CHECK(!srcs.empty() && srcs[0].first == "tagger");
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -886,6 +1017,7 @@ int main() {
     testPack();
     testIndexer();
     testMeta();
+    testSearch();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

@@ -9,16 +9,17 @@ mkdir -p out
 
 # SQLite（third_party/sqlite のアマルガメーション）。大きいので、ソースが変わった時だけコンパイルする
 SQLITE_FLAGS="-O2 -DSQLITE_THREADSAFE=1 -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
-  -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0"
-sqlite_obj() {  # $1: C コンパイラ, $2: 出力
-  if [ ! -f "$2" ] || [ third_party/sqlite/sqlite3.c -nt "$2" ]; then
+  -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0"
+sqlite_obj() {  # $1: C コンパイラ, $2: 出力（ソースかフラグが変わった時だけ作り直す）
+  if [ ! -f "$2" ] || [ third_party/sqlite/sqlite3.c -nt "$2" ] || [ "$(cat "$2.flags" 2>/dev/null)" != "$SQLITE_FLAGS" ]; then
     echo "SQLite をコンパイルしています ($2)"
     # shellcheck disable=SC2086
     "$1" $SQLITE_FLAGS -c third_party/sqlite/sqlite3.c -o "$2"
+    printf '%s' "$SQLITE_FLAGS" > "$2.flags"
   fi
 }
 
-CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/json.cpp src/update_logic.cpp src/commands.cpp"
+CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/search.cpp src/json.cpp src/update_logic.cpp src/commands.cpp"
 
 if [ "${1:-}" = "test" ]; then
   sqlite_obj "${CC:-gcc}" out/sqlite3_host.o

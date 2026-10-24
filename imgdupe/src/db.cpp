@@ -184,6 +184,14 @@ CREATE TRIGGER IF NOT EXISTS images_delete_fts AFTER DELETE ON images BEGIN
 END;
 )SQL";
 
+// 版 4: 検索と並べ替えのための索引（タグは大文字小文字を区別せずに引く）
+const char* const kSchemaV4 = R"SQL(
+CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag COLLATE NOCASE, image_id);
+CREATE INDEX IF NOT EXISTS images_mtime ON images(mtime);
+CREATE INDEX IF NOT EXISTS file_meta_created ON file_meta(created);
+CREATE INDEX IF NOT EXISTS tag_dict_alias ON tag_dict(alias_of COLLATE NOCASE);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -312,7 +320,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i)
         if (!exec(steps[i])) {

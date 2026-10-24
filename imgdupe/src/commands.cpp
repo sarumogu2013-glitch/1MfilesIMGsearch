@@ -47,6 +47,8 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_OPEN, "Open", L"開く(&O)", "Enter"},
     {CMD_EXPLORER, "ShowInExplorer", L"エクスプローラーで表示(&E)", "Ctrl+E"},
     {CMD_COPY_PATH, "CopyPath", L"パスをコピー(&C)", "Ctrl+C"},
+    {CMD_TAB_DUPES, "TabDuplicates", L"重複を探す(&D)", "Ctrl+1"},
+    {CMD_TAB_SEARCH, "TabSearch", L"検索(&S)", "Ctrl+2"},
     {CMD_KEY_SETTINGS, "KeySettings", L"ショートカットキーの設定(&K)...", "Ctrl+K"},
     {CMD_INDEXER_TOGGLE, "Indexer", L"バックグラウンドの解析を始める(&B)", ""},
     {CMD_INDEXER_AUTOSTART, "IndexerAutoStart", L"Windows と一緒にバックグラウンドの解析を始める(&W)", ""},

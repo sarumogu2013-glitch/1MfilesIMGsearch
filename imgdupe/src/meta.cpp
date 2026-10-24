@@ -398,13 +398,38 @@ int64_t fileTimeToUnix(uint64_t ft) {
     return ft < kEpoch ? 0 : static_cast<int64_t>((ft - kEpoch) / 10000000ull);
 }
 
+int64_t civilToUnix(int y, int mo, int d, int h, int mi, int s) {
+    return daysFromCivil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d)) * 86400 + h * 3600 + mi * 60 + s;
+}
+
+void unixToCivil(int64_t t, int& y, int& mo, int& d, int& h, int& mi, int& s) {
+    int64_t days = t / 86400, rem = t % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        --days;
+    }
+    h = static_cast<int>(rem / 3600);
+    mi = static_cast<int>(rem % 3600 / 60);
+    s = static_cast<int>(rem % 60);
+    // days_from_civil の逆
+    days += 719468;
+    const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(days - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
+    mo = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
+    y = static_cast<int>(static_cast<int64_t>(yoe) + era * 400 + (mo <= 2));
+}
+
 int64_t parseExifDate(const std::string& s) {
     int y, mo, d, h = 0, mi = 0, se = 0;
     if (std::sscanf(s.c_str(), "%d:%d:%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) < 3 &&
         std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) < 3)
         return 0;
     if (y < 1900 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
-    return daysFromCivil(y, static_cast<unsigned>(mo), static_cast<unsigned>(d)) * 86400 + h * 3600 + mi * 60 + se;
+    return civilToUnix(y, mo, d, h, mi, se);
 }
 
 void storeMeta(Db& db, int64_t imageId, const std::string& path, const FileMeta& m) {
