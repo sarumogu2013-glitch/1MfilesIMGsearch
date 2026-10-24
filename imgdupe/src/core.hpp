@@ -50,6 +50,8 @@ private:
 
 // EXIF の向きに合わせて正方形の RGB 画像を回す（n×n）
 void applyOrientation(std::vector<uint8_t>& rgb, int n, int orientation);
+// EXIF の向きに合わせて w×h の画像（1 画素 channels バイト）を回す。5〜8 では w と h が入れ替わる
+void orientPixels(std::vector<uint8_t>& px, uint32_t& w, uint32_t& h, int channels, int orientation);
 
 // JPEG の先頭部分（EXIF を含む APP1 まで）から向き（1〜8）を読む。無ければ 0
 int jpegExifOrientation(const uint8_t* data, size_t len);

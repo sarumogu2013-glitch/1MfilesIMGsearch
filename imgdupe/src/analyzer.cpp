@@ -59,8 +59,7 @@ StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::at
             for (size_t i = 0; i < ids.size(); ++i) {
                 if (!finished[i]) continue;
                 AnalyzerOutput& out = outputs[i];
-                for (auto& t : out.tags)
-                    if (t.source.empty()) t.source = name;
+                if (out.ok) out.ok = analyzer.store(db, ids[i], out);
                 replaceTags(db, ids[i], name, out.tags);
                 setStage(db, ids[i], name, out.ok ? StageState::Done : StageState::Failed, version);
                 ++rep.processed;

@@ -11,7 +11,7 @@ namespace imgdupe {
 
 namespace {
 
-// 仕様「データ層」のテーブル。子のテーブルは画像を消すとまとめて消える（ON DELETE CASCADE）
+// 版 1: 仕様「データ層」のテーブル。子のテーブルは画像を消すとまとめて消える（ON DELETE CASCADE）
 const char* const kSchemaV1 = R"SQL(
 CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY,
@@ -163,6 +163,19 @@ CREATE INDEX IF NOT EXISTS file_meta_taken ON file_meta(taken);
 CREATE INDEX IF NOT EXISTS file_meta_rating ON file_meta(rating);
 )SQL";
 
+// 版 2: サムネイルのパックファイルの索引
+const char* const kSchemaV2 = R"SQL(
+CREATE TABLE IF NOT EXISTS thumbs(
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    pack INTEGER NOT NULL,
+    offset INTEGER NOT NULL,
+    length INTEGER NOT NULL,
+    format INTEGER NOT NULL,
+    width INTEGER,
+    height INTEGER
+);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -290,9 +303,15 @@ bool Db::migrate() {
         return false;
     }
     if (v == kSchemaVersion) return true;
-    // 版 0 → 1: すべてのテーブルを作る（次の版を足す時は、ここに版ごとの変更を順に書く）
-    if (!exec("BEGIN IMMEDIATE") || !exec(kSchemaV1) ||
-        !exec(("PRAGMA user_version=" + std::to_string(kSchemaVersion)).c_str()) || !exec("COMMIT")) {
+    // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
+    const char* const steps[] = {kSchemaV1, kSchemaV2};
+    if (!exec("BEGIN IMMEDIATE")) return false;
+    for (int i = v; i < kSchemaVersion; ++i)
+        if (!exec(steps[i])) {
+            exec("ROLLBACK");
+            return false;
+        }
+    if (!exec(("PRAGMA user_version=" + std::to_string(kSchemaVersion)).c_str()) || !exec("COMMIT")) {
         exec("ROLLBACK");
         return false;
     }
@@ -402,17 +421,29 @@ std::unordered_map<std::string, int64_t> upsertScanned(Db& db, const std::vector
     return ids;
 }
 
+namespace {
+const char* const kUpdateFeatures = "UPDATE images SET dh=?,dv=?,color=?,contrast=?,width=?,height=?,readable=? WHERE id=?";
+void bindFeatures(Stmt& st, int64_t id, const Features& f) {
+    st.bind(1, static_cast<int64_t>(f.dh)).bind(2, static_cast<int64_t>(f.dv)).bind(3, packColor(f));
+    st.bind(4, static_cast<int64_t>(f.contrast)).bind(5, static_cast<int64_t>(f.width));
+    st.bind(6, static_cast<int64_t>(f.height)).bind(7, static_cast<int64_t>(f.ok ? 1 : 0)).bind(8, id);
+}
+}  // namespace
+
+void storeFeatures(Db& db, int64_t imageId, const Features& f) {
+    Stmt st(db.handle(), kUpdateFeatures);
+    bindFeatures(st, imageId, f);
+    st.step();
+}
+
 void saveFeatures(Db& db, const std::vector<std::pair<int64_t, Features>>& rows, int hashVersion) {
     if (rows.empty()) return;
     db.begin();
     try {
-        Stmt st(db.handle(),
-                "UPDATE images SET dh=?,dv=?,color=?,contrast=?,width=?,height=?,readable=? WHERE id=?");
+        Stmt st(db.handle(), kUpdateFeatures);
         const int64_t now = nowUnix();
         for (const auto& [id, f] : rows) {
-            st.bind(1, static_cast<int64_t>(f.dh)).bind(2, static_cast<int64_t>(f.dv)).bind(3, packColor(f));
-            st.bind(4, static_cast<int64_t>(f.contrast)).bind(5, static_cast<int64_t>(f.width));
-            st.bind(6, static_cast<int64_t>(f.height)).bind(7, static_cast<int64_t>(f.ok ? 1 : 0)).bind(8, id);
+            bindFeatures(st, id, f);
             st.step();
             st.reset();
         }

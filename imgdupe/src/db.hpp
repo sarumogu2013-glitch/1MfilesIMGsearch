@@ -15,7 +15,7 @@ struct sqlite3_stmt;
 namespace imgdupe {
 
 // 今のスキーマの版。テーブルを変えたら上げ、Db::open の移行処理に足す
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 // 1 つの SQL 文（プリペアドステートメント）
 class Stmt {
@@ -93,7 +93,9 @@ std::unordered_map<std::string, ImageRow> loadHashedImages(Db& db, int hashVersi
 // 戻り値: パス → 画像 ID
 std::unordered_map<std::string, int64_t> upsertScanned(Db& db, const std::vector<ScannedFile>& files);
 
-// 特徴量を書き、段階 "hash" を済みにする
+// 特徴量を 1 件書く（呼び出し側のトランザクションの中で）
+void storeFeatures(Db& db, int64_t imageId, const Features& f);
+// 特徴量を書き、段階 "hash" を済みにする（まとめて 1 つのトランザクションで）
 void saveFeatures(Db& db, const std::vector<std::pair<int64_t, Features>>& rows, int hashVersion);
 void saveSha(Db& db, const std::vector<std::pair<int64_t, Sha256>>& rows);
 

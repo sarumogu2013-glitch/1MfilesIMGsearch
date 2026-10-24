@@ -11,6 +11,8 @@
 #include "analyzer.hpp"
 #include "commands.hpp"
 #include "db.hpp"
+#include "indexer.hpp"
+#include "pack.hpp"
 #include "core.hpp"
 #include "update_logic.hpp"
 
@@ -85,6 +87,25 @@ static void testFeatures() {
         const Features fr = computeFeatures(rotated.data(), o);
         CHECK(fr.dh == fa.dh && fr.dv == fa.dv);
     }
+}
+
+static void testOrientPixels() {
+    // 3×2 の画像（1 画素 1 バイト）: 1 2 3 / 4 5 6
+    const std::vector<uint8_t> src = {1, 2, 3, 4, 5, 6};
+    auto oriented = [&](int o, uint32_t& w, uint32_t& h) {
+        std::vector<uint8_t> px = src;
+        w = 3;
+        h = 2;
+        orientPixels(px, w, h, 1, o);
+        return px;
+    };
+    uint32_t w, h;
+    CHECK(oriented(1, w, h) == src && w == 3);
+    CHECK((oriented(6, w, h) == std::vector<uint8_t>{4, 1, 5, 2, 6, 3}) && w == 2 && h == 3);  // 時計回り
+    CHECK((oriented(8, w, h) == std::vector<uint8_t>{3, 6, 2, 5, 1, 4}) && w == 2 && h == 3);  // 反時計回り
+    CHECK((oriented(3, w, h) == std::vector<uint8_t>{6, 5, 4, 3, 2, 1}) && w == 3 && h == 2);
+    CHECK((oriented(2, w, h) == std::vector<uint8_t>{3, 2, 1, 6, 5, 4}));
+    CHECK((oriented(5, w, h) == std::vector<uint8_t>{1, 4, 2, 5, 3, 6}) && w == 2);  // 転置
 }
 
 static void testShrinker() {
@@ -411,7 +432,7 @@ static void testDb() {
     CHECK(db.open(path));
     CHECK(db.schemaVersion() == kSchemaVersion);
     for (const char* t : {"images", "stages", "tags", "tag_dict", "embeddings", "groups", "group_members", "sources",
-                          "links", "history", "commands", "settings", "file_meta"}) {
+                          "links", "history", "commands", "settings", "file_meta", "thumbs"}) {
         Stmt st(db.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?");
         st.bind(1, std::string(t));
         CHECK(st.step() && st.i64(0) == 1);
@@ -503,6 +524,148 @@ static void testDb() {
     fs::remove_all(dir);
 }
 
+static void testPack() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-pack-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto ids = upsertScanned(db, {{"/p/1.jpg", 1, 1}, {"/p/2.jpg", 2, 2}, {"/p/3.jpg", 3, 3}});
+    ThumbPack pack(dir.string(), 200);  // 小さくして、2 つ目のパックに移るところも試す
+    ThumbData a;
+    a.width = 160;
+    a.height = 120;
+    a.bytes.assign(100, 7);
+    ThumbData b = a;
+    b.bytes.assign(150, 9);
+    b.format = ThumbFormat::WebP;
+    CHECK(pack.put(db, ids["/p/1.jpg"], a));
+    CHECK(pack.put(db, ids["/p/2.jpg"], b));  // 200 を超えるので次のパックへ
+    CHECK(fs::exists(pack.packPath(0)) && fs::exists(pack.packPath(1)));
+    ThumbData got;
+    CHECK(pack.get(db, ids["/p/1.jpg"], got) && got.bytes == a.bytes && got.width == 160 && got.height == 120);
+    CHECK(pack.get(db, ids["/p/2.jpg"], got) && got.bytes == b.bytes && got.format == ThumbFormat::WebP);
+    CHECK(!pack.get(db, ids["/p/3.jpg"], got));
+    CHECK(pack.garbageBytes(db) == 0);
+    // 作り直すと古い分は使われない部分になる
+    a.bytes.assign(50, 1);
+    CHECK(pack.put(db, ids["/p/1.jpg"], a));
+    CHECK(pack.get(db, ids["/p/1.jpg"], got) && got.bytes == a.bytes);
+    CHECK(pack.garbageBytes(db) == 100 + 21);
+    // パックが壊れていたら読めない（落ちない）
+    {
+        FILE* f = std::fopen(pack.packPath(1).c_str(), "r+b");
+        std::fputc('X', f);
+        std::fclose(f);
+    }
+    CHECK(!pack.get(db, ids["/p/2.jpg"], got));
+
+    // 解析器の store がパックに書く
+    class ThumbFake : public Analyzer {
+    public:
+        explicit ThumbFake(ThumbPack& p) : pack_(p) {}
+        std::string stageName() const override { return stage::kThumb; }
+        int version() const override { return 1; }
+        AnalyzerOutput analyze(const AnalyzerInput& in) override {
+            AnalyzerOutput out;
+            out.data.assign(in.path.begin(), in.path.end());
+            out.width = out.height = 8;
+            return out;
+        }
+        bool store(Db& d, int64_t id, AnalyzerOutput& out) override {
+            ThumbData t;
+            t.width = static_cast<uint16_t>(out.width);
+            t.height = static_cast<uint16_t>(out.height);
+            t.bytes = out.data;
+            return pack_.put(d, id, t);
+        }
+
+    private:
+        ThumbPack& pack_;
+    };
+    ThumbPack big(dir.string());
+    ThumbFake tf(big);
+    std::atomic<bool> cancel{false};
+    CHECK(runStage(db, tf, 2, cancel).processed == 3);
+    CHECK(big.get(db, ids["/p/3.jpg"], got) && std::string(got.bytes.begin(), got.bytes.end()) == "/p/3.jpg");
+    db.close();
+
+    // 版 1 の DB を開くと、版 2（thumbs テーブル）へ移行する
+    {
+        Db d;
+        CHECK(d.open((dir / "old.db").string()));
+        d.exec("DROP TABLE thumbs; PRAGMA user_version=1;");
+    }
+    Db d2;
+    CHECK(d2.open((dir / "old.db").string()));
+    CHECK(d2.schemaVersion() == kSchemaVersion);
+    Stmt st(d2.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE name='thumbs'");
+    CHECK(st.step() && st.i64(0) == 1);
+    fs::remove_all(dir);
+}
+
+static void testIndexer() {
+    const fs::path root = fs::temp_directory_path() / "imgdupe-index-test";
+    fs::remove_all(root);
+    const fs::path pics = root / "pics";
+    writeRaw(pics / "a.jpg", pattern(1));
+    writeRaw(pics / "a_noisy.png", noisy(pattern(1), 3, 5));
+    writeRaw(pics / "b.jpg", pattern(2));
+    std::ofstream(pics / "broken.jpg") << "x";
+
+    int decodes = 0;
+    const Callbacks base = fakeCallbacks(decodes);
+    std::atomic<int> encodes{0};
+    IndexCallbacks cb;
+    cb.scan = base.scan;
+    cb.decode = base.decode;
+    cb.encodeThumb = [&encodes](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
+        encodes.fetch_add(1);
+        if (path.find("broken") != std::string::npos) return false;
+        bytes.assign(path.begin(), path.end());
+        w = h = side;
+        return true;
+    };
+    IndexOptions opt;
+    opt.roots = {pics.string()};
+    opt.dbFile = (root / "imgdupe.db").string();
+    opt.packDir = root.string();
+    opt.threads = 2;
+    IndexProgress prog;
+    std::atomic<bool> cancel{false};
+
+    IndexReport r = indexOnce(opt, cb, prog, cancel);
+    CHECK(r.files == 4 && r.added == 4 && r.removed == 0);
+    CHECK(r.hashed == 4 && decodes == 4);
+    CHECK(r.thumbs == 3 && r.failed == 1 && encodes == 4);
+    CHECK(prog.phase == static_cast<int>(IndexPhase::Done));
+
+    // 2 回目は何もしない。消したファイルは DB から消える
+    fs::remove(pics / "b.jpg");
+    decodes = 0;
+    encodes = 0;
+    r = indexOnce(opt, cb, prog, cancel);
+    CHECK(r.added == 0 && r.removed == 1 && r.hashed == 0 && decodes == 0 && encodes == 0);
+
+    // indexer が済ませた分は、検索でも読み直さない
+    RunOptions ro;
+    ro.roots = opt.roots;
+    ro.dbFile = opt.dbFile;
+    ro.threads = 2;
+    Progress p2;
+    const Result res = run(ro, base, p2, cancel);
+    CHECK(res.hashed == 0 && decodes == 0);
+    CHECK(res.files.size() == 3);
+
+    // サムネイルはパックから読める
+    Db db;
+    CHECK(db.open(opt.dbFile));
+    ThumbPack pack(opt.packDir);
+    ThumbData t;
+    CHECK(pack.get(db, res.ids[0], t) && t.width == kThumbSide);
+    fs::remove_all(root);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -527,10 +690,13 @@ static void testMisc() {
 int main() {
     testSha256();
     testFeatures();
+    testOrientPixels();
     testShrinker();
     testSimilarMatchesBruteForce();
     testRun();
     testDb();
+    testPack();
+    testIndexer();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

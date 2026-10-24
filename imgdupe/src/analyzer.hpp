@@ -33,7 +33,9 @@ struct AnalyzerInput {
 
 struct AnalyzerOutput {
     bool ok = true;              // false なら段階を「失敗」にする（同じ版では再挑戦しない）
-    std::vector<TagRow> tags;    // 出どころ（source）は空なら解析器の段階の名前
+    std::vector<TagRow> tags;    // 出どころは解析器の段階の名前
+    std::vector<uint8_t> data;   // 解析器ごとの結果（サムネイルの画像など。store で書く）
+    int width = 0, height = 0;
 };
 
 class Analyzer {
@@ -43,6 +45,8 @@ public:
     virtual int version() const = 0;
     // 複数のスレッドから同時に呼ばれる
     virtual AnalyzerOutput analyze(const AnalyzerInput& in) = 0;
+    // 結果のうちタグ以外を書く（書き込みのトランザクションの中で、1 つのスレッドから呼ぶ）。失敗なら false
+    virtual bool store(Db& /*db*/, int64_t /*imageId*/, AnalyzerOutput& /*out*/) { return true; }
     // 各スレッドの始めと終わり（COM の初期化など）
     virtual void threadBegin() {}
     virtual void threadEnd() {}

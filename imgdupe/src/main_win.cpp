@@ -27,7 +27,9 @@
 
 #include "commands.hpp"
 #include "core.hpp"
+#include "db.hpp"
 #include "image_win.hpp"
+#include "indexer.hpp"
 #include "keymap_win.hpp"
 #include "resource.h"
 #include "update_win.hpp"
@@ -130,7 +132,12 @@ struct App {
     std::thread thumbThread;
     std::mutex thumbMutex;
     std::condition_variable thumbCv;
-    std::deque<std::pair<int, std::wstring>> thumbQueue;  // (項目, パス)
+    struct ThumbJob {
+        int item;
+        std::wstring path;
+        int64_t imageId;
+    };
+    std::deque<ThumbJob> thumbQueue;
     unsigned thumbGen = 0;
     bool thumbQuit = false;
 };
@@ -339,8 +346,12 @@ std::wstring pickSaveBase() {
 
 void thumbLoop() {
     imgwin::threadBegin();
+    // indexer が作ったサムネイル（パックファイル）があればそれを使い、無ければ元の画像から作る
+    Db db;
+    const bool haveDb = db.open(narrow(dbPath()));
+    ThumbPack pack(narrow(app.dataDir));
     for (;;) {
-        std::pair<int, std::wstring> job;
+        App::ThumbJob job;
         unsigned gen;
         {
             std::unique_lock<std::mutex> lock(app.thumbMutex);
@@ -350,8 +361,14 @@ void thumbLoop() {
             app.thumbQueue.pop_front();
             gen = app.thumbGen;
         }
-        HBITMAP bmp = imgwin::loadThumbnail(job.second, app.thumbSize, GetSysColor(COLOR_WINDOW));
-        auto* r = new ThumbResult{gen, job.first, bmp};
+        HBITMAP bmp = nullptr;
+        ThumbData t;
+        // パックのサムネイルが表示より小さければ、ぼやけるので元の画像から作る
+        if (haveDb && job.imageId && pack.get(db, job.imageId, t) &&
+            std::max(t.width, t.height) >= std::min(app.thumbSize, kThumbSide - 1))
+            bmp = imgwin::thumbFromBytes(t.bytes, app.thumbSize, GetSysColor(COLOR_WINDOW));
+        if (!bmp) bmp = imgwin::loadThumbnail(job.path, app.thumbSize, GetSysColor(COLOR_WINDOW));
+        auto* r = new ThumbResult{gen, job.item, bmp};
         if (!PostMessageW(app.hwnd, WM_APP_THUMB, 0, reinterpret_cast<LPARAM>(r))) {
             if (bmp) DeleteObject(bmp);
             delete r;
@@ -448,7 +465,10 @@ void requestThumb(int item) {
     app.requested[item] = 1;
     {
         std::lock_guard<std::mutex> lock(app.thumbMutex);
-        app.thumbQueue.emplace_front(item, widen(e->path));  // 後から頼んだ（今見えている）ものを先に
+        const Group* g = currentGroup();
+        const uint32_t index = g->members[item].index;
+        const int64_t id = index < app.result.ids.size() ? app.result.ids[index] : 0;
+        app.thumbQueue.push_front({item, widen(e->path), id});  // 後から頼んだ（今見えている）ものを先に
     }
     app.thumbCv.notify_one();
 }
@@ -1574,6 +1594,51 @@ int runCli(int argc, wchar_t** argv) {
     return ok ? 0 : 1;
 }
 
+IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::atomic<bool>& cancel) {
+    IndexCallbacks cb;
+    cb.scan = [&found, &cancel](const std::string& root, std::vector<ScannedFile>& files) {
+        imgwin::scanFolder(widen(root), files, found, cancel);
+    };
+    cb.decode = [](const std::string& path) { return imgwin::decodeFeatures(widen(path)); };
+    cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
+        return imgwin::encodeThumbnail(widen(path), side, bytes, w, h);
+    };
+    cb.threadInit = imgwin::threadBegin;
+    cb.threadExit = imgwin::threadEnd;
+    return cb;
+}
+
+// imgdupe.exe --index <フォルダ>...: 走査して DB に登録し、ハッシュとサムネイルを作る
+int runIndexCli(int argc, wchar_t** argv) {
+    Console con;
+    IndexOptions opt;
+    opt.dbFile = narrow(dbPath());
+    opt.packDir = narrow(app.dataDir);
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--no-thumbs") opt.thumbnails = false;
+        else if (a == L"-j" && i + 1 < argc) opt.threads = static_cast<unsigned>(std::max(1, _wtoi(argv[++i])));
+        else opt.roots.push_back(narrow(stripTrailingSlash(a)));
+    }
+    if (opt.roots.empty()) {
+        con.print(L"使い方: imgdupe.exe --index <フォルダ>... [--no-thumbs] [-j スレッド数]");
+        return 2;
+    }
+    std::atomic<bool> cancel{false};
+    IndexProgress prog;
+    const IndexCallbacks cb = windowsIndexCallbacks(prog.prog.total, cancel);
+    try {
+        const IndexReport r = indexOnce(opt, cb, prog, cancel);
+        con.print(L"画像 " + withCommas(r.files) + L" 枚（追加 " + withCommas(r.added) + L"・削除 " + withCommas(r.removed) +
+                  L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、失敗 " +
+                  withCommas(r.failed) + L" 枚");
+    } catch (const std::exception& e) {
+        con.print(L"エラー: " + widen(e.what()));
+        return 1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
@@ -1584,8 +1649,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv && argc >= 2 && lstrcmpiW(argv[1], L"--cli") == 0) {
-        const int code = runCli(argc, argv);
+    if (argv && argc >= 2 && (lstrcmpiW(argv[1], L"--cli") == 0 || lstrcmpiW(argv[1], L"--index") == 0)) {
+        const int code = lstrcmpiW(argv[1], L"--cli") == 0 ? runCli(argc, argv) : runIndexCli(argc, argv);
         LocalFree(argv);
         CoUninitialize();
         return code;

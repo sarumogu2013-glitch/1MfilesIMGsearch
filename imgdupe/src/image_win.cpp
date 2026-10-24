@@ -175,55 +175,48 @@ imgdupe::Features decodeFeatures(const std::wstring& path) {
     return f;
 }
 
-HBITMAP loadThumbnail(const std::wstring& path, int box, COLORREF bg) {
-    IWICImagingFactory* wic = factory();
-    Com<IWICBitmapFrameDecode> frame;
-    UINT w = 0, h = 0;
-    if (!wic || !openFrame(path, frame, w, h)) return nullptr;
-    const int orientation = readOrientation(frame.get(), path);
+namespace {
 
-    Com<IWICBitmapSource> src;
-    fastSource(wic, frame.get(), w, h, static_cast<UINT>(box), src);
-    if (!src) return nullptr;
-
-    // 向きを直す
-    static const WICBitmapTransformOptions transforms[9] = {
-        WICBitmapTransformRotate0,
-        WICBitmapTransformRotate0,
-        WICBitmapTransformFlipHorizontal,
-        WICBitmapTransformRotate180,
-        WICBitmapTransformFlipVertical,
-        static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
-        WICBitmapTransformRotate90,
-        static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
-        WICBitmapTransformRotate270,
-    };
-    Com<IWICFormatConverter> conv;
-    if (FAILED(wic->CreateFormatConverter(conv.put())) ||
-        FAILED(conv->Initialize(src.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
-                                WICBitmapPaletteTypeCustom)))
-        return nullptr;
-    Com<IWICBitmapSource> oriented;
-    Com<IWICBitmapFlipRotator> rot;
-    if (orientation > 1 && SUCCEEDED(wic->CreateBitmapFlipRotator(rot.put())) &&
-        SUCCEEDED(rot->Initialize(conv.get(), transforms[orientation])))
-        rot->QueryInterface(IID_PPV_ARGS(oriented.put()));
-    else
-        conv->QueryInterface(IID_PPV_ARGS(oriented.put()));
-
+// box×box に収まるよう縮めた 32bpp PBGRA の画素（大きくはしない）
+bool fittedPixels(IWICImagingFactory* wic, IWICBitmapSource* src, UINT box, std::vector<BYTE>& px, UINT& tw, UINT& th) {
     UINT sw = 0, sh = 0;
-    oriented->GetSize(&sw, &sh);
-    if (!sw || !sh) return nullptr;
+    src->GetSize(&sw, &sh);
+    if (!sw || !sh) return false;
     const double s = std::min(1.0, std::min(static_cast<double>(box) / sw, static_cast<double>(box) / sh));
-    const UINT tw = std::max<UINT>(1, static_cast<UINT>(std::lround(sw * s)));
-    const UINT th = std::max<UINT>(1, static_cast<UINT>(std::lround(sh * s)));
+    tw = std::max<UINT>(1, static_cast<UINT>(std::lround(sw * s)));
+    th = std::max<UINT>(1, static_cast<UINT>(std::lround(sh * s)));
+    Com<IWICFormatConverter> conv;
     Com<IWICBitmapScaler> scaler;
-    if (FAILED(wic->CreateBitmapScaler(scaler.put())) ||
-        FAILED(scaler->Initialize(oriented.get(), tw, th, WICBitmapInterpolationModeFant)))
-        return nullptr;
-    std::vector<BYTE> px(static_cast<size_t>(tw) * th * 4);
-    if (FAILED(scaler->CopyPixels(nullptr, tw * 4, static_cast<UINT>(px.size()), px.data()))) return nullptr;
+    if (FAILED(wic->CreateFormatConverter(conv.put())) ||
+        FAILED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                WICBitmapPaletteTypeCustom)) ||
+        FAILED(wic->CreateBitmapScaler(scaler.put())) ||
+        FAILED(scaler->Initialize(conv.get(), tw, th, WICBitmapInterpolationModeFant)))
+        return false;
+    px.resize(static_cast<size_t>(tw) * th * 4);
+    return SUCCEEDED(scaler->CopyPixels(nullptr, tw * 4, static_cast<UINT>(px.size()), px.data()));
+}
 
+// ファイルを読み、box×box に収まるよう縮めて、EXIF の向きを直した画素
+// （回転は自分で行う。WIC の回転は環境によって動かないため）
+bool orientedPixels(IWICImagingFactory* wic, const std::wstring& path, UINT box, std::vector<BYTE>& px, UINT& w,
+                    UINT& h) {
+    Com<IWICBitmapFrameDecode> frame;
+    UINT fw = 0, fh = 0;
+    if (!openFrame(path, frame, fw, fh)) return false;
+    const int orientation = readOrientation(frame.get(), path);
+    Com<IWICBitmapSource> src;
+    fastSource(wic, frame.get(), fw, fh, box, src);
+    if (!src || !fittedPixels(wic, src.get(), box, px, w, h)) return false;
+    uint32_t ow = w, oh = h;
+    imgdupe::orientPixels(px, ow, oh, 4, orientation);
+    w = ow;
+    h = oh;
+    return true;
+}
+
+// 画素を box×box の DIB の中央に置く（背景は bg）
+HBITMAP composeThumb(const std::vector<BYTE>& px, UINT tw, UINT th, int box, COLORREF bg) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
     bi.bmiHeader.biWidth = box;
@@ -251,6 +244,76 @@ HBITMAP loadThumbnail(const std::wstring& path, int box, COLORREF bg) {
             for (int c = 0; c < 3; ++c) q[c] = static_cast<BYTE>(p[c] + q[c] * (255 - a) / 255);
         }
     return bmp;
+}
+
+}  // namespace
+
+HBITMAP loadThumbnail(const std::wstring& path, int box, COLORREF bg) {
+    IWICImagingFactory* wic = factory();
+    std::vector<BYTE> px;
+    UINT w = 0, h = 0;
+    if (!wic || !orientedPixels(wic, path, static_cast<UINT>(box), px, w, h)) return nullptr;
+    return composeThumb(px, w, h, box, bg);
+}
+
+HBITMAP thumbFromBytes(const std::vector<uint8_t>& bytes, int box, COLORREF bg) {
+    IWICImagingFactory* wic = factory();
+    Com<IWICStream> stream;
+    Com<IWICBitmapDecoder> dec;
+    Com<IWICBitmapFrameDecode> frame;
+    if (!wic || bytes.empty() || FAILED(wic->CreateStream(stream.put())) ||
+        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
+        FAILED(wic->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, dec.put())) ||
+        FAILED(dec->GetFrame(0, frame.put())))
+        return nullptr;
+    std::vector<BYTE> px;
+    UINT w = 0, h = 0;
+    if (!fittedPixels(wic, frame.get(), static_cast<UINT>(box), px, w, h)) return nullptr;
+    return composeThumb(px, w, h, box, bg);
+}
+
+bool encodeThumbnail(const std::wstring& path, int maxSide, std::vector<uint8_t>& jpeg, int& width, int& height) {
+    IWICImagingFactory* wic = factory();
+    std::vector<BYTE> px;
+    UINT tw = 0, th = 0;
+    if (!wic || !orientedPixels(wic, path, static_cast<UINT>(maxSide), px, tw, th)) return false;
+    // 透明な部分は白にする（JPEG はアルファを持てない）
+    std::vector<BYTE> bgr(static_cast<size_t>(tw) * th * 3);
+    for (size_t i = 0; i < static_cast<size_t>(tw) * th; ++i)
+        for (int c = 0; c < 3; ++c) bgr[i * 3 + c] = static_cast<BYTE>(px[i * 4 + c] + (255 - px[i * 4 + 3]));
+
+    Com<IStream> stream;
+    Com<IWICBitmapEncoder> enc;
+    Com<IWICBitmapFrameEncode> fe;
+    Com<IPropertyBag2> props;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, stream.put())) ||
+        FAILED(wic->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, enc.put())) ||
+        FAILED(enc->Initialize(stream.get(), WICBitmapEncoderNoCache)) || FAILED(enc->CreateNewFrame(fe.put(), props.put())))
+        return false;
+    PROPBAG2 opt{};
+    opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_R4;
+    v.fltVal = 0.82f;
+    props->Write(1, &opt, &v);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+    if (FAILED(fe->Initialize(props.get())) || FAILED(fe->SetSize(tw, th)) || FAILED(fe->SetPixelFormat(&fmt)) ||
+        !IsEqualGUID(fmt, GUID_WICPixelFormat24bppBGR) ||
+        FAILED(fe->WritePixels(th, tw * 3, static_cast<UINT>(bgr.size()), bgr.data())) || FAILED(fe->Commit()) ||
+        FAILED(enc->Commit()))
+        return false;
+    STATSTG st{};
+    if (FAILED(stream->Stat(&st, STATFLAG_NONAME))) return false;
+    jpeg.resize(static_cast<size_t>(st.cbSize.QuadPart));
+    LARGE_INTEGER zero{};
+    ULONG read = 0;
+    if (FAILED(stream->Seek(zero, STREAM_SEEK_SET, nullptr)) ||
+        FAILED(stream->Read(jpeg.data(), static_cast<ULONG>(jpeg.size()), &read)) || read != jpeg.size())
+        return false;
+    width = static_cast<int>(tw);
+    height = static_cast<int>(th);
+    return true;
 }
 
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,

@@ -129,24 +129,34 @@ Similar collect(UnionFind& uf, std::vector<uint8_t> nearest) {
 
 int popcount64(uint64_t x) { return __builtin_popcountll(x); }
 
-void applyOrientation(std::vector<uint8_t>& rgb, int n, int orientation) {
+void orientPixels(std::vector<uint8_t>& px, uint32_t& w, uint32_t& h, int channels, int orientation) {
     if (orientation < 2 || orientation > 8) return;
-    std::vector<uint8_t> out(rgb.size());
-    for (int y = 0; y < n; ++y)
-        for (int x = 0; x < n; ++x) {
-            int sx = x, sy = y;
+    const bool swap = orientation >= 5;
+    const uint32_t ow = swap ? h : w, oh = swap ? w : h;
+    std::vector<uint8_t> out(px.size());
+    const size_t ch = static_cast<size_t>(channels);
+    for (uint32_t y = 0; y < oh; ++y)
+        for (uint32_t x = 0; x < ow; ++x) {
+            uint32_t sx = x, sy = y;
             switch (orientation) {
-                case 2: sx = n - 1 - x; break;
-                case 3: sx = n - 1 - x; sy = n - 1 - y; break;
-                case 4: sy = n - 1 - y; break;
+                case 2: sx = w - 1 - x; break;
+                case 3: sx = w - 1 - x; sy = h - 1 - y; break;
+                case 4: sy = h - 1 - y; break;
                 case 5: sx = y; sy = x; break;
-                case 6: sx = y; sy = n - 1 - x; break;  // 時計回りに 90°
-                case 7: sx = n - 1 - y; sy = n - 1 - x; break;
-                case 8: sx = n - 1 - y; sy = x; break;  // 反時計回りに 90°
+                case 6: sx = y; sy = h - 1 - x; break;  // 時計回りに 90°
+                case 7: sx = w - 1 - y; sy = h - 1 - x; break;
+                case 8: sx = w - 1 - y; sy = x; break;  // 反時計回りに 90°
             }
-            std::memcpy(&out[(static_cast<size_t>(y) * n + x) * 3], &rgb[(static_cast<size_t>(sy) * n + sx) * 3], 3);
+            std::memcpy(&out[(static_cast<size_t>(y) * ow + x) * ch], &px[(static_cast<size_t>(sy) * w + sx) * ch], ch);
         }
-    rgb.swap(out);
+    px.swap(out);
+    w = ow;
+    h = oh;
+}
+
+void applyOrientation(std::vector<uint8_t>& rgb, int n, int orientation) {
+    uint32_t w = static_cast<uint32_t>(n), h = static_cast<uint32_t>(n);
+    orientPixels(rgb, w, h, 3, orientation);
 }
 
 Features computeFeatures(const uint8_t* rgbIn, int orientation) {

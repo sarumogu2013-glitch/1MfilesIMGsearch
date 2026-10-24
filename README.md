@@ -85,6 +85,7 @@ exe と同じフォルダに `imgdupe.ini`（設定）と `imgdupe.db`（画像�
 前の版の `imgdupe_cache.bin` があれば、最初の 1 回だけ `imgdupe.db` に取り込みます（読み直しは要りません。取り込んだ後は消して構いません）。
 exe のフォルダに書き込めない時（Program Files に置いた時など）は `%LOCALAPPDATA%\imgdupe` に作ります。
 場所は「ヘルプ → バージョン情報」で確かめられます。`imgdupe.db` は消しても構いません（次回すべて読み直します）。
+サムネイルは同じ場所の `thumbs_000.pack` などにまとめて保存します（小さなファイルを大量に作らないため）。
 
 ## コマンドラインで使う
 
@@ -93,6 +94,10 @@ imgdupe.exe --cli D:\Photos E:\Backup               # 重複グループを imgd
 imgdupe.exe --cli D:\Photos -t 6 -o result         # しきい値 6、result.csv / result.html に書き出す
 imgdupe.exe --cli D:\Photos --exact-only           # 完全一致だけ
 imgdupe.exe --cli D:\Photos -q sample.jpg          # 1 枚と似た画像を探す
+```
+
+```
+imgdupe.exe --index D:\Photos                     # 走査して DB に登録し、ハッシュとサムネイルだけ先に作っておく
 ```
 
 オプション: `--include-flat`（単色に近い画像も比べる）、`--db <ファイル>`（DB の場所）、`-j <数>`（スレッド数）。
