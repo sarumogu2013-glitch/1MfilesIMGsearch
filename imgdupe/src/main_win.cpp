@@ -2946,10 +2946,11 @@ int runIndexCli(int argc, wchar_t** argv) {
         const std::wstring a = argv[i];
         if (a == L"--no-thumbs") opt.thumbnails = false;
         else if (a == L"-j" && i + 1 < argc) opt.threads = static_cast<unsigned>(std::max(1, _wtoi(argv[++i])));
+        else if (a == L"--db" && i + 1 < argc) opt.dbFile = narrow(argv[++i]);
         else opt.roots.push_back(narrow(stripTrailingSlash(a)));
     }
     if (opt.roots.empty()) {
-        con.print(L"使い方: imgdupe.exe --index <フォルダ>... [--no-thumbs] [-j スレッド数]");
+        con.print(L"使い方: imgdupe.exe --index <フォルダ>... [--no-thumbs] [-j スレッド数] [--db ファイル]");
         return 2;
     }
     std::atomic<bool> cancel{false};
@@ -2959,7 +2960,7 @@ int runIndexCli(int argc, wchar_t** argv) {
         const IndexReport r = indexOnce(opt, cb, prog, cancel);
         con.print(L"画像 " + withCommas(r.files) + L" 枚（追加 " + withCommas(r.added) + L"・削除 " + withCommas(r.removed) +
                   L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、メタデータ " +
-                  withCommas(r.metas) + L" 枚、失敗 " +
+                  withCommas(r.metas) + L" 枚、json・フォルダ名 " + withCommas(r.names) + L" 枚、失敗 " +
                   withCommas(r.failed) + L" 枚");
     } catch (const std::exception& e) {
         con.print(L"エラー: " + widen(e.what()));

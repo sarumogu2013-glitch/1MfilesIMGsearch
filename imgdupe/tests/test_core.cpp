@@ -15,6 +15,7 @@
 #include "meta.hpp"
 #include "search.hpp"
 #include "links.hpp"
+#include "names.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1114,6 +1115,99 @@ static void testLinks() {
     fs::remove_all(dir);
 }
 
+static void testNames() {
+    // gallery-dl の pixiv
+    SidecarInfo s;
+    CHECK(parseSidecarJson(R"({"category":"pixiv","id":98765432,"title":" 夏の海 ","num":0,
+        "tags":["初音ミク","VOCALOID",{"name":"海","translated_name":"sea"}],
+        "user":{"id":1234,"name":"作者さん","account":"sakusha"}})", s));
+    CHECK(s.site == "pixiv" && s.postId == "98765432" && s.authorId == "1234" && s.title == "夏の海");
+    CHECK(s.url == "https://www.pixiv.net/artworks/98765432");
+    CHECK(s.tags.size() == 4 && s.tags[0].tag == "作者さん" && s.tags[0].kind == "artist" && s.tags[0].source == "meta");
+    CHECK(s.tags[3].tag == "海" && s.tags[3].kind == "general" && std::abs(s.tags[3].confidence - 0.95) < 1e-9);
+    // twitter
+    CHECK(parseSidecarJson(R"({"category":"twitter","tweet_id":1790000000000000001,"id":5,
+        "author":{"id":42,"name":"screen","nick":"表示名"},"hashtags":["miku","miku"]})", s));
+    CHECK(s.postId == "1790000000000000001" && s.url == "https://x.com/screen/status/1790000000000000001");
+    CHECK(s.tags.size() == 2 && s.tags[0].tag == "表示名" && s.tags[1].tag == "miku");
+    // danbooru
+    CHECK(parseSidecarJson(R"({"category":"danbooru","id":7,"tag_string_artist":"some_artist",
+        "tag_string_character":"hatsune_miku","tag_string_copyright":"vocaloid","tag_string_general":"1girl ^_^ "})", s));
+    CHECK(s.url == "https://danbooru.donmai.us/posts/7" && s.tags.size() == 5);
+    CHECK(s.tags[0].kind == "artist" && s.tags[1].kind == "character" && s.tags[1].tag == "hatsune_miku");
+    CHECK(s.tags[4].tag == "^_^");
+    CHECK(!parseSidecarJson("[]", s) && !parseSidecarJson("{oops", s));
+
+    // フォルダ名
+    auto names = [](const std::string& p) {
+        std::vector<std::string> v;
+        for (const auto& t : folderTags(p)) v.push_back(t.kind + ":" + t.tag);
+        return v;
+    };
+    using V = std::vector<std::string>;
+    CHECK((names("D:\\Pics\\初音ミク\\a.jpg") == V{"general:初音ミク"}));
+    CHECK((names("D:\\Pics\\[作者名] 夏の本\\001.jpg") == V{"artist:作者名", "general:夏の本"}));
+    CHECK((names("D:\\【サークル】\\001.jpg") == V{"artist:サークル"}));
+    CHECK(names("C:\\Users\\me\\Downloads\\a.jpg").empty());
+    CHECK(names("D:\\Photos\\2024-05\\a.jpg").empty());
+    CHECK(names("E:\\DCIM\\100MEDIA\\a.jpg").empty());
+    CHECK(names("D:\\a.jpg").empty());
+    CHECK((names("/home/u/landscape_/b.png") == V{"general:landscape"}));
+    CHECK(folderTags("D:\\Miku\\a.jpg").at(0).source == "folder");
+
+    // 段階 names: json を読み、タグ・出典・タイトルを書く
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-names-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "初音ミク");
+    const std::string img = (dir / "初音ミク" / "98765432_p0.jpg").string();
+    const std::string img2 = (dir / "初音ミク" / "b.png").string();
+    {
+        std::ofstream(img) << "x";
+        std::ofstream(img2) << "y";
+        std::ofstream(img + ".json") << R"({"category":"pixiv","id":98765432,"title":"夏の海","tags":["blue_sky"],"user":{"id":1,"name":"作者"}})";
+        std::ofstream((dir / "初音ミク" / "b.json").string()) << R"({"category":"gelbooru","id":3,"tags":"a b"})";
+    }
+    CHECK(findSidecar(img) == img + ".json" && findSidecar(img2) == (dir / "初音ミク" / "b.json").string());
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{img, 1, 1}, {img2, 1, 2}});
+    {
+        Stmt st(db.handle(), "INSERT INTO file_meta(image_id) VALUES(?)");
+        st.bind(1, id[img]);
+        st.step();
+    }
+    NamesAnalyzer na;
+    std::atomic<bool> cancel{false};
+    StageReport rep = runStage(db, na, 2, cancel);
+    CHECK(rep.processed == 2 && rep.failed == 0);
+    int metaTags = 0, folderTagsN = 0;
+    for (const auto& t : tagsOf(db, id[img])) {
+        if (t.source == "meta") ++metaTags;
+        if (t.source == "folder" && t.tag == "初音ミク" && std::abs(t.confidence - 0.70) < 1e-9) ++folderTagsN;
+    }
+    CHECK(metaTags == 2 && folderTagsN == 1);
+    {
+        Stmt st(db.handle(), "SELECT author_id, url FROM sources WHERE image_id=? AND site='pixiv' AND post_id='98765432'");
+        st.bind(1, id[img]);
+        CHECK(st.step() && st.text(0) == "1" && st.text(1) == "https://www.pixiv.net/artworks/98765432");
+        Stmt t(db.handle(), "SELECT title FROM file_meta WHERE image_id=?");
+        t.bind(1, id[img]);
+        CHECK(t.step() && t.text(0) == "夏の海");
+    }
+    SearchQuery q;
+    q.text = "夏の海";
+    CHECK((search(db, q).ids == std::vector<int64_t>{id[img]}));  // json のタイトルも全文検索に入る
+    q = SearchQuery{};
+    q.tags = {"作者"};
+    q.minConfidence = 0.9;
+    CHECK((search(db, q).ids == std::vector<int64_t>{id[img]}));
+    q.tags = {"初音ミク"};
+    CHECK(search(db, q).ids.empty());  // フォルダ名は 0.70
+    q.minConfidence = 0.6;
+    CHECK(search(db, q).ids.size() == 2);
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1148,6 +1242,7 @@ int main() {
     testMeta();
     testSearch();
     testLinks();
+    testNames();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

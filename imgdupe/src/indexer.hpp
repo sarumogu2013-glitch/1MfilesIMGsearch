@@ -35,7 +35,7 @@ struct IndexCallbacks {
     std::function<void()> threadInit, threadExit;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
@@ -43,7 +43,7 @@ struct IndexProgress {
 };
 
 struct IndexReport {
-    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, failed = 0;
+    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, failed = 0;
     bool cancelled = false;
 };
 

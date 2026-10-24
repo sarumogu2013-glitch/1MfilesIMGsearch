@@ -354,6 +354,8 @@ void Db::commit() {
 }
 void Db::rollback() { exec("ROLLBACK"); }
 
+int Db::changes() { return sqlite3_changes(db_); }
+
 std::string Db::setting(const std::string& key, const std::string& def) {
     Stmt st(db_, "SELECT value FROM settings WHERE key=?");
     st.bind(1, key);

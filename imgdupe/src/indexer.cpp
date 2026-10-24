@@ -4,6 +4,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "names.hpp"
+
 namespace imgdupe {
 
 // ---------------------------------------------------------------- 解析器
@@ -116,8 +118,18 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
         sr = runStage(db, meta, opt.threads, cancel, &progress.prog);
         rep.metas = sr.processed - sr.failed;
         rep.failed += sr.failed;
-        rep.cancelled = sr.cancelled;
+        if (sr.cancelled) {
+            rep.cancelled = true;
+            return rep;
+        }
     }
+    // json・フォルダ名（ファイルを読むだけなので OS に依存しない）
+    progress.phase = static_cast<int>(IndexPhase::Names);
+    NamesAnalyzer names;
+    sr = runStage(db, names, opt.threads, cancel, &progress.prog);
+    rep.names = sr.processed - sr.failed;
+    rep.failed += sr.failed;
+    rep.cancelled = sr.cancelled;
     progress.phase = static_cast<int>(IndexPhase::Done);
     return rep;
 }

@@ -65,6 +65,7 @@ public:
     void begin();
     void commit();
     void rollback();
+    int changes();  // 直前の INSERT / UPDATE / DELETE で変わった行の数
 
     std::string setting(const std::string& key, const std::string& def = "");
     void setSetting(const std::string& key, const std::string& value);

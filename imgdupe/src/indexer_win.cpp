@@ -287,6 +287,10 @@ std::wstring statusText() {
                 swprintf(t, 128, L"メタデータ %llu / %llu", static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
                 break;
+            case IndexPhase::Names:
+                swprintf(t, 128, L"json・フォルダ名 %llu / %llu", static_cast<unsigned long long>(done),
+                         static_cast<unsigned long long>(total));
+                break;
             default: swprintf(t, 128, L"処理中"); break;
         }
         return t;
