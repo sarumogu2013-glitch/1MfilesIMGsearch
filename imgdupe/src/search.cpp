@@ -172,6 +172,22 @@ SearchResult search(Db& db, const SearchQuery& q) {
         params.emplace_back(q.format);
     }
     if (q.animatedOnly) where += " AND f.animated = 1";
+    if (q.unclassified) {
+        // 出どころの絞り込みは確度の合成と同じ
+        std::string cond;
+        if (!q.sources.empty()) {
+            cond += " AND (u.manual=1 OR u.source IN (" + placeholders(q.sources.size()) + "))";
+            for (const auto& x : q.sources) params.emplace_back(x);
+        }
+        if (!q.excludeSources.empty()) {
+            cond += " AND (u.manual=1 OR u.source NOT IN (" + placeholders(q.excludeSources.size()) + "))";
+            for (const auto& x : q.excludeSources) params.emplace_back(x);
+        }
+        where += " AND NOT EXISTS (SELECT 1 FROM tags u WHERE u.image_id=i.id" + cond +
+                 " GROUP BY lower(u.tag) HAVING CASE WHEN max(u.manual)=1 THEN max(CASE WHEN u.manual=1 THEN u.confidence END) "
+                 "ELSE 1 - exp(sum(ln(1 - min(u.confidence, 0.999999)))) END >= ?)";
+        params.emplace_back(q.minConfidence);
+    }
     if (!q.pathContains.empty()) {
         where += " AND instr(lower(i.path), ?) > 0";
         params.emplace_back(lowerAscii(q.pathContains));
@@ -267,6 +283,77 @@ void clearManualTag(Db& db, int64_t imageId, const std::string& tag) {
     del.step();
 }
 
+void TagHistory::touch(int64_t imageId, const std::string& tag) {
+    if (!seen_.insert({imageId, lowerAscii(tag)}).second) return;
+    const auto names = aliasesOf(db_, tag);
+    const std::string sql = "SELECT tag, kind, confidence FROM tags WHERE image_id=? AND manual=1 AND tag COLLATE NOCASE IN (" +
+                            placeholders(names.size()) + ")";
+    Stmt st(db_.handle(), sql.c_str());
+    st.bind(1, imageId);
+    for (size_t i = 0; i < names.size(); ++i) st.bind(static_cast<int>(i + 2), names[i]);
+    std::string item = "{\"image\":" + std::to_string(imageId) + ",\"tag\":";
+    jsonString(item, tag);
+    item += ",\"rows\":[";
+    bool first = true;
+    while (st.step()) {
+        item += first ? "[" : ",[";
+        first = false;
+        jsonString(item, st.text(0));
+        item += ",";
+        jsonString(item, st.text(1));
+        char conf[32];
+        snprintf(conf, sizeof conf, ",%.17g]", st.f64(2));
+        item += conf;
+    }
+    item += "]}";
+    before_ += (before_.empty() ? "" : ",") + item;
+}
+
+int64_t TagHistory::save(const std::string& description) {
+    if (before_.empty()) return 0;
+    Stmt ins(db_.handle(), "INSERT INTO history(op, target, before, at) VALUES('tags', ?, ?, ?)");
+    ins.bind(1, description).bind(2, "[" + before_ + "]").bind(3, static_cast<int64_t>(std::time(nullptr)));
+    ins.step();
+    before_.clear();
+    seen_.clear();
+    Stmt id(db_.handle(), "SELECT last_insert_rowid()");
+    return id.step() ? id.i64(0) : 0;
+}
+
+bool undoLastTagEdit(Db& db, std::string& description) {
+    int64_t id = 0;
+    std::string before;
+    {
+        Stmt st(db.handle(), "SELECT id, target, before FROM history WHERE op='tags' ORDER BY id DESC LIMIT 1");
+        if (!st.step()) return false;
+        id = st.i64(0);
+        description = st.text(1);
+        before = st.text(2);
+    }
+    Json j;
+    if (parseJson(before, j) && j.type == Json::Array) {
+        Stmt ins(db.handle(), "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'manual',1)");
+        for (const Json& e : j.arr) {
+            const Json* image = e.get("image");
+            if (!image || image->type != Json::Number) continue;
+            const int64_t imageId = std::strtoll(image->str.c_str(), nullptr, 10);
+            clearManualTag(db, imageId, e.getString("tag"));
+            if (const Json* rows = e.get("rows"); rows && rows->type == Json::Array) {
+                for (const Json& r : rows->arr) {
+                    if (r.type != Json::Array || r.arr.size() != 3) continue;
+                    ins.bind(1, imageId).bind(2, r.arr[0].str).bind(3, r.arr[1].str).bind(4, std::strtod(r.arr[2].str.c_str(), nullptr));
+                    ins.step();
+                    ins.reset();
+                }
+            }
+        }
+    }
+    Stmt del(db.handle(), "DELETE FROM history WHERE id=?");
+    del.bind(1, id);
+    del.step();
+    return true;
+}
+
 namespace {
 
 const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence"};
@@ -319,6 +406,7 @@ std::string queryToJson(const SearchQuery& q) {
     putInt(out, "maxSize", q.maxSize);
     putText(out, "format", q.format);
     putBool(out, "animatedOnly", q.animatedOnly);
+    putBool(out, "unclassified", q.unclassified);
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
     putBool(out, "review", q.review);
@@ -361,6 +449,7 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     num("maxSize", q.maxSize);
     q.format = j.getString("format");
     flag("animatedOnly", q.animatedOnly);
+    flag("unclassified", q.unclassified);
     q.pathContains = j.getString("path");
     q.downloadContains = j.getString("download");
     const std::string sort = j.getString("sort");

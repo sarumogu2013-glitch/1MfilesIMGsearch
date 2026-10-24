@@ -1010,6 +1010,37 @@ static void testSearch() {
     nt.tags = {"new_tag"};
     CHECK((ids(nt) == V{c}));
 
+    // 取り消し: 変える前の手動の確定に戻す
+    {
+        TagHistory h(db);
+        h.touch(a, "hatsune_miku");
+        setManualTag(db, a, "hatsune_miku", false);
+        h.touch(c, "new_tag");
+        setManualTag(db, c, "new_tag", false);
+        CHECK(h.save("違う 2 枚") > 0);
+        TagHistory empty(db);
+        CHECK(empty.save("nothing") == 0);
+        SearchQuery hq;
+        hq.tags = {"hatsune_miku"};
+        hq.minConfidence = 0.7;
+        CHECK((ids(hq) == V{b}));
+        std::string desc;
+        CHECK(undoLastTagEdit(db, desc) && desc == "違う 2 枚");
+        CHECK((ids(hq) == V{a, b}));  // a は手動の確定が無い状態に戻る
+        CHECK((ids(nt) == V{c}));      // c は「正しい」に戻る
+        CHECK(!undoLastTagEdit(db, desc));
+    }
+    // 未分類: 確度 0.5 以上のタグが 1 つも無い画像
+    {
+        SearchQuery uq;
+        uq.unclassified = true;
+        uq.minConfidence = 0.5;
+        // a: miku 0.9、b: miku 0.75、c: 1boy 0.8 / new_tag 1.0（手動）、d: miku 手動 0
+        CHECK((ids(uq) == V{d}));
+        uq.excludeSources = {"tagger"};
+        CHECK((ids(uq) == V{a, d}));  // タガーを除くと a は無い、b はフォルダとで 0.5（>= 0.5）、c は手動
+    }
+
     // 条件の JSON（スマートフォルダ）
     SearchQuery full;
     full.tags = {"初音ミク", "say \"hi\""};
@@ -1033,6 +1064,7 @@ static void testSearch() {
     full.sort = SortKey::Taken;
     full.descending = true;
     full.review = true;
+    full.unclassified = true;
     SearchQuery back;
     CHECK(queryFromJson(queryToJson(full), back));
     CHECK(back.tags == full.tags && back.excludeTags == full.excludeTags && back.excludeSources == full.excludeSources);
@@ -1040,7 +1072,7 @@ static void testSearch() {
     CHECK(back.takenFrom == full.takenFrom && back.takenTo == full.takenTo && back.noTaken && back.minWidth == 3000);
     CHECK(back.minHeight == 2000 && back.minSize == 150 && back.maxSize == 5000000000LL && back.format == "PNG");
     CHECK(back.animatedOnly && back.pathContains == full.pathContains && back.downloadContains == "pixiv");
-    CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0 && back.review);
+    CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0 && back.review && back.unclassified);
     SearchQuery def;
     CHECK(queryFromJson(queryToJson(SearchQuery{}), def) && def.minRating == -1 && def.minConfidence == 0.5 &&
           def.sort == SortKey::Path && !def.descending);

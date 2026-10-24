@@ -3,6 +3,8 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -30,6 +32,7 @@ struct SearchQuery {
     int64_t minSize = 0, maxSize = 0;    // バイト
     std::string format;                  // "JPEG" など
     bool animatedOnly = false;
+    bool unclassified = false;           // 未分類: 確度 minConfidence 以上のタグ（出どころで絞った合成）が 1 つも無い画像
     std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
     // 確認キュー: 1 つ目のタグをまだ手動で確定していない画像のうち、確度が kReviewMax 未満のものを、
@@ -66,6 +69,21 @@ constexpr double kReviewMax = 0.9;
 // 手動で正誤を確定する（正しい = 1.0、違う = 0）。別名を含め、同じタグの前の確定は置き換える
 void setManualTag(Db& db, int64_t imageId, const std::string& tag, bool correct);
 void clearManualTag(Db& db, int64_t imageId, const std::string& tag);
+
+// タグの手動の確定を取り消せるように、変える前の状態を history に残す（仕様「操作の取り消し」）。
+// 使い方: 変える前に touch(画像, タグ) → setManualTag など → 最後に save(説明)
+class TagHistory {
+public:
+    explicit TagHistory(Db& db) : db_(db) {}
+    void touch(int64_t imageId, const std::string& tag);
+    int64_t save(const std::string& description);  // 何も touch していなければ 0
+private:
+    Db& db_;
+    std::string before_;  // JSON の配列の中身
+    std::set<std::pair<int64_t, std::string>> seen_;
+};
+// 最後のタグの操作を元に戻す（説明を返す）。戻すものが無ければ false
+bool undoLastTagEdit(Db& db, std::string& description);
 
 // 条件を JSON にする / JSON から戻す（スマートフォルダの保存用。知らない項目は無視、無い項目は既定値）
 std::string queryToJson(const SearchQuery& q);

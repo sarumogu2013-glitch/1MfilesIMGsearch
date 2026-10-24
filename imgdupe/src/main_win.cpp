@@ -109,6 +109,7 @@ enum : int {
     IDC_S_YES,
     IDC_S_NO,
     IDC_S_BULK,
+    IDC_S_UNCLASSIFIED,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -171,7 +172,7 @@ struct App {
 
     // 検索の画面
     struct SearchCtl {
-        HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, minW, minKb, maxKb, path, download,
+        HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, unclassified, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
@@ -187,6 +188,7 @@ struct App {
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
+    std::wstring searchNotice;           // 次の検索結果の件数の横に一度だけ出す（「元に戻しました」など）
     int reselect = -1;                   // 次の検索結果で選ぶ項目（タグを確定した後、同じ位置＝次の画像を選ぶ）
 
     // メニューとショートカットキー
@@ -1102,6 +1104,7 @@ SearchQuery searchQueryFromUi() {
     if (auto t = pickerDate(app.s.from, false)) q.takenFrom = *t;
     if (auto t = pickerDate(app.s.to, true)) q.takenTo = *t;
     q.noTaken = Button_GetCheck(app.s.noTaken) == BST_CHECKED;
+    q.unclassified = Button_GetCheck(app.s.unclassified) == BST_CHECKED;
     q.minWidth = _wtoi(editText(app.s.minW).c_str());
     q.minSize = static_cast<int64_t>(_wtoi(editText(app.s.minKb).c_str())) * 1024;
     q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
@@ -1180,7 +1183,9 @@ void onSearched(SearchDone* p) {
                          : withCommas(app.searchTotal) + L" 件" +
                                (app.searchTotal > app.searchIds.size() ? L"（残りを読み込んでいます…）"
                                 : review                              ? L"（迷っている順）"
-                                                                      : L""));
+                                                                      : L"") +
+                               (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
+    app.searchNotice.clear();
     showSearchInfo(-1);
     if (app.reselect >= 0 && !app.searchIds.empty()) {
         const int item = std::min(app.reselect, static_cast<int>(app.searchIds.size()) - 1);
@@ -1275,6 +1280,7 @@ void clearSearchConditions() {
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
     Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
+    Button_SetCheck(app.s.unclassified, BST_UNCHECKED);
     Button_SetCheck(app.s.review, BST_UNCHECKED);
     app.uncheckedSources.clear();
     refreshSources();
@@ -1427,6 +1433,7 @@ void applyQueryToUi(const SearchQuery& q) {
     setDate(app.s.from, q.takenFrom);
     setDate(app.s.to, q.takenTo);
     Button_SetCheck(app.s.noTaken, q.noTaken ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.unclassified, q.unclassified ? BST_CHECKED : BST_UNCHECKED);
     auto setNum = [](HWND h, int64_t n) { SetWindowTextW(h, n > 0 ? std::to_wstring(n).c_str() : L""); };
     setNum(app.s.minW, q.minWidth);
     setNum(app.s.minKb, q.minSize / 1024);
@@ -1795,13 +1802,16 @@ std::vector<int> selectedResults() {
 }
 
 // 選んだ画像のタグを書き換えて、検索し直す（同じ位置の画像を選び直す）
+// edit(db, 画像 ID, history) は、タグを変える前に history.touch(画像 ID, タグ) を呼ぶ（取り消せるように）
 template <typename F>
-void editSelectedTags(const std::vector<int>& items, F&& edit) {
+void editSelectedTags(const std::vector<int>& items, const std::string& description, F&& edit) {
     Db* db = uiDb();
     if (!db || items.empty()) return;
     try {
         db->begin();
-        for (int i : items) edit(*db, app.searchIds[i]);
+        TagHistory history(*db);
+        for (int i : items) edit(*db, app.searchIds[i], history);
+        history.save(description);
         db->commit();
     } catch (const std::exception& e) {
         try {
@@ -1827,7 +1837,11 @@ void markSelected(bool correct) {
     const std::vector<int> items = selectedResults();
     if (items.empty()) return;
     const std::string tag = tags[0];
-    editSelectedTags(items, [&](Db& db, int64_t id) { setManualTag(db, id, tag, correct); });
+    const std::string desc = std::to_string(items.size()) + " 枚の " + tag + " を「" + (correct ? "正しい" : "違う") + "」に";
+    editSelectedTags(items, desc, [&](Db& db, int64_t id, TagHistory& h) {
+        h.touch(id, tag);
+        setManualTag(db, id, tag, correct);
+    });
 }
 
 void bulkTagUi() {
@@ -1843,10 +1857,44 @@ void bulkTagUi() {
     std::vector<std::string> add, remove;
     parseTagQuery(narrow(*input), add, remove);
     if (add.empty() && remove.empty()) return;
-    editSelectedTags(items, [&](Db& db, int64_t id) {
-        for (const auto& t : add) setManualTag(db, id, t, true);
-        for (const auto& t : remove) setManualTag(db, id, t, false);
-    });
+    editSelectedTags(items, std::to_string(items.size()) + " 枚に「" + narrow(trimmed(*input)) + "」",
+                     [&](Db& db, int64_t id, TagHistory& h) {
+                         for (const auto& t : add) {
+                             h.touch(id, t);
+                             setManualTag(db, id, t, true);
+                         }
+                         for (const auto& t : remove) {
+                             h.touch(id, t);
+                             setManualTag(db, id, t, false);
+                         }
+                     });
+}
+
+void undoTagEdit() {
+    Db* db = uiDb();
+    if (!db) return;
+    std::string desc;
+    bool done = false;
+    try {
+        db->begin();
+        done = undoLastTagEdit(*db, desc);
+        db->commit();
+    } catch (const std::exception& e) {
+        try {
+            db->rollback();
+        } catch (const std::exception&) {
+        }
+        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    if (!done) {
+        MessageBoxW(app.hwnd, L"元に戻せるタグの操作はありません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    app.searchNotice = L"元に戻しました: " + widen(desc);
+    app.reselect = std::max(0, ListView_GetNextItem(app.s.results, -1, LVNI_FOCUSED));
+    refreshSources();
+    scheduleSearch(10);
 }
 
 void layout();
@@ -1917,7 +1965,8 @@ void layoutSearch(int y, int W, int bottom) {
     label(cy + px(4), x + dw + px(4), px(16));
     MoveWindow(app.s.to, x + panelW - dw, cy, dw, rowH, TRUE);
     cy += rowH + px(2);
-    MoveWindow(app.s.noTaken, x, cy, panelW, rowH, TRUE);
+    MoveWindow(app.s.noTaken, x, cy, half, rowH, TRUE);
+    MoveWindow(app.s.unclassified, x + half + gap, cy, half, rowH, TRUE);
     cy += rowH + gap;
     // 幅・ファイルサイズ
     label(cy, x, px(90));
@@ -2012,8 +2061,9 @@ void createSearchControls() {
     app.s.to = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_TO);
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
-    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日の無い画像（EXIF なし）だけ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
-    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken});
+    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日なし（EXIF なし）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
+    app.s.unclassified = makeControl(WC_BUTTONW, L"未分類（タグなし）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_UNCLASSIFIED);
+    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken, app.s.unclassified});
     label(L"幅（px）以上");
     label(L"ファイルサイズ（KB）");
     app.s.minW = edit(IDC_S_MINW, ES_NUMBER);
@@ -2128,7 +2178,7 @@ bool onSearchCommand(WPARAM wp) {
         case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_SORT:
             if (code == CBN_SELCHANGE) scheduleSearch(30);
             return true;
-        case IDC_S_NOTAKEN: case IDC_S_DESC:
+        case IDC_S_NOTAKEN: case IDC_S_DESC: case IDC_S_UNCLASSIFIED:
             scheduleSearch(30);
             return true;
         case IDC_S_CLEAR:
@@ -2559,7 +2609,7 @@ void appendMainMenus(HMENU root) {
     popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
-    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG});
+    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
     popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
@@ -2817,6 +2867,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case CMD_BULK_TAG:
                     if (app.tab == 1) bulkTagUi();
+                    break;
+                case CMD_UNDO:
+                    if (app.tab != 1) switchTab(1);
+                    undoTagEdit();
                     break;
                 case CMD_REVIEW:
                     if (app.tab != 1) switchTab(1);
