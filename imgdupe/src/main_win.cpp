@@ -43,9 +43,13 @@ namespace {
 
 constexpr UINT WM_APP_DONE = WM_APP + 1;   // lParam: Outcome*
 constexpr UINT WM_APP_THUMB = WM_APP + 2;  // lParam: ThumbResult*
-constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: 自動の確認なら 1, lParam: upd::CheckResult*
-constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // lParam: upd::DownloadResult*
+constexpr UINT WM_APP_CHECKED = WM_APP + 3;     // wParam: CheckMode, lParam: upd::CheckResult*
+constexpr UINT WM_APP_DOWNLOADED = WM_APP + 4;  // wParam: CheckMode, lParam: upd::DownloadResult*
 constexpr UINT_PTR kProgressTimer = 1;
+constexpr UINT_PTR kExitTimer = 2;
+constexpr UINT kExitCheckTimeoutMs = 20000;  // 終了時の確認を待つのはここまで
+
+enum CheckMode : WPARAM { kManual = 0, kOnExit = 1 };
 
 enum : int {
     IDC_FOLDERS = 100,
@@ -116,7 +120,7 @@ struct App {
 
     // アップデート
     bool updating = false;                   // 確認・ダウンロード中
-    std::unique_ptr<imgdupe::ReleaseInfo> pendingUpdate;  // 検索中に見つかった新しい版（検索が終わったら聞く）
+    bool closing = false;                    // 終了時のアップデート確認中（ウィンドウは隠してある）
 
     // 結果
     Result result;
@@ -643,8 +647,6 @@ void onDone(Outcome* out) {
         SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     }
     setRunning(false);
-    // 検索中に見つかった新しい版は、結果を出してから聞く
-    if (app.pendingUpdate) PostMessageW(app.hwnd, WM_APP_CHECKED, 2, 0);
     if (!o->error.empty()) {
         setText(app.status, o->error);
         MessageBoxW(app.hwnd, o->error.c_str(), L"imgdupe", MB_ICONWARNING);
@@ -670,50 +672,57 @@ std::wstring today() {
     return buf;
 }
 
-void startCheck(bool automatic) {
+void startCheck(CheckMode mode) {
     if (app.updating) return;
     app.updating = true;
     tbEnable(ID_CHECK_UPDATE, false);
-    if (automatic) iniSet(L"lastUpdateCheck", today());
     HWND hwnd = app.hwnd;
-    std::thread([hwnd, automatic] {
+    std::thread([hwnd, mode] {
         auto* r = new upd::CheckResult(upd::checkLatest());
-        if (!PostMessageW(hwnd, WM_APP_CHECKED, automatic ? 1 : 0, reinterpret_cast<LPARAM>(r))) delete r;
+        if (!PostMessageW(hwnd, WM_APP_CHECKED, mode, reinterpret_cast<LPARAM>(r))) delete r;
     }).detach();
 }
 
-void startDownload(const imgdupe::ReleaseInfo& info) {
+void startDownload(CheckMode mode, const imgdupe::ReleaseInfo& info) {
     app.updating = true;
     tbEnable(ID_CHECK_UPDATE, false);
     setText(app.status, L"新しい版 " + widen(info.tag) + L" をダウンロードしています…");
     HWND hwnd = app.hwnd;
-    std::thread([hwnd, info] {
+    std::thread([hwnd, mode, info] {
         auto* r = new upd::DownloadResult(upd::downloadAndReplace(info));
-        if (!PostMessageW(hwnd, WM_APP_DOWNLOADED, 0, reinterpret_cast<LPARAM>(r))) delete r;
+        if (!PostMessageW(hwnd, WM_APP_DOWNLOADED, mode, reinterpret_cast<LPARAM>(r))) delete r;
     }).detach();
 }
 
-void askUpdate(const imgdupe::ReleaseInfo& info) {
-    const std::wstring text = L"新しい版があります。\r\n\r\n新しい版: " + widen(info.tag) + L"\r\n今の版: " +
-                              widen(IMGDUPE_VERSION) +
-                              L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます）";
-    if (MessageBoxW(app.hwnd, text.c_str(), L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION) == IDYES)
-        startDownload(info);
+// 終了する時、その日初めてならアップデートを確認する（imgdupe.ini の autoUpdateCheck=0 で止められる）
+bool shouldCheckOnExit() {
+    wchar_t last[32];
+    GetPrivateProfileStringW(L"imgdupe", L"lastUpdateCheck", L"", last, 32, iniPath().c_str());
+    return iniInt(L"autoUpdateCheck", 1) && today() != last && std::string(IMGDUPE_VERSION) != "dev";
 }
 
-void onChecked(bool automatic, const upd::CheckResult& r) {
+void onChecked(CheckMode mode, const upd::CheckResult& r) {
     app.updating = false;
     tbEnable(ID_CHECK_UPDATE, true);
     const std::wstring err = r.error();
     const auto cmp = err.empty() ? compareVersion(IMGDUPE_VERSION, r.info.tag) : VersionCompare::Latest;
-    if (automatic) {
-        // 自動の確認では、新しい版がある時だけ知らせる（検索中なら終わってから）
-        if (!err.empty() || cmp != VersionCompare::RemoteNewer) return;
-        if (app.running) app.pendingUpdate = std::make_unique<imgdupe::ReleaseInfo>(r.info);
-        else askUpdate(r.info);
+    const std::wstring cur = widen(IMGDUPE_VERSION);
+    const std::wstring versions = L"新しい版: " + widen(r.info.tag) + L"\r\n今の版: " + cur;
+    if (mode == kOnExit) {
+        // 新しい版がある時だけ聞く。確認できなかった時は何も言わずに終わる
+        KillTimer(app.hwnd, kExitTimer);
+        if (err.empty() && cmp == VersionCompare::RemoteNewer &&
+            MessageBoxW(nullptr,
+                        (L"新しい版があります。\r\n\r\n" + versions +
+                         L"\r\n\r\n終了する前に更新しますか？\r\n（次に起動した時から新しい版になります。設定とキャッシュはそのまま使えます）")
+                            .c_str(),
+                        L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES) {
+            startDownload(kOnExit, r.info);
+            return;
+        }
+        DestroyWindow(app.hwnd);
         return;
     }
-    const std::wstring cur = widen(IMGDUPE_VERSION);
     if (!err.empty()) {
         MessageBoxW(app.hwnd, (L"アップデートを確認できませんでした。\r\n\r\n" + err + L"\r\n\r\n今の版: " + cur).c_str(),
                     L"imgdupe のアップデート", MB_ICONWARNING);
@@ -725,12 +734,24 @@ void onChecked(bool automatic, const upd::CheckResult& r) {
                     L"imgdupe のアップデート", MB_ICONINFORMATION);
         return;
     }
-    askUpdate(r.info);
+    if (MessageBoxW(app.hwnd,
+                    (L"新しい版があります。\r\n\r\n" + versions +
+                     L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます）")
+                        .c_str(),
+                    L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION) == IDYES)
+        startDownload(kManual, r.info);
 }
 
-void onDownloaded(const upd::DownloadResult& r) {
+void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
     app.updating = false;
     tbEnable(ID_CHECK_UPDATE, true);
+    if (mode == kOnExit) {
+        if (!r.ok)
+            MessageBoxW(nullptr, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
+                        MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        DestroyWindow(app.hwnd);
+        return;
+    }
     if (!r.ok) {
         setText(app.status, L"更新できませんでした");
         MessageBoxW(app.hwnd, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
@@ -1172,7 +1193,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (app.running)
                         MessageBoxW(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
                     else
-                        startCheck(false);
+                        startCheck(kManual);
                     break;
                 case ID_HELP: showHelp(); break;
                 case ID_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
@@ -1191,25 +1212,24 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return onNotify(reinterpret_cast<NMHDR*>(lp));
         case WM_TIMER:
             if (wp == kProgressTimer) updateProgress();
+            if (wp == kExitTimer) DestroyWindow(hwnd);  // 確認に時間がかかりすぎたら、そのまま終わる
             return 0;
         case WM_APP_DONE:
+            if (app.closing) {  // 終了しようとして中止した検索
+                delete reinterpret_cast<Outcome*>(lp);
+                if (app.worker.joinable()) app.worker.join();
+                return 0;
+            }
             onDone(reinterpret_cast<Outcome*>(lp));
             return 0;
-        case WM_APP_CHECKED:
-            if (wp == 2) {  // 検索が終わった後で、待っていたアップデートを聞く
-                if (app.pendingUpdate && !app.running) {
-                    const imgdupe::ReleaseInfo info = *app.pendingUpdate;
-                    app.pendingUpdate.reset();
-                    askUpdate(info);
-                }
-            } else {
-                std::unique_ptr<upd::CheckResult> r(reinterpret_cast<upd::CheckResult*>(lp));
-                onChecked(wp == 1, *r);
-            }
+        case WM_APP_CHECKED: {
+            std::unique_ptr<upd::CheckResult> r(reinterpret_cast<upd::CheckResult*>(lp));
+            onChecked(static_cast<CheckMode>(wp), *r);
             return 0;
+        }
         case WM_APP_DOWNLOADED: {
             std::unique_ptr<upd::DownloadResult> r(reinterpret_cast<upd::DownloadResult*>(lp));
-            onDownloaded(*r);
+            onDownloaded(static_cast<CheckMode>(wp), *r);
             return 0;
         }
         case WM_APP_THUMB: {
@@ -1228,6 +1248,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CLOSE:
+            if (app.closing) return 0;
             if (app.updating) {
                 MessageBoxW(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
                 return 0;
@@ -1237,6 +1258,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
             saveSettings();
+            if (shouldCheckOnExit()) {
+                // その日初めての終了: ウィンドウを隠して、裏でアップデートを確認してから終わる
+                app.closing = true;
+                app.cancel = true;
+                iniSet(L"lastUpdateCheck", today());
+                ShowWindow(hwnd, SW_HIDE);
+                startCheck(kOnExit);
+                SetTimer(hwnd, kExitTimer, kExitCheckTimeoutMs, nullptr);
+                return 0;
+            }
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
@@ -1418,10 +1449,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     app.thumbThread = std::thread(thumbLoop);
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
-    // 1 日 1 回、裏でアップデートを確認する（imgdupe.ini の autoUpdateCheck=0 で止められる）
-    wchar_t last[32];
-    GetPrivateProfileStringW(L"imgdupe", L"lastUpdateCheck", L"", last, 32, iniPath().c_str());
-    if (iniInt(L"autoUpdateCheck", 1) && today() != last && std::string(IMGDUPE_VERSION) != "dev") startCheck(true);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
