@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: ['imgdupe/**', 'README.md', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 版の番号は既存のタグから決めるので、リリースは 1 つずつ順に作る
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 既存のタグからパッチ番号を決めるため
+      - name: 版を決める
+        run: |
+          # VERSION（例: 1.0）と同じメジャー.マイナーのタグのうち、最大のパッチ + 1。無ければ 0
+          BASE=$(tr -d ' \r\n' < imgdupe/VERSION)
+          LAST=$(git tag -l "v$BASE.*" | sed "s/^v$BASE\.//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+          TAG="v$BASE.$(( ${LAST:--1} + 1 ))"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "版: $TAG"
+      - name: MinGW-w64 を入れる
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
+      - name: テスト
+        run: imgdupe/build.sh test
+      - name: ビルド
+        run: IMGDUPE_VERSION="$TAG" imgdupe/build.sh
+      - name: zip にまとめる
+        run: |
+          mkdir -p dist/imgdupe
+          cp imgdupe/out/imgdupe.exe README.md dist/imgdupe/
+          (cd dist && zip -r -X ../imgdupe.zip imgdupe)
+      - name: リリースを作成
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp imgdupe/out/imgdupe.exe imgdupe.exe
+          gh release create "$TAG" imgdupe.zip imgdupe.exe --target "$GITHUB_SHA" \
+            --title "imgdupe $TAG" \
+            --notes "imgdupe.zip: exe と README.md の一式。
+          imgdupe.exe: 実行ファイル単体（上書きして更新する時用）。"

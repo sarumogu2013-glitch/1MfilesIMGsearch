@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: MinGW-w64 を入れる
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
+      - name: テスト
+        run: imgdupe/build.sh test
+      - name: ビルド
+        run: imgdupe/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imgdupe-exe
+          path: imgdupe/out/imgdupe.exe

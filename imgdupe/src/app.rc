@@ -1,0 +1,6 @@
+// 文字列は実行時に設定する（rc は ASCII のまま保つ）
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
