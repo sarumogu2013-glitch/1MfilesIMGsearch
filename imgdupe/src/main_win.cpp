@@ -1178,9 +1178,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case ID_ABOUT:
                     MessageBoxW(hwnd,
-                                (L"imgdupe " + widen(IMGDUPE_VERSION) +
-                                 L"\r\n見た目が同じ画像を探すツール（画像は読むだけで、変更しません）\r\n\r\n設定とキャッシュ: " +
-                                 app.dataDir)
+                                (L"imgdupe " + widen(IMGDUPE_VERSION) + L"\r\n重複画像検索\r\n\r\n"
+                                 L"github.com/" APP_REPOSITORY L"\r\n\r\n"
+                                 L"設定・キャッシュ: " + app.dataDir)
                                     .c_str(),
                                 L"バージョン情報", MB_ICONINFORMATION);
                     break;
