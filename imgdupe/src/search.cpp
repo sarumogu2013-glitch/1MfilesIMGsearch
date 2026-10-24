@@ -1,7 +1,11 @@
 #include "search.hpp"
 
+#include "json.hpp"
+
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
 #include <set>
 #include <variant>
 
@@ -86,6 +90,10 @@ SearchResult search(Db& db, const SearchQuery& q) {
         if (!q.sources.empty()) {
             sql += " AND (manual=1 OR source IN (" + placeholders(q.sources.size()) + "))";
             for (const auto& s : q.sources) params.emplace_back(s);
+        }
+        if (!q.excludeSources.empty()) {
+            sql += " AND (manual=1 OR source NOT IN (" + placeholders(q.excludeSources.size()) + "))";
+            for (const auto& s : q.excludeSources) params.emplace_back(s);
         }
         sql += " GROUP BY image_id HAVING conf >= ?)";
         params.emplace_back(q.minConfidence);
@@ -225,6 +233,152 @@ bool imageInfo(Db& db, int64_t id, ImageInfo& out) {
     out.title = st.text(7);
     out.format = st.text(8);
     return true;
+}
+
+namespace {
+
+const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence"};
+
+void putList(std::string& out, const char* key, const std::vector<std::string>& v) {
+    if (v.empty()) return;
+    out += ",\"";
+    out += key;
+    out += "\":[";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += ",";
+        jsonString(out, v[i]);
+    }
+    out += "]";
+}
+void putText(std::string& out, const char* key, const std::string& v) {
+    if (v.empty()) return;
+    out += ",\"";
+    out += key;
+    out += "\":";
+    jsonString(out, v);
+}
+void putInt(std::string& out, const char* key, int64_t v, int64_t unset = 0) {
+    if (v != unset) out += ",\"" + std::string(key) + "\":" + std::to_string(v);
+}
+void putBool(std::string& out, const char* key, bool v) {
+    if (v) out += ",\"" + std::string(key) + "\":true";
+}
+
+}  // namespace
+
+std::string queryToJson(const SearchQuery& q) {
+    std::string out = "{\"version\":1";
+    putList(out, "tags", q.tags);
+    putList(out, "excludeTags", q.excludeTags);
+    char conf[32];
+    snprintf(conf, sizeof conf, "%.4g", q.minConfidence);
+    out += ",\"minConfidence\":" + std::string(conf);
+    putList(out, "sources", q.sources);
+    putList(out, "excludeSources", q.excludeSources);
+    putText(out, "text", q.text);
+    putInt(out, "minRating", q.minRating, -1);
+    putBool(out, "noRating", q.noRating);
+    putInt(out, "takenFrom", q.takenFrom);
+    putInt(out, "takenTo", q.takenTo);
+    putBool(out, "noTaken", q.noTaken);
+    putInt(out, "minWidth", q.minWidth);
+    putInt(out, "minHeight", q.minHeight);
+    putInt(out, "minSize", q.minSize);
+    putInt(out, "maxSize", q.maxSize);
+    putText(out, "format", q.format);
+    putBool(out, "animatedOnly", q.animatedOnly);
+    putText(out, "path", q.pathContains);
+    putText(out, "download", q.downloadContains);
+    out += ",\"sort\":\"" + std::string(kSortNames[static_cast<int>(q.sort)]) + "\"";
+    putBool(out, "descending", q.descending);
+    out += "}";
+    return out;
+}
+
+bool queryFromJson(const std::string& json, SearchQuery& out) {
+    Json j;
+    if (!parseJson(json, j) || j.type != Json::Object) return false;
+    SearchQuery q;
+    auto list = [&](const char* key, std::vector<std::string>& v) {
+        if (const Json* a = j.get(key); a && a->type == Json::Array)
+            for (const Json& e : a->arr)
+                if (e.type == Json::String) v.push_back(e.str);
+    };
+    auto num = [&](const char* key, auto& v) {
+        if (const Json* n = j.get(key); n && n->type == Json::Number)
+            v = static_cast<std::remove_reference_t<decltype(v)>>(std::strtod(n->str.c_str(), nullptr));
+    };
+    auto flag = [&](const char* key, bool& v) {
+        if (const Json* b = j.get(key); b && b->type == Json::Bool) v = b->str == "true";
+    };
+    list("tags", q.tags);
+    list("excludeTags", q.excludeTags);
+    num("minConfidence", q.minConfidence);
+    list("sources", q.sources);
+    list("excludeSources", q.excludeSources);
+    q.text = j.getString("text");
+    num("minRating", q.minRating);
+    flag("noRating", q.noRating);
+    num("takenFrom", q.takenFrom);
+    num("takenTo", q.takenTo);
+    flag("noTaken", q.noTaken);
+    num("minWidth", q.minWidth);
+    num("minHeight", q.minHeight);
+    num("minSize", q.minSize);
+    num("maxSize", q.maxSize);
+    q.format = j.getString("format");
+    flag("animatedOnly", q.animatedOnly);
+    q.pathContains = j.getString("path");
+    q.downloadContains = j.getString("download");
+    const std::string sort = j.getString("sort");
+    for (size_t i = 0; i < std::size(kSortNames); ++i)
+        if (sort == kSortNames[i]) q.sort = static_cast<SortKey>(i);
+    flag("descending", q.descending);
+    out = std::move(q);
+    return true;
+}
+
+std::vector<SmartFolder> smartFolders(Db& db) {
+    std::vector<SmartFolder> out;
+    Stmt st(db.handle(), "SELECT id, name, query FROM smart_folders ORDER BY name COLLATE NOCASE");
+    while (st.step()) {
+        SmartFolder f;
+        f.id = st.i64(0);
+        f.name = st.text(1);
+        queryFromJson(st.text(2), f.query);
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+int64_t saveSmartFolder(Db& db, const std::string& name, const SearchQuery& q) {
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    Stmt st(db.handle(),
+            "INSERT INTO smart_folders(name, query, created, updated) VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET query=excluded.query, updated=excluded.updated");
+    st.bind(1, name).bind(2, queryToJson(q)).bind(3, now).bind(4, now);
+    st.step();
+    Stmt id(db.handle(), "SELECT id FROM smart_folders WHERE name=?");
+    id.bind(1, name);
+    return id.step() ? id.i64(0) : 0;
+}
+
+bool renameSmartFolder(Db& db, int64_t id, const std::string& name) {
+    {
+        Stmt st(db.handle(), "SELECT 1 FROM smart_folders WHERE name=? AND id<>?");
+        st.bind(1, name).bind(2, id);
+        if (st.step()) return false;
+    }
+    Stmt st(db.handle(), "UPDATE smart_folders SET name=?, updated=? WHERE id=?");
+    st.bind(1, name).bind(2, static_cast<int64_t>(std::time(nullptr))).bind(3, id);
+    st.step();
+    return true;
+}
+
+void deleteSmartFolder(Db& db, int64_t id) {
+    Stmt st(db.handle(), "DELETE FROM smart_folders WHERE id=?");
+    st.bind(1, id);
+    st.step();
 }
 
 std::vector<std::pair<std::string, int64_t>> tagSources(Db& db) {

@@ -99,6 +99,9 @@ enum : int {
     IDC_S_COUNT,
     IDC_S_RESULTS,
     IDC_S_LABEL,
+    IDC_S_SMART,
+    IDC_S_SMART_SAVE,
+    IDC_S_SMART_DELETE,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -162,7 +165,7 @@ struct App {
     // 検索の画面
     struct SearchCtl {
         HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, minW, minKb, maxKb, path, download,
-            sort, desc, clear, count, results;
+            sort, desc, clear, count, results, smart, smartSave, smartDelete;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
     std::vector<HWND> searchPage;
@@ -175,6 +178,7 @@ struct App {
     std::vector<std::string> sourceNames;    // 出どころの一覧の並び
     std::set<std::string> uncheckedSources;  // 外した出どころ
     bool fillingSources = false;
+    std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
 
     // メニューとショートカットキー
     HMENU menuBar = nullptr;
@@ -984,6 +988,11 @@ HWND makeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, D
 void addColumn(HWND lv, int i, const wchar_t* title, int width, int fmt = LVCFMT_LEFT);
 void copyOut(LVITEMW& item, const std::wstring& s);
 
+void applyQueryToUi(const SearchQuery& q);
+void saveSmartFolderUi();
+void deleteSmartFolderUi();
+void refreshSmartFolders(const std::wstring& select);
+
 struct SearchDone {
     unsigned gen;
     SearchResult result;
@@ -1058,10 +1067,7 @@ SearchQuery searchQueryFromUi() {
     SearchQuery q;
     parseTagQuery(narrow(editText(app.s.tags)), q.tags, q.excludeTags);
     q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
-    if (!app.uncheckedSources.empty())
-        for (const auto& n : app.sourceNames)
-            if (!app.uncheckedSources.count(n)) q.sources.push_back(n);
-    if (!app.uncheckedSources.empty() && q.sources.empty()) q.sources.push_back("\x01");  // すべて外した = 何も出さない
+    q.excludeSources.assign(app.uncheckedSources.begin(), app.uncheckedSources.end());
     q.text = narrow(editText(app.s.text));
     const int rating = ComboBox_GetCurSel(app.s.rating);  // 0: 指定なし、1〜5: ★n 以上、6: 星なし
     if (rating >= 1 && rating <= 5) q.minRating = rating;
@@ -1242,7 +1248,209 @@ void clearSearchConditions() {
     Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
     app.uncheckedSources.clear();
     refreshSources();
+    ComboBox_SetCurSel(app.s.smart, 0);
+    EnableWindow(app.s.smartDelete, FALSE);
     scheduleSearch(10);
+}
+
+// 1 行の文字を入力してもらう（キャンセルなら nullopt）
+std::optional<std::wstring> promptText(const std::wstring& title, const std::wstring& message, const std::wstring& initial) {
+    struct State {
+        HWND edit = nullptr;
+        std::optional<std::wstring> result;
+        bool done = false;
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == IDOK) {
+                    st->result = editText(st->edit);
+                    st->done = true;
+                } else if (LOWORD(wp) == IDCANCEL) {
+                    st->done = true;
+                }
+                return 0;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupePrompt";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(380), h = px(150);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupePrompt", title.c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd,
+                               nullptr, app.inst, nullptr);
+    if (!dlg) return std::nullopt;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cw, int ch,
+                     DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cw, ch, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int m = px(12);
+    child(WC_STATICW, message.c_str(), SS_NOPREFIX, -1, m, m, w - 2 * m, px(20));
+    st.edit = child(WC_EDITW, initial.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 100, m, m + px(26), w - 2 * m, px(24),
+                    WS_EX_CLIENTEDGE);
+    child(WC_BUTTONW, L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, w - m - px(180), h - m - px(28), px(86), px(28));
+    child(WC_BUTTONW, L"キャンセル", WS_TABSTOP, IDCANCEL, w - m - px(86), h - m - px(28), px(86), px(28));
+    SendMessageW(st.edit, EM_SETSEL, 0, -1);
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(st.edit);
+    MSG msg;
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(dlg, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    SetActiveWindow(app.hwnd);
+    return st.result;
+}
+
+// スマートフォルダの一覧を DB から作り直す（select の名前があれば選ぶ）
+void refreshSmartFolders(const std::wstring& select) {
+    std::wstring cur = select;
+    if (cur.empty()) {
+        const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+        if (i >= 0 && i < static_cast<int>(app.smartList.size())) cur = widen(app.smartList[i].name);
+    }
+    app.smartList.clear();
+    if (Db* db = uiDb()) {
+        try {
+            app.smartList = smartFolders(*db);
+        } catch (const std::exception&) {
+        }
+    }
+    ComboBox_ResetContent(app.s.smart);
+    ComboBox_AddString(app.s.smart, app.smartList.empty() ? L"（まだありません）" : L"（選ぶと条件を読み込みます）");
+    int sel = 0;
+    for (size_t i = 0; i < app.smartList.size(); ++i) {
+        const std::wstring name = widen(app.smartList[i].name);
+        ComboBox_AddString(app.s.smart, name.c_str());
+        if (!cur.empty() && name == cur) sel = static_cast<int>(i) + 1;
+    }
+    ComboBox_SetCurSel(app.s.smart, sel);
+    EnableWindow(app.s.smartDelete, sel > 0);
+}
+
+// 保存した条件を画面に戻す（画面に無い項目は使わない）
+void applyQueryToUi(const SearchQuery& q) {
+    std::wstring tags;
+    for (const auto& t : q.tags) tags += (tags.empty() ? L"" : L" ") + widen(t);
+    for (const auto& t : q.excludeTags) tags += (tags.empty() ? L"-" : L" -") + widen(t);
+    SetWindowTextW(app.s.tags, tags.c_str());
+    const int conf = std::clamp(static_cast<int>(q.minConfidence * 100 + 0.5), 0, 100);
+    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, conf);
+    wchar_t v[16];
+    swprintf(v, 16, L"%.2f", conf / 100.0);
+    setText(app.s.confValue, v);
+    app.uncheckedSources.clear();
+    for (const auto& n : q.excludeSources) app.uncheckedSources.insert(n);
+    if (!q.sources.empty())
+        for (const auto& n : app.sourceNames)
+            if (std::find(q.sources.begin(), q.sources.end(), n) == q.sources.end()) app.uncheckedSources.insert(n);
+    refreshSources();
+    SetWindowTextW(app.s.text, widen(q.text).c_str());
+    ComboBox_SetCurSel(app.s.rating, q.noRating ? 6 : q.minRating >= 1 && q.minRating <= 5 ? q.minRating : 0);
+    int format = 0;
+    if (q.animatedOnly) format = ComboBox_FindStringExact(app.s.format, -1, L"アニメーション");
+    else if (!q.format.empty()) format = ComboBox_FindStringExact(app.s.format, -1, widen(q.format).c_str());
+    ComboBox_SetCurSel(app.s.format, std::max(0, format));
+    auto setDate = [](HWND h, int64_t t) {
+        if (!t) {
+            DateTime_SetSystemtime(h, GDT_NONE, nullptr);
+            return;
+        }
+        int y, mo, d, hh, mi, ss;
+        unixToCivil(t, y, mo, d, hh, mi, ss);
+        SYSTEMTIME st{};
+        st.wYear = static_cast<WORD>(y);
+        st.wMonth = static_cast<WORD>(mo);
+        st.wDay = static_cast<WORD>(d);
+        DateTime_SetSystemtime(h, GDT_VALID, &st);
+    };
+    setDate(app.s.from, q.takenFrom);
+    setDate(app.s.to, q.takenTo);
+    Button_SetCheck(app.s.noTaken, q.noTaken ? BST_CHECKED : BST_UNCHECKED);
+    auto setNum = [](HWND h, int64_t n) { SetWindowTextW(h, n > 0 ? std::to_wstring(n).c_str() : L""); };
+    setNum(app.s.minW, q.minWidth);
+    setNum(app.s.minKb, q.minSize / 1024);
+    setNum(app.s.maxKb, q.maxSize / 1024);
+    SetWindowTextW(app.s.path, widen(q.pathContains).c_str());
+    SetWindowTextW(app.s.download, widen(q.downloadContains).c_str());
+    static const SortKey sorts[] = {SortKey::Path,      SortKey::Modified, SortKey::Created, SortKey::Taken, SortKey::Resolution,
+                                    SortKey::Size,      SortKey::Rating,   SortKey::Title,   SortKey::Confidence};
+    for (size_t i = 0; i < std::size(sorts); ++i)
+        if (sorts[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
+    Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
+    scheduleSearch(10);
+}
+
+void saveSmartFolderUi() {
+    Db* db = uiDb();
+    if (!db) return;
+    const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+    const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"";
+    auto name = promptText(L"スマートフォルダに保存", L"名前（今の検索条件を保存します）", initial);
+    if (!name) return;
+    while (!name->empty() && iswspace(name->back())) name->pop_back();
+    while (!name->empty() && iswspace(name->front())) name->erase(name->begin());
+    if (name->empty()) return;
+    const std::string n = narrow(*name);
+    for (const auto& f : app.smartList) {
+        if (_wcsicmp(widen(f.name).c_str(), name->c_str()) == 0 &&
+            MessageBoxW(app.hwnd, (L"「" + *name + L"」の条件を今の条件で置き換えますか？").c_str(), L"imgdupe",
+                        MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+            return;
+    }
+    try {
+        saveSmartFolder(*db, n, searchQueryFromUi());
+    } catch (const std::exception& e) {
+        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    refreshSmartFolders(*name);
+}
+
+void deleteSmartFolderUi() {
+    Db* db = uiDb();
+    const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+    if (!db || i < 0 || i >= static_cast<int>(app.smartList.size())) return;
+    const std::wstring name = widen(app.smartList[i].name);
+    if (MessageBoxW(app.hwnd, (L"スマートフォルダ「" + name + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
+                    MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    try {
+        deleteSmartFolder(*db, app.smartList[i].id);
+    } catch (const std::exception&) {
+    }
+    ComboBox_SetCurSel(app.s.smart, 0);
+    refreshSmartFolders(L"");
 }
 
 void layout();
@@ -1255,6 +1463,7 @@ void switchTab(int t) {
     layout();
     if (t == 1) {
         refreshSources();
+        refreshSmartFolders(L"");
         if (!app.searchShown) {
             app.searchShown = true;
             scheduleSearch(10);
@@ -1279,6 +1488,14 @@ void layoutSearch(int y, int W, int bottom) {
         MoveWindow(h, x, cy, panelW, height, TRUE);
         cy += height + gap;
     };
+    // スマートフォルダ
+    label(cy, x, panelW);
+    cy += labelH + px(2);
+    const int bw = px(56);
+    MoveWindow(app.s.smart, x, cy, panelW - 2 * (bw + px(4)), px(300), TRUE);
+    MoveWindow(app.s.smartSave, x + panelW - 2 * bw - px(4), cy, bw, rowH, TRUE);
+    MoveWindow(app.s.smartDelete, x + panelW - bw, cy, bw, rowH, TRUE);
+    cy += rowH + gap;
     full(app.s.tags, rowH);
     // 確度
     label(cy, x, panelW);
@@ -1286,7 +1503,7 @@ void layoutSearch(int y, int W, int bottom) {
     MoveWindow(app.s.conf, x, cy, panelW - px(50), rowH + px(4), TRUE);
     MoveWindow(app.s.confValue, x + panelW - px(46), cy + px(4), px(46), labelH, TRUE);
     cy += rowH + px(4) + gap;
-    full(app.s.sources, px(96));
+    full(app.s.sources, px(72));
     full(app.s.text, rowH);
     // 星・形式
     const int half = (panelW - gap) / 2;
@@ -1315,19 +1532,24 @@ void layoutSearch(int y, int W, int bottom) {
     label(cy + px(4), x + px(184), px(16));
     MoveWindow(app.s.maxKb, x + px(204), cy, px(80), rowH, TRUE);
     cy += rowH + gap;
-    full(app.s.path, rowH);
-    full(app.s.download, rowH);
+    // パス・ダウンロード元
+    label(cy, x, half);
+    label(cy, x + half + gap, half);
+    cy += labelH + px(2);
+    MoveWindow(app.s.path, x, cy, half, rowH, TRUE);
+    MoveWindow(app.s.download, x + half + gap, cy, half, rowH, TRUE);
+    cy += rowH + gap;
     // 並べ替え
     label(cy, x, panelW);
     cy += labelH + px(2);
     MoveWindow(app.s.sort, x, cy, panelW - px(80), px(300), TRUE);
     MoveWindow(app.s.desc, x + panelW - px(72), cy, px(72), rowH, TRUE);
-    cy += rowH + gap;
-    MoveWindow(app.s.clear, x, cy, px(140), px(28), TRUE);
 
-    const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m);
-    MoveWindow(app.s.count, rx, y, rw, labelH, TRUE);
-    MoveWindow(app.s.results, rx, y + labelH + px(4), rw, std::max(0, bottom - y - labelH - px(4)), TRUE);
+    // 右: 件数・条件をクリア・結果
+    const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m), cw = px(110), top = rowH + px(4);
+    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, rw - cw - gap), labelH, TRUE);
+    MoveWindow(app.s.clear, rx + rw - cw, y, cw, rowH, TRUE);
+    MoveWindow(app.s.results, rx, y + top, rw, std::max(0, bottom - y - top), TRUE);
 }
 
 void createSearchControls() {
@@ -1349,6 +1571,11 @@ void createSearchControls() {
         return h;
     };
     // 見出しの順は layoutSearch で並べる順と同じ
+    label(L"スマートフォルダ（保存した条件）");
+    app.s.smart = combo(IDC_S_SMART, {});
+    app.s.smartSave = makeControl(WC_BUTTONW, L"保存…", WS_TABSTOP, IDC_S_SMART_SAVE);
+    app.s.smartDelete = makeControl(WC_BUTTONW, L"削除", WS_TABSTOP, IDC_S_SMART_DELETE);
+    app.searchPage.insert(app.searchPage.end(), {app.s.smartSave, app.s.smartDelete});
     label(L"タグ（空白で区切る。-タグ で除外）");
     app.s.tags = edit(IDC_S_TAGS);
     label(L"確度（右へ動かすほど確実なものだけ）");
@@ -1384,9 +1611,9 @@ void createSearchControls() {
     label(L"〜");
     app.s.minKb = edit(IDC_S_MINKB, ES_NUMBER);
     app.s.maxKb = edit(IDC_S_MAXKB, ES_NUMBER);
-    label(L"パス（フォルダ名・ファイル名の一部）");
+    label(L"パス（一部）");
+    label(L"ダウンロード元（URL）");
     app.s.path = edit(IDC_S_PATH);
-    label(L"ダウンロード元（URL の一部。pixiv など）");
     app.s.download = edit(IDC_S_DOWNLOAD);
     label(L"並べ替え");
     app.s.sort = combo(IDC_S_SORT, {L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ", L"星",
@@ -1491,6 +1718,20 @@ bool onSearchCommand(WPARAM wp) {
             return true;
         case IDC_S_CLEAR:
             clearSearchConditions();
+            return true;
+        case IDC_S_SMART:
+            // 開いた一覧の中で動かしている間は読み込まない（選び終えた時か、閉じたままキーで変えた時）
+            if (code == CBN_SELENDOK || (code == CBN_SELCHANGE && !ComboBox_GetDroppedState(app.s.smart))) {
+                const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+                if (i >= 0 && i < static_cast<int>(app.smartList.size())) applyQueryToUi(app.smartList[i].query);
+                EnableWindow(app.s.smartDelete, i >= 0);
+            }
+            return true;
+        case IDC_S_SMART_SAVE:
+            saveSmartFolderUi();
+            return true;
+        case IDC_S_SMART_DELETE:
+            deleteSmartFolderUi();
             return true;
     }
     return false;
@@ -1887,7 +2128,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH});
+    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"その他(&O)", {CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_RELEASES});
@@ -1974,6 +2215,9 @@ bool handleShortcut(const MSG& msg) {
     // 文字の入力欄では、文字・カーソル移動・コピーなどのキーはそのまま入力欄に渡す
     wchar_t cls[32] = L"";
     GetClassNameW(msg.hwnd, cls, 32);
+    // 開いているドロップダウンのキー（Enter で選ぶ、Esc で閉じるなど）は奪わない
+    if (lstrcmpiW(cls, L"ComboLBox") == 0 || (lstrcmpiW(cls, L"ComboBox") == 0 && ComboBox_GetDroppedState(msg.hwnd)))
+        return false;
     if (lstrcmpiW(cls, L"Edit") == 0 && !(mods & KMOD_ALT) && !(vk >= VK_F1 && vk <= VK_F24)) {
         const bool ctrlLetter = (mods & KMOD_CTRL) && vk >= 'A' && vk <= 'Z' && !wcschr(L"ACVXYZ", static_cast<wchar_t>(vk));
         if (!ctrlLetter) return false;
@@ -2122,6 +2366,14 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
                 case CMD_TAB_DUPES: switchTab(0); break;
                 case CMD_TAB_SEARCH: switchTab(1); break;
+                case CMD_SAVE_SMART:
+                    if (app.tab != 1) switchTab(1);
+                    saveSmartFolderUi();
+                    break;
+                case CMD_DELETE_SMART:
+                    if (app.tab != 1) switchTab(1);
+                    deleteSmartFolderUi();
+                    break;
                 case CMD_INDEXER_TOGGLE:
                     saveSettings();  // 調べるフォルダを DB に書いてから
                     if (indexer::isRunning()) {

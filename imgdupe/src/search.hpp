@@ -18,6 +18,7 @@ struct SearchQuery {
     std::vector<std::string> excludeTags;
     double minConfidence = 0.5;          // 確度スライダー（0〜1）
     std::vector<std::string> sources;    // 使う出どころ（空 = すべて）。確度はこの出どころだけで合成する
+    std::vector<std::string> excludeSources;  // 使わない出どころ（後から増えた出どころは使う）
     // タイトル・件名・コメント・キーワード・PNG のテキストの部分一致
     std::string text;
     // メタデータ（0 / -1 / 空 = 条件なし）
@@ -56,6 +57,22 @@ struct ImageInfo {
     std::string title, format;
 };
 bool imageInfo(Db& db, int64_t id, ImageInfo& out);
+
+// 条件を JSON にする / JSON から戻す（スマートフォルダの保存用。知らない項目は無視、無い項目は既定値）
+std::string queryToJson(const SearchQuery& q);
+bool queryFromJson(const std::string& json, SearchQuery& q);
+
+// スマートフォルダ（検索条件に名前を付けて DB に保存したもの。中身は毎回 DB に問い合わせるので常に最新）
+struct SmartFolder {
+    int64_t id = 0;
+    std::string name;
+    SearchQuery query;
+};
+std::vector<SmartFolder> smartFolders(Db& db);  // 名前順
+// 同じ名前（大文字小文字は区別しない）があれば条件を上書きする。保存した ID を返す
+int64_t saveSmartFolder(Db& db, const std::string& name, const SearchQuery& q);
+bool renameSmartFolder(Db& db, int64_t id, const std::string& name);  // 同じ名前が別にあれば false
+void deleteSmartFolder(Db& db, int64_t id);
 
 // 出どころの一覧（タグの数の多い順）
 std::vector<std::pair<std::string, int64_t>> tagSources(Db& db);

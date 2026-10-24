@@ -192,6 +192,17 @@ CREATE INDEX IF NOT EXISTS file_meta_created ON file_meta(created);
 CREATE INDEX IF NOT EXISTS tag_dict_alias ON tag_dict(alias_of COLLATE NOCASE);
 )SQL";
 
+// 版 5: スマートフォルダ（検索条件の保存。query は SearchQuery の JSON）
+const char* const kSchemaV5 = R"SQL(
+CREATE TABLE IF NOT EXISTS smart_folders(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    query TEXT NOT NULL,
+    created INTEGER,
+    updated INTEGER
+);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -320,7 +331,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i)
         if (!exec(steps[i])) {

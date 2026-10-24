@@ -922,6 +922,9 @@ static void testSearch() {
     q.sources = {"tagger"};
     CHECK((ids(q) == V{a}));                    // 出どころを絞ると b は 0.5
     q.sources.clear();
+    q.excludeSources = {"folder"};
+    CHECK((ids(q) == V{a}));                    // 除外でも同じ
+    q.excludeSources.clear();
     q.minConfidence = 0.2;
     CHECK((ids(q) == V{a, b, c}));              // 大文字小文字は区別しない
     q.tags = {"初音ミク"};
@@ -977,6 +980,58 @@ static void testSearch() {
     m.sort = SortKey::Rating;
     m.descending = true;
     CHECK((ids(m) == V{a, c, b, d}));  // 星なしは最後（パス順）
+
+    // 条件の JSON（スマートフォルダ）
+    SearchQuery full;
+    full.tags = {"初音ミク", "say \"hi\""};
+    full.excludeTags = {"1boy"};
+    full.minConfidence = 0.35;
+    full.excludeSources = {"tagger"};
+    full.text = "夏\n空";
+    full.minRating = 0;
+    full.noRating = true;
+    full.takenFrom = 1714500000;
+    full.takenTo = 1714600000;
+    full.noTaken = true;
+    full.minWidth = 3000;
+    full.minHeight = 2000;
+    full.minSize = 150;
+    full.maxSize = 5000000000LL;
+    full.format = "PNG";
+    full.animatedOnly = true;
+    full.pathContains = "\\p\\";
+    full.downloadContains = "pixiv";
+    full.sort = SortKey::Taken;
+    full.descending = true;
+    SearchQuery back;
+    CHECK(queryFromJson(queryToJson(full), back));
+    CHECK(back.tags == full.tags && back.excludeTags == full.excludeTags && back.excludeSources == full.excludeSources);
+    CHECK(std::abs(back.minConfidence - 0.35) < 1e-9 && back.text == full.text && back.minRating == 0 && back.noRating);
+    CHECK(back.takenFrom == full.takenFrom && back.takenTo == full.takenTo && back.noTaken && back.minWidth == 3000);
+    CHECK(back.minHeight == 2000 && back.minSize == 150 && back.maxSize == 5000000000LL && back.format == "PNG");
+    CHECK(back.animatedOnly && back.pathContains == full.pathContains && back.downloadContains == "pixiv");
+    CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0);
+    SearchQuery def;
+    CHECK(queryFromJson(queryToJson(SearchQuery{}), def) && def.minRating == -1 && def.minConfidence == 0.5 &&
+          def.sort == SortKey::Path && !def.descending);
+    CHECK(!queryFromJson("[1]", def) && !queryFromJson("{", def));
+
+    SearchQuery miku;
+    miku.tags = {"hatsune_miku"};
+    miku.minConfidence = 0.7;
+    const int64_t s1 = saveSmartFolder(db, "ミク", miku);
+    const int64_t s2 = saveSmartFolder(db, "png", m);
+    CHECK(s1 && s2 && s1 != s2);
+    miku.minConfidence = 0.2;
+    CHECK(saveSmartFolder(db, "ミク", miku) == s1);  // 同じ名前は上書き
+    auto folders = smartFolders(db);
+    CHECK(folders.size() == 2 && folders[0].name == "png" && folders[1].name == "ミク");
+    CHECK((ids(folders[1].query) == V{a, b, c}));      // 保存した条件で、今の DB を探す
+    CHECK(saveSmartFolder(db, "PNG", m) == s2);          // 大文字小文字は区別しない
+    CHECK(!renameSmartFolder(db, s1, "Png") && renameSmartFolder(db, s1, "初音ミク"));
+    deleteSmartFolder(db, s2);
+    folders = smartFolders(db);
+    CHECK(folders.size() == 1 && folders[0].name == "初音ミク" && folders[0].id == s1);
 
     ImageInfo info;
     CHECK(imageInfo(db, a, info) && info.path == "/p/a.jpg" && info.rating == 5 && info.title == "夏の空と海");
