@@ -22,6 +22,7 @@
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "links.hpp"
+#include "clip_win.hpp"
 #include "tagger_win.hpp"
 #include "resource.h"
 #include "win_util.hpp"
@@ -181,6 +182,17 @@ void runOnce(const std::vector<std::wstring>& roots) {
         }
         return r.analyzer;
     };
+    cb.clipVersion = [] { return clip::stageVersion(g->dataDir); };
+    cb.prepareClip = [](Db& db) { clip::prepare(g->dataDir, db); };
+    cb.makeClip = [&cb](std::string& error) {
+        clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
+        error = narrow(r.error);
+        if (r.analyzer) {
+            std::lock_guard<std::mutex> lock(g->m);
+            g->taggerDevice = r.device;
+        }
+        return r.analyzer;
+    };
 
     // 見張り: 一時停止・終了・控えるべき状態になったら、すぐ止める（続きは次の回）
     std::atomic<bool> done{false};
@@ -299,6 +311,10 @@ std::wstring statusText() {
                 break;
             case IndexPhase::Meta:
                 swprintf(t, 128, L"メタデータ %llu / %llu", static_cast<unsigned long long>(done),
+                         static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Clip:
+                swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
                 break;
             case IndexPhase::Tagger:

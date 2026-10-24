@@ -38,6 +38,10 @@ struct SearchQuery {
     // 確認キュー: 1 つ目のタグをまだ手動で確定していない画像のうち、確度が kReviewMax 未満のものを、
     // 迷っている順（確度が 0.5 に近い順）に並べる（sort は使わない）
     bool review = false;
+    // 内容（CLIP）: 言葉で探す / この画像に似た画像。どちらかがあれば、似ている順に並べる（sort は使わない）。
+    // SQL では扱わない（rankByVector で、ほかの条件に合う画像を似ている順にする）
+    std::string clipText;
+    int64_t similarTo = 0;
     // 並べ替え
     SortKey sort = SortKey::Path;
     bool descending = false;
@@ -84,6 +88,9 @@ private:
 };
 // 最後のタグの操作を元に戻す（説明を返す）。戻すものが無ければ false
 bool undoLastTagEdit(Db& db, std::string& description);
+
+// 条件（並べ替え・件数・CLIP 以外）が 1 つでもあるか
+bool hasConditions(const SearchQuery& q);
 
 // 条件を JSON にする / JSON から戻す（スマートフォルダの保存用。知らない項目は無視、無い項目は既定値）
 std::string queryToJson(const SearchQuery& q);

@@ -354,6 +354,13 @@ bool undoLastTagEdit(Db& db, std::string& description) {
     return true;
 }
 
+bool hasConditions(const SearchQuery& q) {
+    return !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
+           q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
+           q.minSize > 0 || q.maxSize > 0 || !q.format.empty() || q.animatedOnly || q.unclassified || !q.pathContains.empty() ||
+           !q.downloadContains.empty();
+}
+
 namespace {
 
 const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence"};
@@ -410,6 +417,8 @@ std::string queryToJson(const SearchQuery& q) {
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
     putBool(out, "review", q.review);
+    putText(out, "clipText", q.clipText);
+    putInt(out, "similarTo", q.similarTo);
     out += ",\"sort\":\"" + std::string(kSortNames[static_cast<int>(q.sort)]) + "\"";
     putBool(out, "descending", q.descending);
     out += "}";
@@ -457,6 +466,8 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
         if (sort == kSortNames[i]) q.sort = static_cast<SortKey>(i);
     flag("descending", q.descending);
     flag("review", q.review);
+    q.clipText = j.getString("clipText");
+    if (const Json* n = j.get("similarTo"); n && n->type == Json::Number) q.similarTo = std::strtoll(n->str.c_str(), nullptr, 10);
     out = std::move(q);
     return true;
 }

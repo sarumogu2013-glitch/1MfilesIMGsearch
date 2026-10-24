@@ -19,6 +19,7 @@
 #include "models.hpp"
 #include "tagger.hpp"
 #include "vectors.hpp"
+#include "clip.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1459,6 +1460,115 @@ static void testVectors() {
     fs::remove_all(dir);
 }
 
+static void testClip() {
+    WordPiece wp;
+    CHECK(wp.load("[PAD]\n[UNK]\n[CLS]\n[SEP]\n夕\n焼\nけ\n##の\n写\n真\nsun\n##set\n,\nphoto\n"));
+    using V = std::vector<std::string>;
+    // 漢字は 1 文字ずつ、かなは続けて WordPiece、記号は分ける
+    CHECK((wp.tokens("夕焼けの写真") == V{"夕", "焼", "け", "##の", "写", "真"}));
+    CHECK((wp.tokens(" sunset,photo\t") == V{"sun", "##set", ",", "photo"}));
+    CHECK((wp.tokens("Sunset xyz") == V{"[UNK]", "[UNK]"}));  // 大文字小文字はそのまま
+    CHECK((wp.encode("夕焼け") == std::vector<int64_t>{2, 4, 5, 6, 3}));
+    CHECK(wp.encode("夕 夕 夕 夕 夕", 4).size() == 4);  // [CLS] 夕 夕 [SEP]
+
+    // safetensors の Dense（2×3）
+    std::string st;
+    const std::string header = R"({"linear.weight":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}})";
+    const uint64_t hl = header.size();
+    st.append(reinterpret_cast<const char*>(&hl), 8);
+    st += header;
+    const float wts[6] = {1, 0, 0, 0, 2, 1};
+    st.append(reinterpret_cast<const char*>(wts), 24);
+    DenseLayer d;
+    CHECK(d.load(st) && d.out == 2 && d.in == 3);
+    const float x[3] = {3, 4, 5};
+    const auto y = d.apply(x);
+    CHECK(y.size() == 2 && y[0] == 3 && y[1] == 13);
+    CHECK(!d.load("short"));
+
+    const float tok[6] = {1, 2, 3, 4, 100, 100};  // 3 単語 × 2 次元、最後は mask で使わない
+    const auto mp = meanPool(tok, 3, 2, {1, 1, 0});
+    CHECK(mp.size() == 2 && mp[0] == 2 && mp[1] == 3);
+
+    // 前処理: 4×2 の画像（左半分 赤、右半分 白）→ 2×2。短い辺（2）に合わせ、中央の 2×2 を切り抜く
+    std::vector<uint8_t> px(4 * 2 * 4, 255);
+    for (int y2 = 0; y2 < 2; ++y2)
+        for (int x2 = 0; x2 < 2; ++x2) {
+            uint8_t* p = &px[(y2 * 4 + x2) * 4];
+            p[0] = 0, p[1] = 0, p[2] = 255;  // BGR = 赤
+        }
+    std::vector<float> in(3 * 2 * 2);
+    prepareClipInput(px.data(), 4, 2, 2, in.data());
+    const float r1 = (1.f - 0.48145466f) / 0.26862954f, g0 = (0.f - 0.4578275f) / 0.26130258f, g1 = (1.f - 0.4578275f) / 0.26130258f;
+    CHECK(std::abs(in[0] - r1) < 1e-4);              // R の面、左上（赤の列）
+    CHECK(std::abs(in[4 + 0] - g0) < 1e-4);          // G の面、左上は赤なので 0
+    CHECK(std::abs(in[4 + 1] - g1) < 1e-4);          // G の面、右上は白
+    CHECK(clipStageVersion("a") != clipStageVersion("b") && clipStageVersion("a") > 0);
+
+    // 段階 clip: ベクトルがファイルに入る
+    struct Fake : ClipModel {
+        int imageSide() const override { return 4; }
+        size_t dim() const override { return 3; }
+        bool encodeImage(const std::vector<float>& p, std::vector<float>& out, std::string&) override {
+            out = {p[0], 1.f, 0.f};
+            return true;
+        }
+        bool encodeText(const std::string&, std::vector<float>& out, std::string&) override {
+            out = {0, 1, 0};
+            return true;
+        }
+    };
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-clip-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{"/a.png", 1, 1}, {"/b.png", 1, 2}});
+    auto writer = std::make_shared<VectorWriter>();
+    CHECK(writer->open((dir / "v.bin").string(), 3, "m1"));
+    ClipAnalyzer ca(std::make_shared<Fake>(), writer, clipStageVersion("m1"),
+                    [](const std::string& path, int box, std::vector<uint8_t>& bgra, int& w, int& h) {
+                        w = h = box;
+                        bgra.assign(static_cast<size_t>(box) * box * 4, path == "/a.png" ? 255 : 0);
+                        if (path != "/a.png")
+                            for (size_t i = 3; i < bgra.size(); i += 4) bgra[i] = 255;  // 黒
+                        return true;
+                    });
+    std::atomic<bool> cancel{false};
+    CHECK(runStage(db, ca, 2, cancel).processed == 2);
+    writer->close();
+    VectorIndex idx;
+    CHECK(idx.load((dir / "v.bin").string()) && idx.size() == 2 && idx.has(id["/a.png"]) && idx.has(id["/b.png"]));
+    std::vector<float> va, vb;
+    idx.get(id["/a.png"], va);
+    idx.get(id["/b.png"], vb);
+    CHECK(va[0] > 0.5f && vb[0] < 0 && std::abs(va[0] * va[0] + va[1] * va[1] + va[2] * va[2] - 1) < 1e-2);  // 長さ 1
+    // 似ている順（ほかの条件で絞る）
+    {
+        Stmt st(db.handle(), "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,'x','general',0.9,'tagger',0)");
+        st.bind(1, id["/b.png"]);
+        st.step();
+    }
+    const float qa[3] = {1, 0, 0};
+    SearchQuery none;
+    RankResult rr = rankByVector(db, none, idx, qa, 10);
+    CHECK(rr.total == 2 && rr.ids.size() == 2 && rr.ids[0] == id["/a.png"] && rr.scores[0] > rr.scores[1]);
+    SearchQuery withTag;
+    withTag.tags = {"x"};
+    rr = rankByVector(db, withTag, idx, qa, 10);
+    CHECK(rr.total == 1 && rr.ids == std::vector<int64_t>{id["/b.png"]});
+    rr = rankByVector(db, none, idx, qa, 10, id["/a.png"]);  // 似た画像を探す時は、元の画像を除く
+    CHECK(rr.ids == std::vector<int64_t>{id["/b.png"]});
+    CHECK(!hasConditions(none) && hasConditions(withTag));
+    SearchQuery js;
+    js.clipText = "夕焼けの海";
+    js.similarTo = 42;
+    SearchQuery jb;
+    CHECK(queryFromJson(queryToJson(js), jb) && jb.clipText == "夕焼けの海" && jb.similarTo == 42);
+    idx.close();
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1497,6 +1607,7 @@ int main() {
     testModels();
     testTagger();
     testVectors();
+    testClip();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

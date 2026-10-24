@@ -22,6 +22,19 @@
         "revision": "main",
         "files": {"model.onnx": "wd14/model.onnx", "selected_tags.csv": "wd14/selected_tags.csv"}
       }
+    },
+    {
+      "id": "clip",
+      "name": "CLIP（似た画像・言葉で探す。日本語も可）",
+      "description": "画像の内容をベクトルにして、似た画像や「夕焼けの海」などの言葉で探せるようにする",
+      "requires": ["onnxruntime"],
+      "huggingface": [
+        {"repo": "Xenova/clip-vit-base-patch32", "revision": "main",
+         "files": {"onnx/vision_model.onnx": "clip/vision_model.onnx"}},
+        {"repo": "sentence-transformers/clip-ViT-B-32-multilingual-v1", "revision": "main",
+         "files": {"onnx/model_quint8_avx2.onnx": "clip/text_model.onnx", "vocab.txt": "clip/vocab.txt",
+                   "2_Dense/model.safetensors": "clip/dense.safetensors"}}
+      ]
     }
   ]
 }

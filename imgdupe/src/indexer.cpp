@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "clip.hpp"
 #include "names.hpp"
 
 namespace imgdupe {
@@ -142,6 +143,24 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             rep.tagged = sr.processed - sr.failed;
             rep.failed += sr.failed;
             rep.cancelled = sr.cancelled;
+        }
+    }
+    if (rep.cancelled) {
+        progress.phase = static_cast<int>(IndexPhase::Done);
+        return rep;
+    }
+    // CLIP（似た画像・言葉での検索のためのベクトル）
+    const int cv = cb.clipVersion ? cb.clipVersion() : 0;
+    if (cv && cb.makeClip) {
+        if (cb.prepareClip) cb.prepareClip(db);
+        if (!pendingImages(db, kStageClip, cv, 1).empty()) {
+            progress.phase = static_cast<int>(IndexPhase::Clip);
+            if (std::shared_ptr<Analyzer> c = cb.makeClip(rep.clipError)) {
+                sr = runStage(db, *c, opt.threads, cancel, &progress.prog);
+                rep.clipped = sr.processed - sr.failed;
+                rep.failed += sr.failed;
+                rep.cancelled = sr.cancelled;
+            }
         }
     }
     progress.phase = static_cast<int>(IndexPhase::Done);

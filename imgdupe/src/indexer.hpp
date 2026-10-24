@@ -37,9 +37,13 @@ struct IndexCallbacks {
     // 段階 tagger（無ければ飛ばす）。版を先に聞き、済んでいない画像がある時だけ makeTagger でモデルを読む
     std::function<int()> taggerVersion;
     std::function<std::shared_ptr<Analyzer>(std::string& error)> makeTagger;
+    // 段階 clip（同じく。prepareClip は版を聞いた後、済んでいない画像を調べる前に呼ぶ）
+    std::function<int()> clipVersion;
+    std::function<void(Db&)> prepareClip;
+    std::function<std::shared_ptr<Analyzer>(std::string& error)> makeClip;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
@@ -47,8 +51,9 @@ struct IndexProgress {
 };
 
 struct IndexReport {
-    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, failed = 0;
+    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, clipped = 0, failed = 0;
     std::string taggerError;  // モデルを読めなかった時の理由
+    std::string clipError;
     bool cancelled = false;
 };
 

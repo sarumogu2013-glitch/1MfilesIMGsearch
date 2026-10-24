@@ -36,6 +36,7 @@
 #include "indexer_win.hpp"
 #include "install_win.hpp"
 #include "keymap_win.hpp"
+#include "clip_win.hpp"
 #include "tagger_win.hpp"
 #include "models_win.hpp"
 #include "resource.h"
@@ -116,6 +117,7 @@ enum : int {
     IDC_S_NO,
     IDC_S_BULK,
     IDC_S_UNCLASSIFIED,
+    IDC_S_CLIP,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -181,7 +183,7 @@ struct App {
 
     // 検索の画面
     struct SearchCtl {
-        HWND tags, conf, confValue, sources, text, rating, format, from, to, noTaken, unclassified, minW, minKb, maxKb, path, download,
+        HWND tags, conf, confValue, sources, text, clip, rating, format, from, to, noTaken, unclassified, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
@@ -197,6 +199,11 @@ struct App {
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
+    int64_t similarTo = 0;               // 「似た画像を探す」の元の画像（0 = 使っていない）
+    std::vector<float> searchScores;     // 内容（CLIP）で探した時の、各画像の似ている度合い
+    std::wstring similarLabel;           // その時に「内容」の欄に出している文字
+    std::mutex clipMutex;
+    std::shared_ptr<ClipModel> clipText;  // 言葉をベクトルにするモデル（最初に使う時に読む）
     std::wstring searchNotice;           // 次の検索結果の件数の横に一度だけ出す（「元に戻しました」など）
     int reselect = -1;                   // 次の検索結果で選ぶ項目（タグを確定した後、同じ位置＝次の画像を選ぶ）
 
@@ -1083,11 +1090,19 @@ std::wstring selectedPath() {
 }
 
 // 画像の右クリックのメニュー
-void imageContextMenu(const std::wstring& path) {
+void findSimilar(int64_t imageId, const std::wstring& name);
+
+// imageId があれば「似た画像を探す」も出す（検索の画面）
+void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
+    constexpr int kSimilar = 0x7f00;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
     AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
     AppendMenuW(menu, MF_STRING, CMD_COPY_PATH, L"パスをコピー(&C)");
+    if (imageId) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kSimilar, L"似た画像を探す(&S)");
+    }
     POINT pt;
     GetCursorPos(&pt);
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
@@ -1095,6 +1110,10 @@ void imageContextMenu(const std::wstring& path) {
     if (cmd == CMD_OPEN) openPath(path);
     if (cmd == CMD_EXPLORER) showPathInExplorer(path);
     if (cmd == CMD_COPY_PATH) copyText(path);
+    if (cmd == kSimilar) {
+        const size_t sep = path.find_last_of(L"\\/");
+        findSimilar(imageId, sep == std::wstring::npos ? path : path.substr(sep + 1));
+    }
 }
 
 void exportResult() {
@@ -1157,6 +1176,8 @@ struct SearchDone {
     SearchResult result;
     std::wstring error;
     bool rest = false;  // 2 回目（先頭の後の残り全部）
+    bool clip = false;  // 内容（CLIP）で似ている順に上位だけ
+    std::vector<float> scores;
 };
 
 constexpr size_t kFirstResults = 2000;  // まず先頭だけ並べて見せる（残りは裏で）
@@ -1228,6 +1249,8 @@ SearchQuery searchQueryFromUi() {
     q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
     q.excludeSources.assign(app.uncheckedSources.begin(), app.uncheckedSources.end());
     q.text = narrow(editText(app.s.text));
+    if (app.similarTo) q.similarTo = app.similarTo;
+    else q.clipText = narrow(editText(app.s.clip));
     const int rating = ComboBox_GetCurSel(app.s.rating);  // 0: 指定なし、1〜5: ★n 以上、6: 星なし
     if (rating >= 1 && rating <= 5) q.minRating = rating;
     if (rating == 6) q.noRating = true;
@@ -1269,16 +1292,47 @@ void runSearch() {
     setText(app.s.count, L"検索中…");
     const std::string db = narrow(dbPath());
     HWND hwnd = app.hwnd;
-    std::thread([q, gen, db, hwnd]() mutable {
+    const std::wstring dataDir = app.dataDir;
+    std::thread([q, gen, db, hwnd, dataDir]() mutable {
         // 1 回目: 先頭だけ（DB は上位だけを並べるので速い）と全部の数。多ければ 2 回目に残りを全部
         auto* done = new SearchDone{gen, {}, L""};
         bool more = false;
         Db d;
         try {
             if (!d.open(db)) throw std::runtime_error(d.error());
-            q.limit = kFirstResults;
-            done->result = search(d, q);
-            more = done->result.total > done->result.ids.size();
+            if (!q.clipText.empty() || q.similarTo) {
+                // 内容（CLIP）: ほかの条件に合う画像を、似ている順に上位だけ
+                done->clip = true;
+                VectorIndex idx;
+                if (!idx.load(narrow(clip::vectorPath(dataDir))))
+                    throw std::runtime_error("CLIP のベクトルがまだありません（AI 解析の部品の CLIP を入れると、バックグラウンドの解析で作ります）");
+                std::vector<float> qv;
+                if (q.similarTo) {
+                    if (!idx.get(q.similarTo, qv)) throw std::runtime_error("この画像の CLIP のベクトルがまだありません（バックグラウンドの解析で作ります）");
+                } else {
+                    std::shared_ptr<ClipModel> model;
+                    {
+                        std::lock_guard<std::mutex> lock(app.clipMutex);
+                        if (!app.clipText) {
+                            std::wstring err;
+                            app.clipText = clip::loadText(dataDir, err);
+                            if (!app.clipText) throw std::runtime_error(narrow(err));
+                        }
+                        model = app.clipText;
+                    }
+                    std::string err;
+                    if (!model->encodeText(q.clipText, qv, err)) throw std::runtime_error("言葉をベクトルにできませんでした: " + err);
+                }
+                if (qv.size() != idx.dim()) throw std::runtime_error("CLIP のモデルとベクトルの次元が合いません");
+                const RankResult rr = rankByVector(d, q, idx, qv.data(), kFirstResults, q.similarTo);
+                done->result.ids = rr.ids;
+                done->result.total = rr.total;
+                done->scores = rr.scores;
+            } else {
+                q.limit = kFirstResults;
+                done->result = search(d, q);
+                more = done->result.total > done->result.ids.size();
+            }
         } catch (const std::exception& e) {
             done->error = widen(e.what());
         }
@@ -1313,15 +1367,19 @@ void onSearched(SearchDone* p) {
     }
     app.searchIds = std::move(done->result.ids);
     app.searchTotal = done->result.total;
+    app.searchScores = std::move(done->scores);
     app.infoCache.clear();
     resetView(kSearchView, static_cast<int>(app.searchIds.size()));
     const bool review = Button_GetCheck(app.s.review) == BST_CHECKED;
-    setText(app.s.count, !app.searchTotal ? (review ? L"確かめる画像はありません" : L"見つかりません")
-                         : withCommas(app.searchTotal) + L" 件" +
-                               (app.searchTotal > app.searchIds.size() ? L"（残りを読み込んでいます…）"
-                                : review                              ? L"（迷っている順）"
-                                                                      : L"") +
-                               (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
+    std::wstring count;
+    if (!app.searchTotal) count = review ? L"確かめる画像はありません" : L"見つかりません";
+    else if (done->clip)
+        count = withCommas(app.searchTotal) + L" 件のうち、" + (app.similarTo ? L"似ている" : L"内容が近い") + L"順に " +
+                withCommas(app.searchIds.size()) + L" 件";
+    else
+        count = withCommas(app.searchTotal) + L" 件" +
+                (app.searchTotal > app.searchIds.size() ? L"（残りを読み込んでいます…）" : review ? L"（迷っている順）" : L"");
+    setText(app.s.count, count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
     app.searchNotice.clear();
     showSearchInfo(-1);
     if (app.reselect >= 0 && !app.searchIds.empty()) {
@@ -1372,6 +1430,11 @@ void showSearchInfo(int item) {
     if (info->rating > 0) line += L"　" + stars(info->rating);
     if (info->taken) line += L"　撮影 " + dateText(info->taken);
     if (!info->title.empty()) line += L"　「" + widen(info->title) + L"」";
+    if (item >= 0 && item < static_cast<int>(app.searchScores.size())) {
+        wchar_t sc[48];
+        swprintf(sc, 48, L"　似ている度合い %.3f", app.searchScores[item]);
+        line += sc;
+    }
     // ファイルに書き込まれているタグ（実体。出どころ embedded）と、DB にだけある検索用のタグを分けて出す。
     // 検索用のタグは、出どころの確度を合成した値（手動で確定したものはその値）
     std::wstring fileTags, tags;
@@ -1414,8 +1477,17 @@ void showSearchInfo(int item) {
     setText(app.info, widen(info->path) + L"\r\n" + line + L"\r\n" + fileTags + L"\r\n" + tags);
 }
 
+// 「似た画像を探す」: 内容の欄をその画像にして探す（ほかの条件はそのまま）
+void findSimilar(int64_t imageId, const std::wstring& name) {
+    app.similarTo = imageId;
+    app.similarLabel = L"似た画像: " + name;
+    SetWindowTextW(app.s.clip, app.similarLabel.c_str());  // EN_CHANGE が来ても同じ文字なので似た画像のまま
+    scheduleSearch(10);
+}
+
 void clearSearchConditions() {
-    for (HWND h : {app.s.tags, app.s.text, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
+    app.similarTo = 0;
+    for (HWND h : {app.s.tags, app.s.text, app.s.clip, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
         SetWindowTextW(h, L"");
     SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
     setText(app.s.confValue, L"0.50");
@@ -1556,6 +1628,19 @@ void applyQueryToUi(const SearchQuery& q) {
             if (std::find(q.sources.begin(), q.sources.end(), n) == q.sources.end()) app.uncheckedSources.insert(n);
     refreshSources();
     SetWindowTextW(app.s.text, widen(q.text).c_str());
+    app.similarTo = 0;
+    if (q.similarTo) {
+        ImageInfo info;
+        Db* db = uiDb();
+        std::wstring name = L"ID " + std::to_wstring(q.similarTo);
+        if (db && imageInfo(*db, q.similarTo, info)) {
+            const std::wstring p = widen(info.path);
+            name = p.substr(p.find_last_of(L"\\/") + 1);
+        }
+        findSimilar(q.similarTo, name);
+    } else {
+        SetWindowTextW(app.s.clip, widen(q.clipText).c_str());
+    }
     ComboBox_SetCurSel(app.s.rating, q.noRating ? 6 : q.minRating >= 1 && q.minRating <= 5 ? q.minRating : 0);
     int format = 0;
     if (q.animatedOnly) format = ComboBox_FindStringExact(app.s.format, -1, L"アニメーション");
@@ -2044,12 +2129,12 @@ void undoTagEdit() {
 // ---------------------------------------------------------------- 設定の画面（imgdupe.ini と同じ内容を画面から変える）
 
 struct SettingsWindow {
-    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, gpu = nullptr, aiStatus = nullptr;
+    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2064,9 +2149,11 @@ void applySettings() {
         }
     }
     const int tagger = Button_GetCheck(w.tagger) == BST_CHECKED ? 1 : 0;
+    const int clipOn = Button_GetCheck(w.clip) == BST_CHECKED ? 1 : 0;
     const int cpu = Button_GetCheck(w.gpu) == BST_CHECKED ? 0 : 1;
-    const bool changed = tagger != iniInt(L"taggerEnabled", 1) || cpu != iniInt(L"taggerCpu", 0);
+    const bool changed = tagger != iniInt(L"taggerEnabled", 1) || clipOn != iniInt(L"clipEnabled", 1) || cpu != iniInt(L"taggerCpu", 0);
     iniSet(L"taggerEnabled", std::to_wstring(tagger));
+    iniSet(L"clipEnabled", std::to_wstring(clipOn));
     iniSet(L"taggerCpu", std::to_wstring(cpu));
     if (changed) restartIndexerAfterUpdate();  // 動いているバックグラウンドの解析に新しい設定を使わせる
 }
@@ -2080,7 +2167,9 @@ void settingsCommand(int id, int code) {
             break;
         case IDCANCEL: w.done = true; break;
         case IDC_ST_TAGGER:
-            if (code == BN_CLICKED) EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED);
+        case IDC_ST_CLIP:
+            if (code == BN_CLICKED)
+                EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED || Button_GetCheck(w.clip) == BST_CHECKED);
             break;
         // 別の画面を開くものは、設定を保存して閉じてから開く
         case IDC_ST_MODELS: applySettings(); w.after = CMD_MODELS; w.done = true; break;
@@ -2117,7 +2206,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(520), ch = px(392), m = px(12);
+    const int cw = px(520), ch = px(416), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2147,13 +2236,15 @@ void showSettingsWindow() {
                          in, gy, iw, rowH);
     gy = group(L"バックグラウンドの解析", px(52));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
-    gy = group(L"AI 解析", px(126));
+    gy = group(L"AI 解析", px(150));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
+    w.clip = child(WC_BUTTONW, L"CLIP で画像の内容を調べる（似た画像を探す・言葉で探す）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_CLIP,
+                   in, gy + rowH + px(2), iw, rowH);
     w.gpu = child(WC_BUTTONW, L"GPU（DirectML）を使う（調子が悪い時は外すと CPU だけで動きます）", WS_TABSTOP | BS_AUTOCHECKBOX,
-                  IDC_ST_GPU, in, gy + rowH + px(2), iw, rowH);
-    w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 2 * (rowH + px(2)) + px(6), iw - px(150), px(36));
-    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 2 * (rowH + px(2)) + px(4), px(140), bh);
+                  IDC_ST_GPU, in, gy + 2 * (rowH + px(2)), iw, rowH);
+    w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 3 * (rowH + px(2)) + px(6), iw - px(150), px(36));
+    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 3 * (rowH + px(2)) + px(4), px(140), bh);
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
@@ -2166,14 +2257,19 @@ void showSettingsWindow() {
     Button_SetCheck(w.autoUpdate, iniInt(L"autoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.clip, iniInt(L"clipEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.gpu, iniInt(L"taggerCpu", 0) ? BST_UNCHECKED : BST_CHECKED);
-    EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED);
+    EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED || Button_GetCheck(w.clip) == BST_CHECKED);
     {
         const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
         auto wd = installed.find("wd14");
-        setText(w.aiStatus, wd != installed.end() && installed.count("onnxruntime")
-                                ? L"WD14 タガーが入っています（版 " + widen(wd->second.version) + L"）"
-                                : L"AI 解析の部品はまだ入っていません");
+        std::wstring status;
+        if (installed.count("onnxruntime")) {
+            if (wd != installed.end()) status += L"WD14 タガー（版 " + widen(wd->second.version) + L"）";
+            if (auto c = installed.find("clip"); c != installed.end())
+                status += (status.empty() ? L"" : L"、") + std::wstring(L"CLIP（版 ") + widen(c->second.version) + L"）";
+        }
+        setText(w.aiStatus, status.empty() ? L"AI 解析の部品はまだ入っていません" : status + L" が入っています");
     }
 
     EnableWindow(app.hwnd, FALSE);
@@ -2248,7 +2344,16 @@ void layoutSearch(int y, int W, int bottom) {
     MoveWindow(app.s.confValue, x + panelW - px(46), cy + px(4), px(46), labelH, TRUE);
     cy += rowH + px(4) + gap;
     full(app.s.sources, px(72));
-    full(app.s.text, rowH);
+    // 文字・内容（AI）
+    {
+        const int hw = (panelW - gap) / 2;
+        label(cy, x, hw);
+        label(cy, x + hw + gap, hw);
+        cy += labelH + px(2);
+        MoveWindow(app.s.text, x, cy, hw, rowH, TRUE);
+        MoveWindow(app.s.clip, x + hw + gap, cy, hw, rowH, TRUE);
+        cy += rowH + gap;
+    }
     // 星・形式
     const int half = (panelW - gap) / 2;
     label(cy, x, half);
@@ -2348,8 +2453,10 @@ void createSearchControls() {
     ListView_SetExtendedListViewStyle(app.s.sources, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
     addColumn(app.s.sources, 0, L"", 270);
     app.searchPage.push_back(app.s.sources);
-    label(L"文字（タイトル・コメント・プロンプトなど）");
+    label(L"文字（タイトルなど）");
+    label(L"内容（AI。夕焼けの海 など）");
     app.s.text = edit(IDC_S_TEXT);
+    app.s.clip = edit(IDC_S_CLIP);
     label(L"星");
     label(L"形式");
     app.s.rating = combo(IDC_S_RATING, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
@@ -2439,7 +2546,7 @@ bool onSearchNotify(NMHDR* nm) {
                 const ImageInfo* info = resultInfo(ia->iItem);
                 if (!info) return true;
                 ListView_SetItemState(app.s.results, ia->iItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-                imageContextMenu(widen(info->path));
+                imageContextMenu(widen(info->path), info->id);
                 return true;
             }
         }
@@ -2471,6 +2578,12 @@ bool onSearchNotify(NMHDR* nm) {
 bool onSearchCommand(WPARAM wp) {
     const int id = LOWORD(wp), code = HIWORD(wp);
     switch (id) {
+        case IDC_S_CLIP:
+            if (code == EN_CHANGE) {
+                if (app.similarTo && editText(app.s.clip) != app.similarLabel) app.similarTo = 0;  // 書き換えたら言葉で探す
+                scheduleSearch(500);  // 言葉のベクトル化は少し重いので、長めに待つ
+            }
+            return true;
         case IDC_S_TAGS: case IDC_S_TEXT: case IDC_S_MINW: case IDC_S_MINKB: case IDC_S_MAXKB: case IDC_S_PATH:
         case IDC_S_DOWNLOAD:
             if (code == EN_CHANGE) scheduleSearch(300);  // 打ち終わるのを少し待つ
@@ -2518,6 +2631,7 @@ bool onSearchCommand(WPARAM wp) {
 void saveSearchSettings() {
     WritePrivateProfileStringW(L"Search", L"tags", editText(app.s.tags).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"text", editText(app.s.text).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"clip", app.similarTo ? L"" : editText(app.s.clip).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"confidence",
                                std::to_wstring(SendMessageW(app.s.conf, TBM_GETPOS, 0, 0)).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"sort", std::to_wstring(ComboBox_GetCurSel(app.s.sort)).c_str(), iniPath().c_str());
@@ -2536,6 +2650,8 @@ void loadSearchSettings() {
     SetWindowTextW(app.s.tags, buf);
     GetPrivateProfileStringW(L"Search", L"text", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.text, buf);
+    GetPrivateProfileStringW(L"Search", L"clip", L"", buf, 4096, iniPath().c_str());
+    SetWindowTextW(app.s.clip, buf);
     const int conf = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"confidence", 50, iniPath().c_str())), 0, 100);
     SendMessageW(app.s.conf, TBM_SETPOS, TRUE, conf);
     wchar_t v[16];
@@ -3443,6 +3559,13 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
         error = narrow(r.error);
         return r.analyzer;
     };
+    cb.clipVersion = [] { return clip::stageVersion(app.dataDir); };
+    cb.prepareClip = [](Db& db) { clip::prepare(app.dataDir, db); };
+    cb.makeClip = [](std::string& error) {
+        clip::LoadResult r = clip::loadAnalyzer(app.dataDir);
+        error = narrow(r.error);
+        return r.analyzer;
+    };
     return cb;
 }
 
@@ -3528,7 +3651,8 @@ int runIndexCli(int argc, wchar_t** argv) {
         con.print(L"画像 " + withCommas(r.files) + L" 枚（追加 " + withCommas(r.added) + L"・削除 " + withCommas(r.removed) +
                   L"）、ハッシュ " + withCommas(r.hashed) + L" 枚、サムネイル " + withCommas(r.thumbs) + L" 枚、メタデータ " +
                   withCommas(r.metas) + L" 枚、json・フォルダ名 " + withCommas(r.names) + L" 枚、タグ付け " +
-                  withCommas(r.tagged) + L" 枚、失敗 " + withCommas(r.failed) + L" 枚");
+                  withCommas(r.tagged) + L" 枚、CLIP " + withCommas(r.clipped) + L" 枚、失敗 " + withCommas(r.failed) + L" 枚");
+        if (!r.clipError.empty()) con.print(L"CLIP を使えませんでした: " + widen(r.clipError));
         if (!r.taggerError.empty()) con.print(L"WD14 タガーを使えませんでした: " + widen(r.taggerError));
     } catch (const std::exception& e) {
         con.print(L"エラー: " + widen(e.what()));

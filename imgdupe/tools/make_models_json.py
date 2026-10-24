@@ -54,10 +54,20 @@ def nuget_component(c, out_dir, repo, tag):
 
 
 def hf_component(c):
-    h = c["huggingface"]
+    # 1 つのリポジトリ（オブジェクト）か、いくつかのリポジトリ（配列）。版はそれぞれのコミットをつなげたもの
+    sources = c["huggingface"] if isinstance(c["huggingface"], list) else [c["huggingface"]]
+    versions, files = [], []
+    for h in sources:
+        v, f = hf_files(h)
+        versions.append(v)
+        files += f
+    return "+".join(versions), files
+
+
+def hf_files(h):
     repo, rev = h["repo"], h.get("revision", "main")
     commit = json.loads(fetch(f"https://huggingface.co/api/models/{repo}/revision/{rev}"))["sha"]
-    tree = json.loads(fetch(f"https://huggingface.co/api/models/{repo}/tree/{commit}"))
+    tree = json.loads(fetch(f"https://huggingface.co/api/models/{repo}/tree/{commit}?recursive=true"))
     by_path = {e["path"]: e for e in tree if e.get("type") == "file"}
     files = []
     for src, dest in h["files"].items():

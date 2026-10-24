@@ -3,14 +3,12 @@
 #include <windows.h>
 
 #include <cstdio>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "image_win.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
-#include "onnxruntime_c_api.h"
+#include "onnx_win.hpp"
 #include "tagger.hpp"
 #include "win_util.hpp"
 
@@ -20,15 +18,6 @@ using winutil::narrow;
 using winutil::widen;
 
 namespace {
-
-using DmlAppend = OrtStatus*(ORT_API_CALL*)(OrtSessionOptions*, int);
-using GetApiBase = const OrtApiBase*(ORT_API_CALL*)();
-
-// GetProcAddress の結果を関数の型にする（いったん汎用の関数ポインタを通す）
-template <typename F>
-F procAddress(HMODULE dll, const char* name) {
-    return reinterpret_cast<F>(reinterpret_cast<void (*)()>(GetProcAddress(dll, name)));
-}
 
 bool readFile(const std::wstring& path, std::string& out) {
     FILE* f = _wfopen(path.c_str(), L"rb");
@@ -43,127 +32,29 @@ bool readFile(const std::wstring& path, std::string& out) {
 
 bool exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-// ONNX Runtime のセッション（C API）
-class OnnxModel : public imgdupe::TaggerModel {
+// WD14 タガーのモデル（入力 [N, 大きさ, 大きさ, 3] の BGR、出力は各タグの確率）
+class OnnxTagger : public imgdupe::TaggerModel {
 public:
-    ~OnnxModel() override {
-        if (!api_) return;
-        if (session_) api_->ReleaseSession(session_);
-        if (memory_) api_->ReleaseMemoryInfo(memory_);
-        if (env_) api_->ReleaseEnv(env_);
-        // dll は外さない（ほかの所がまだ関数を持っているかもしれないので、プロセスの終わりまで置く）
-    }
-
-    // 失敗したら理由を返す
     std::wstring open(const std::wstring& dir, const std::wstring& modelPath, bool useGpu, int cpuThreads) {
-        HMODULE dll = LoadLibraryExW((dir + L"\\onnxruntime.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (!dll) return L"onnxruntime.dll を読み込めません（エラー " + std::to_wstring(GetLastError()) + L"）";
-        auto getBase = procAddress<GetApiBase>(dll, "OrtGetApiBase");
-        if (!getBase) return L"onnxruntime.dll が想定と違います（OrtGetApiBase がありません）";
-        api_ = getBase()->GetApi(ORT_API_VERSION);
-        if (!api_) return L"onnxruntime.dll の版が古すぎます（" + widen(getBase()->GetVersionString()) + L"）";
-        if (auto e = check(api_->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "imgdupe", &env_)); !e.empty()) return e;
-        if (auto e = check(api_->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_)); !e.empty()) return e;
-
-        auto tryOpen = [&](bool gpu, std::wstring& err) -> bool {
-            OrtSessionOptions* opt = nullptr;
-            if (!(err = check(api_->CreateSessionOptions(&opt))).empty()) return false;
-            api_->SetSessionGraphOptimizationLevel(opt, ORT_ENABLE_ALL);
-            if (gpu) {
-                // DirectML は「メモリの使い回しの事前計画なし・順に実行」が条件
-                api_->DisableMemPattern(opt);
-                api_->SetSessionExecutionMode(opt, ORT_SEQUENTIAL);
-                auto append = procAddress<DmlAppend>(dll, "OrtSessionOptionsAppendExecutionProvider_DML");
-                if (!append || !(err = check(append(opt, 0))).empty()) {
-                    if (err.empty()) err = L"DirectML が使えません";
-                    api_->ReleaseSessionOptions(opt);
-                    return false;
-                }
-            } else {
-                api_->SetIntraOpNumThreads(opt, cpuThreads > 0 ? cpuThreads
-                                                               : static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
-            }
-            err = check(api_->CreateSession(env_, modelPath.c_str(), opt, &session_));
-            api_->ReleaseSessionOptions(opt);
-            return err.empty();
-        };
-        std::wstring err;
-        gpu_ = useGpu && tryOpen(true, err);
-        if (!gpu_ && !tryOpen(false, err)) return L"モデルを読み込めません: " + err;
-
-        // 入力と出力の名前、入力の大きさ（[N, 448, 448, 3] の 448）
-        OrtAllocator* alloc = nullptr;
-        api_->GetAllocatorWithDefaultOptions(&alloc);
-        char* name = nullptr;
-        if (!(err = check(api_->SessionGetInputName(session_, 0, alloc, &name))).empty()) return err;
-        inputName_ = name;
-        alloc->Free(alloc, name);
-        if (!(err = check(api_->SessionGetOutputName(session_, 0, alloc, &name))).empty()) return err;
-        outputName_ = name;
-        alloc->Free(alloc, name);
-        OrtTypeInfo* type = nullptr;
-        if (!(err = check(api_->SessionGetInputTypeInfo(session_, 0, &type))).empty()) return err;
-        const OrtTensorTypeAndShapeInfo* tensor = nullptr;
-        api_->CastTypeInfoToTensorInfo(type, &tensor);
-        size_t dims = 0;
-        if (tensor) api_->GetDimensionsCount(tensor, &dims);
-        std::vector<int64_t> shape(dims);
-        if (dims) api_->GetDimensions(tensor, shape.data(), dims);
-        api_->ReleaseTypeInfo(type);
-        if (dims != 4 || shape[3] != 3 || shape[1] != shape[2] || shape[1] <= 0)
+        if (std::wstring e = session_.open(dir, modelPath, useGpu, cpuThreads); !e.empty()) return e;
+        const auto shape = session_.inputShape(0);
+        if (session_.inputNames().empty() || session_.outputNames().empty() || shape.size() != 4 || shape[3] != 3 ||
+            shape[1] != shape[2] || shape[1] <= 0)
             return L"モデルの入力の形が WD14 タガーと違います（[N, 大きさ, 大きさ, 3] のはず）";
         side_ = static_cast<int>(shape[1]);
         return {};
     }
-
     int inputSide() const override { return side_; }
-    bool gpu() const { return gpu_; }
-
+    bool gpu() const { return session_.gpu(); }
     bool run(const std::vector<float>& input, std::vector<float>& probs, std::string& error) override {
-        std::lock_guard<std::mutex> lock(runMutex_);  // DirectML は同時に 1 つずつ。CPU も中で全部のコアを使う
-        const int64_t shape[4] = {1, side_, side_, 3};
-        OrtValue* in = nullptr;
-        OrtValue* out = nullptr;
-        std::wstring err = check(api_->CreateTensorWithDataAsOrtValue(memory_, const_cast<float*>(input.data()),
-                                                                       input.size() * sizeof(float), shape, 4,
-                                                                       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in));
-        if (err.empty()) {
-            const char* inNames[] = {inputName_.c_str()};
-            const char* outNames[] = {outputName_.c_str()};
-            err = check(api_->Run(session_, nullptr, inNames, &in, 1, outNames, 1, &out));
-        }
-        if (err.empty()) {
-            float* data = nullptr;
-            OrtTensorTypeAndShapeInfo* info = nullptr;
-            size_t count = 0;
-            err = check(api_->GetTensorMutableData(out, reinterpret_cast<void**>(&data)));
-            if (err.empty()) err = check(api_->GetTensorTypeAndShape(out, &info));
-            if (err.empty()) err = check(api_->GetTensorShapeElementCount(info, &count));
-            if (info) api_->ReleaseTensorTypeAndShapeInfo(info);
-            if (err.empty()) probs.assign(data, data + count);
-        }
-        if (in) api_->ReleaseValue(in);
-        if (out) api_->ReleaseValue(out);
-        if (!err.empty()) error = narrow(err);
-        return err.empty();
+        std::vector<int64_t> shape;
+        return session_.run({{session_.inputNames()[0], {1, side_, side_, 3}, input.data(), nullptr}}, session_.outputNames()[0],
+                            probs, shape, error);
     }
 
 private:
-    std::wstring check(OrtStatus* st) {
-        if (!st) return {};
-        std::wstring msg = widen(api_->GetErrorMessage(st));
-        api_->ReleaseStatus(st);
-        return msg.empty() ? L"ONNX Runtime のエラー" : msg;
-    }
-
-    const OrtApi* api_ = nullptr;
-    OrtEnv* env_ = nullptr;
-    OrtSession* session_ = nullptr;
-    OrtMemoryInfo* memory_ = nullptr;
-    std::string inputName_, outputName_;
+    onnx::Session session_;
     int side_ = 0;
-    bool gpu_ = false;
-    std::mutex runMutex_;
 };
 
 }  // namespace
@@ -204,7 +95,7 @@ LoadResult load(const std::wstring& dataDir, int cpuThreads, std::function<void(
     wchar_t env[8] = L"";
     const bool cpuOnly = (GetEnvironmentVariableW(L"IMGDUPE_TAGGER_CPU", env, 8) && env[0] == L'1') ||
                          GetPrivateProfileIntW(L"imgdupe", L"taggerCpu", 0, (dataDir + L"\\imgdupe.ini").c_str()) != 0;
-    auto model = std::make_shared<OnnxModel>();
+    auto model = std::make_shared<OnnxTagger>();
     if (std::wstring e = model->open(dir, modelPath, !cpuOnly, cpuThreads); !e.empty()) {
         r.error = e;
         return r;
