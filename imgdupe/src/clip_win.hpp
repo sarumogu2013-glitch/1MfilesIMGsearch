@@ -25,6 +25,12 @@ void updateVariants(const std::wstring& dataDir, imgdupe::Db& db, unsigned threa
                     imgdupe::Progress* progress);
 double variantSimilarity(const std::wstring& dataDir);
 
+// 行動・アイテム辞書（<dataDir>\dictionary.txt。無ければ例を書いて置く）を当てる。
+// force でなければ、辞書・タガーのタグ・CLIP のベクトルが前回から変わっていない時は何もしない。
+// 当てた項目の数を entries に返す。辞書が読めなければその理由を返す（それ以外は空）
+std::wstring applyDictionary(const std::wstring& dataDir, imgdupe::Db& db, bool force, size_t* entries = nullptr);
+std::wstring dictionaryPath(const std::wstring& dataDir);
+
 struct LoadResult {
     std::shared_ptr<imgdupe::Analyzer> analyzer;
     std::wstring device;

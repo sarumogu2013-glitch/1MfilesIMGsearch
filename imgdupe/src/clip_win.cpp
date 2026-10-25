@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "ann.hpp"
+#include "dict.hpp"
 #include "image_win.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
@@ -215,6 +216,57 @@ void updateVariants(const std::wstring& dataDir, imgdupe::Db& db, unsigned threa
     imgdupe::replaceVariantGroups(db, groups);
     db.setSetting("variants:last", key);
     db.setSetting("variants:input", input);
+}
+
+std::wstring dictionaryPath(const std::wstring& dataDir) { return dataDir + L"\\" + widen(imgdupe::kDictionaryFile); }
+
+std::wstring applyDictionary(const std::wstring& dataDir, imgdupe::Db& db, bool force, size_t* count) {
+    const std::wstring path = dictionaryPath(dataDir);
+    std::string text;
+    if (!readFile(path, text)) {
+        text = imgdupe::defaultDictionary();
+        if (FILE* f = _wfopen(path.c_str(), L"wb")) {
+            std::fwrite(text.data(), 1, text.size(), f);
+            std::fclose(f);
+        }
+    }
+    std::vector<imgdupe::DictEntry> entries;
+    std::string error;
+    if (!imgdupe::parseDictionary(text, entries, error)) return L"辞書を読めません（" + widen(error) + L"）";
+    if (count) *count = entries.size();
+    bool anyClip = false;
+    for (const auto& e : entries) anyClip |= !e.clip.empty();
+    // 前回から何も変わっていなければ何もしない（辞書・タガーのタグの数・CLIP のベクトルの数）
+    imgdupe::VectorIndex vecs;
+    const Files f = findFiles(dataDir);
+    const bool haveVecs = anyClip && f.ok && enabled(dataDir) && vecs.load(narrow(vectorPath(dataDir))) && vecs.version() == f.version;
+    int64_t taggerRows = 0;
+    {
+        imgdupe::Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE source='tagger'");
+        if (st.step()) taggerRows = st.i64(0);
+    }
+    const std::string state = imgdupe::dictionaryHash(text) + "|" + std::to_string(taggerRows) + "|" +
+                              std::to_string(haveVecs ? vecs.records() : 0);
+    if (!force && db.setting("dict:state") == state) return {};
+    imgdupe::applyDictionaryTags(db, entries);
+    std::vector<std::vector<std::pair<int64_t, float>>> matches(entries.size());
+    if (haveVecs) {
+        std::wstring err;
+        if (auto model = loadText(dataDir, err)) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                std::vector<std::vector<float>> tvs;
+                for (const auto& sentence : entries[i].clip) {
+                    std::vector<float> v;
+                    std::string e;
+                    if (model->encodeText(sentence, v, e)) tvs.push_back(std::move(v));
+                }
+                if (!tvs.empty()) matches[i] = imgdupe::clipMatches(vecs, tvs, 0.2);
+            }
+        }
+    }
+    imgdupe::replaceClipDictTags(db, entries, matches);
+    db.setSetting("dict:state", state);
+    return {};
 }
 
 LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::function<void()> threadInit, std::function<void()> threadExit) {

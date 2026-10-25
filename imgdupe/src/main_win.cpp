@@ -31,6 +31,7 @@
 #include "commands.hpp"
 #include "core.hpp"
 #include "db.hpp"
+#include "dict.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "indexer_win.hpp"
@@ -1217,7 +1218,7 @@ std::wstring sourceLabel(const std::string& s) {
     static const std::pair<const char*, const wchar_t*> names[] = {
         {"manual", L"手動で確認"}, {"embedded", L"ファイル埋め込み"}, {"meta", L"メタデータ"}, {"id_lookup", L"ID 照会"},
         {"reverse", L"逆画像検索"}, {"folder", L"フォルダ名"}, {"same_folder", L"同じフォルダからの推定"},
-        {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
+        {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"dict", L"辞書"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
     for (const auto& [k, v] : names)
         if (s == k) return v;
     return widen(s);
@@ -2330,6 +2331,173 @@ void showSettingsWindow() {
     if (w.after) PostMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(w.after), 0);
 }
 
+// ---------------------------------------------------------------- 行動・アイテムの辞書の画面
+
+struct DictionaryWindow {
+    HWND wnd = nullptr, edit = nullptr, status = nullptr, save = nullptr;
+    bool done = false, applying = false;
+} dictWin;
+
+constexpr UINT WM_DICT_APPLIED = WM_APP + 50;  // lParam: std::wstring*（結果の文）
+
+std::wstring readTextFile(const std::wstring& path) {
+    std::string text;
+    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+        fclose(f);
+    }
+    if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) text.erase(0, 3);
+    // 編集欄は CRLF
+    std::wstring w = widen(text), out;
+    for (size_t i = 0; i < w.size(); ++i) {
+        if (w[i] == L'\n' && (i == 0 || w[i - 1] != L'\r')) out += L'\r';
+        out += w[i];
+    }
+    return out;
+}
+
+void dictionarySave() {
+    DictionaryWindow& w = dictWin;
+    if (w.applying) return;
+    std::wstring text = editText(w.edit);
+    std::string utf8 = narrow(text);
+    utf8.erase(std::remove(utf8.begin(), utf8.end(), '\r'), utf8.end());
+    std::vector<DictEntry> entries;
+    std::string error;
+    if (!parseDictionary(utf8, entries, error)) {
+        setText(w.status, L"保存できません: " + widen(error));
+        return;
+    }
+    const std::wstring path = clip::dictionaryPath(app.dataDir);
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f || fwrite(utf8.data(), 1, utf8.size(), f) != utf8.size()) {
+        if (f) fclose(f);
+        setText(w.status, L"保存できませんでした: " + path);
+        return;
+    }
+    fclose(f);
+    w.applying = true;
+    EnableWindow(w.save, FALSE);
+    setText(w.status, L"保存しました。すべての画像に当てています…");
+    HWND wnd = w.wnd;
+    const std::wstring dataDir = app.dataDir, db = dbPath();
+    std::thread([wnd, dataDir, db] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::wstring msg;
+        try {
+            Db d;
+            if (!d.open(narrow(db))) throw std::runtime_error(d.error());
+            size_t n = 0;
+            const std::wstring err = clip::applyDictionary(dataDir, d, true, &n);
+            msg = err.empty() ? L"当てました（" + std::to_wstring(n) + L" 項目）。検索の「タグ」で項目の名前を入れると探せます" : err;
+        } catch (const std::exception& e) {
+            msg = L"当てられませんでした: " + widen(e.what());
+        }
+        CoUninitialize();
+        auto* p = new std::wstring(msg);
+        if (!PostMessageW(wnd, WM_DICT_APPLIED, 0, reinterpret_cast<LPARAM>(p))) delete p;
+    }).detach();
+}
+
+void showDictionaryWindow() {
+    DictionaryWindow& w = dictWin;
+    if (w.wnd) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            switch (msg) {
+                case WM_COMMAND:
+                    if (LOWORD(wp) == IDOK) dictionarySave();
+                    else if (LOWORD(wp) == IDCANCEL && !dictWin.applying) dictWin.done = true;
+                    return 0;
+                case WM_CLOSE:
+                    if (!dictWin.applying) dictWin.done = true;
+                    return 0;
+                case WM_DICT_APPLIED: {
+                    std::unique_ptr<std::wstring> m(reinterpret_cast<std::wstring*>(lp));
+                    dictWin.applying = false;
+                    EnableWindow(dictWin.save, TRUE);
+                    setText(dictWin.status, *m);
+                    if (app.tab == 1) {
+                        refreshSources();
+                        scheduleSearch(10);
+                    }
+                    return 0;
+                }
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeDictionary";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int cw = px(640), ch = px(480), m = px(10), bh = px(28);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, cw, ch};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    w = DictionaryWindow{};
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeDictionary", L"行動・アイテムの辞書", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                            app.inst, nullptr);
+    if (!w.wnd) return;
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    child(WC_STATICW,
+          L"WD14 のタグ（wd14:）と CLIP の文章（clip:）を、自分の分類にまとめます。書き方は先頭のコメントを見てください。"
+          L"保存すると、すべての画像に当て直します（数秒〜数十秒）。",
+          SS_NOPREFIX, -1, m, m, cw - 2 * m, px(36));
+    w.edit = child(WC_EDITW, L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                   -1, m, m + px(40), cw - 2 * m, ch - 3 * m - px(40) - bh - px(24), WS_EX_CLIENTEDGE);
+    SendMessageW(w.edit, EM_SETLIMITTEXT, 0, 0);
+    w.status = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, ch - m - bh - px(24), cw - 2 * m, px(20));
+    w.save = child(WC_BUTTONW, L"保存して当てる", WS_TABSTOP, IDOK, cw - m - px(260), ch - m - bh, px(150), bh);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, cw - m - px(100), ch - m - bh, px(100), bh);
+    const std::wstring path = clip::dictionaryPath(app.dataDir);
+    std::wstring text = readTextFile(path);
+    if (text.empty()) {
+        std::string def = defaultDictionary();
+        std::wstring wdef = widen(def), out;
+        for (wchar_t c : wdef) {
+            if (c == L'\n') out += L'\r';
+            out += c;
+        }
+        text = out;
+    }
+    SetWindowTextW(w.edit, text.c_str());
+    setText(w.status, L"場所: " + path);
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(w.wnd, SW_SHOW);
+    SetFocus(w.edit);
+    MSG msg;
+    while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE && !w.applying) {
+            w.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(w.wnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(w.wnd);
+    w.wnd = nullptr;
+    SetActiveWindow(app.hwnd);
+}
+
 void layout();
 
 void switchTab(int t) {
@@ -3068,7 +3236,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -3362,6 +3530,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_SETTINGS: showSettingsWindow(); break;
+                case CMD_DICTIONARY: showDictionaryWindow(); break;
                 case CMD_HELP: showHelp(); break;
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_ABOUT:
@@ -3618,6 +3787,7 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(app.dataDir, db, threads, cancel, p);
     };
+    cb.merge = [](Db& db) { clip::applyDictionary(app.dataDir, db, false); };
     return cb;
 }
 

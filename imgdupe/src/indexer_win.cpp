@@ -187,6 +187,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(g->dataDir, db, threads, cancel, p);
     };
+    cb.merge = [](Db& db) { clip::applyDictionary(g->dataDir, db, false); };
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
         error = narrow(r.error);
@@ -320,6 +321,7 @@ std::wstring statusText() {
                 swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
                 break;
+            case IndexPhase::Merge: swprintf(t, 128, L"辞書を当てています"); break;
             case IndexPhase::Variants:
                 swprintf(t, 128, L"差分グループ %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
                 break;

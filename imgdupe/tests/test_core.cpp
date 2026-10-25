@@ -21,6 +21,7 @@
 #include "vectors.hpp"
 #include "clip.hpp"
 #include "ann.hpp"
+#include "dict.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1666,6 +1667,80 @@ static void testAnn() {
     fs::remove_all(dir);
 }
 
+static void testDict() {
+    std::vector<DictEntry> d;
+    std::string err;
+    CHECK(parseDictionary("\xEF\xBB\xBF# c\n[テニスをしている]\nwd14: tennis_racket, tennis_ball\nclip: \"a person, playing tennis\", テニスをする人\n"
+                          "\n[剣]\n種類: item\nwd14:sword\n",
+                          d, err));
+    CHECK(d.size() == 2 && d[0].name == "テニスをしている" && d[0].kind == "action");
+    CHECK((d[0].wd14 == std::vector<std::string>{"tennis_racket", "tennis_ball"}));
+    CHECK((d[0].clip == std::vector<std::string>{"a person, playing tennis", "テニスをする人"}));
+    CHECK(d[1].kind == "item" && d[1].wd14 == std::vector<std::string>{"sword"});
+    CHECK(!parseDictionary("wd14: a\n", d, err) && err.find("1 行目") == 0);
+    CHECK(!parseDictionary("[a]\nfoo: b\n", d, err) && err.find("2 行目") == 0);
+    CHECK(!parseDictionary("[ ]\n", d, err));
+    CHECK(parseDictionary(defaultDictionary(), d, err) && d.empty());  // 例はコメント
+    CHECK(dictionaryHash("a") != dictionaryHash("b") && dictionaryHash("a").size() == 16);
+    CHECK(std::abs(clipProbability(0.27) - 0.5) < 1e-9 && clipProbability(0.35) > 0.9 && clipProbability(0.2) < 0.1);
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-dict-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{"/a.png", 1, 1}, {"/b.png", 1, 2}, {"/c.png", 1, 3}});
+    auto tag = [&](int64_t img, const std::string& t, double conf) {
+        Stmt st(db.handle(), "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,'general',?,'tagger',0)");
+        st.bind(1, img).bind(2, t).bind(3, conf);
+        st.step();
+    };
+    tag(id["/a.png"], "tennis_racket", 0.6);
+    tag(id["/a.png"], "tennis_ball", 0.8);
+    tag(id["/b.png"], "tennis_ball", 0.3);
+    tag(id["/c.png"], "sword", 0.9);
+    parseDictionary("[テニスをしている]\nwd14: tennis_racket, tennis_ball\n[剣]\n種類: item\nwd14: sword\n", d, err);
+    applyDictionaryTags(db, d);
+    applyDictionaryTags(db, d);  // 何度当てても同じ
+    auto conf = [&](int64_t img, const std::string& t, const char* source) {
+        Stmt st(db.handle(), "SELECT confidence, kind FROM tags WHERE image_id=? AND tag=? AND source=?");
+        st.bind(1, img).bind(2, t).bind(3, std::string(source));
+        return st.step() ? st.f64(0) : -1.0;
+    };
+    CHECK(std::abs(conf(id["/a.png"], "テニスをしている", "dict") - 0.8) < 1e-9);  // 一番高いもの
+    CHECK(std::abs(conf(id["/b.png"], "テニスをしている", "dict") - 0.3) < 1e-9);
+    CHECK(conf(id["/c.png"], "テニスをしている", "dict") < 0 && conf(id["/c.png"], "剣", "dict") > 0.8);
+    // 辞書から消した項目のタグも消える
+    parseDictionary("[剣]\nwd14: sword\n", d, err);
+    applyDictionaryTags(db, d);
+    CHECK(conf(id["/a.png"], "テニスをしている", "dict") < 0 && conf(id["/c.png"], "剣", "dict") > 0.8);
+
+    // clip の行
+    const std::string vpath = (dir / "v.bin").string();
+    {
+        VectorWriter w;
+        CHECK(w.open(vpath, 2, "m"));
+        const float a[2] = {1, 0}, b[2] = {0.6f, 0.8f}, c[2] = {0, 1};
+        w.append(id["/a.png"], a);
+        w.append(id["/b.png"], b);
+        w.append(id["/c.png"], c);
+    }
+    VectorIndex idx;
+    CHECK(idx.load(vpath));
+    // 文章のベクトル (1, 0) → a は 1.0、b は 0.6 → どちらも 0.27 を大きく超える。c は 0
+    auto m = clipMatches(idx, {{1, 0}}, 0.2);
+    CHECK(m.size() == 2 && m[0].first == id["/a.png"] && m[1].first == id["/b.png"] && m[0].second > 0.99f);
+    m = clipMatches(idx, {{1, 0}, {0, 1}}, 0.2);  // 2 つの文章 → どちらかに近ければ
+    CHECK(m.size() == 3);
+    parseDictionary("[外]\nclip: outdoor\n", d, err);
+    replaceClipDictTags(db, d, {m});
+    CHECK(conf(id["/c.png"], "外", "clip") > 0.99 && conf(id["/a.png"], "剣", "dict") < 0);
+    replaceClipDictTags(db, d, {{}});
+    CHECK(conf(id["/c.png"], "外", "clip") < 0);
+    idx.close();
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1706,6 +1781,7 @@ int main() {
     testVectors();
     testClip();
     testAnn();
+    testDict();
     testExifOrientation();
     testUpdateLogic();
     testKeys();
