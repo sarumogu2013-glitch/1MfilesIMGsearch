@@ -43,6 +43,8 @@
 #include "clip_win.hpp"
 #include "lookup_win.hpp"
 #include "stats.hpp"
+#include "explorer_win.hpp"
+#include "sameimg.hpp"
 #include "tagger_win.hpp"
 #include "models_win.hpp"
 #include "resource.h"
@@ -73,6 +75,7 @@ constexpr UINT WM_APP_MODELS_DONE = WM_APP + 9;     // lParam: std::wstring*（�
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
+constexpr UINT_PTR kSameTimer = 4;  // エクスプローラーで画像を選んでから、少し待って同じ画像を探す
 constexpr UINT kExitCheckTimeoutMs = 20000;  // 終了時の確認を待つのはここまで
 
 enum CheckMode : WPARAM { kManual = 0, kOnExit = 1 };
@@ -313,6 +316,8 @@ std::vector<std::wstring> folderList() {
 
 void saveSearchSettings();
 
+void saveExplorerDir();
+
 void saveSettings() {
     if (app.s.tags) saveSearchSettings();
     const auto f = folderList();
@@ -324,6 +329,7 @@ void saveSettings() {
     iniSet(L"exactOnly", Button_GetCheck(app.exact) == BST_CHECKED ? L"1" : L"0");
     iniSet(L"includeFlat", Button_GetCheck(app.flat) == BST_CHECKED ? L"1" : L"0");
     iniSet(L"showVariants", Button_GetCheck(app.variants) == BST_CHECKED ? L"1" : L"0");
+    saveExplorerDir();
     WINDOWPLACEMENT wp{sizeof(wp)};
     if (GetWindowPlacement(app.hwnd, &wp)) {
         const RECT& r = wp.rcNormalPosition;
@@ -3090,12 +3096,269 @@ void showTagDictWindow() {
 
 void layout();
 
+
+// ---------------------------------------------------------------- エクスプローラーの画面（mgview と同じ形。explorer_win.*）
+
+constexpr UINT WM_SAME_DONE = WM_APP + 54;  // lParam: SameDone*
+
+struct SameDone {
+    unsigned gen = 0;
+    std::wstring title, error;
+    std::vector<ExplorerMatch> matches;
+};
+
+struct ExplorerApp : ExplorerHost {
+    std::unique_ptr<Explorer> view;
+    SameImageIndex index;          // 見た目一致を探すための、DB の全部の画像の dHash
+    std::atomic<unsigned> gen{0};  // 新しく探し始めたら古い結果は捨てる
+    std::wstring pendingSel;       // 選んでから少し待って探す画像
+    bool shown = false;
+
+    void ExplorerOpen(const std::wstring& path) override;
+    void ExplorerSelected(const std::wstring& path, bool image) override;
+    void ExplorerFindSameFile(const std::wstring& path) override;
+    void ExplorerFindSameUrl(const std::wstring& url) override;
+    void ExplorerAddRoot(const std::wstring& dir) override;
+    void ExplorerSettingsChanged(const ExplorerSettings& s) override;
+    std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
+} ex;
+
+std::wstring fileNameOf(const std::wstring& path) {
+    const size_t sep = path.find_last_of(L"\\/");
+    return sep == std::wstring::npos ? path : path.substr(sep + 1);
+}
+
+// path の画像と同じ画像を DB から探す（別のスレッドで）。self: path そのものを結果から除く（DB の中の画像の時）
+void findSameAsync(const std::wstring& path, const std::wstring& title, bool self, bool deleteAfter) {
+    const unsigned gen = ++ex.gen;
+    KillTimer(app.hwnd, kSameTimer);
+    ex.view->SetSameStatus(title + L"　同じ画像を探しています…");
+    const std::wstring db = dbPath();
+    const int threshold = iniInt(L"threshold", 10);
+    std::thread([=] {
+        imgwin::threadBegin();
+        auto* r = new SameDone;
+        r->gen = gen;
+        r->title = title;
+        try {
+            SameQuery q;
+            q.f = imgwin::decodeFeatures(path);
+            q.threshold = threshold;
+            if (self) q.selfPath = narrow(path);
+            WIN32_FILE_ATTRIBUTE_DATA a{};
+            if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a))
+                q.size = (static_cast<uint64_t>(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+            Db d;
+            if (!d.open(narrow(db))) throw std::runtime_error(d.error());
+            // 完全一致は、同じ大きさの画像がある時だけ SHA-256 を求める
+            if (q.size) {
+                Stmt st(d.handle(), "SELECT 1 FROM images WHERE size=? LIMIT 1");
+                st.bind(1, static_cast<int64_t>(q.size));
+                if (st.step()) q.hasSha = sha256File(narrow(path), q.sha);
+            }
+            if (q.f.ok && q.f.contrast < q.flatContrast) r->title += L"（単色に近いので、完全一致だけを探します）";
+            if (!q.f.ok && !q.hasSha) {
+                r->error = L"画像を読めませんでした";
+            } else {
+                ex.index.refresh(d, kHashVersion);
+                for (const auto& m : ex.index.find(d, q, [](const std::string& p, Sha256& out) { return sha256File(p, out); })) {
+                    ExplorerMatch e;
+                    e.path = widen(m.path);
+                    e.exact = m.exact;
+                    e.distance = m.distance;
+                    e.size = m.size;
+                    e.width = static_cast<int>(m.width);
+                    e.height = static_cast<int>(m.height);
+                    r->matches.push_back(std::move(e));
+                }
+            }
+        } catch (const std::exception& e) {
+            r->error = L"探せませんでした: " + widen(e.what());
+        }
+        imgwin::threadEnd();
+        if (deleteAfter) DeleteFileW(path.c_str());
+        if (!PostMessageW(app.hwnd, WM_SAME_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void onSameDone(SameDone* p) {
+    std::unique_ptr<SameDone> r(p);
+    if (r->gen != ex.gen || !ex.view) return;  // もう別の画像を探している
+    if (!r->error.empty()) ex.view->SetSameStatus(r->title + L"　" + r->error);
+    else ex.view->SetSame(r->title, std::move(r->matches));
+}
+
+void ExplorerApp::ExplorerOpen(const std::wstring& path) { openPath(path); }
+
+void ExplorerApp::ExplorerSelected(const std::wstring& path, bool image) {
+    KillTimer(app.hwnd, kSameTimer);
+    pendingSel = image ? path : L"";
+    if (image) SetTimer(app.hwnd, kSameTimer, 250, nullptr);  // 矢印キーで次々に選んでいる間は探さない
+}
+
+void ExplorerApp::ExplorerFindSameFile(const std::wstring& path) {
+    findSameAsync(path, L"「" + fileNameOf(path) + L"」", true, false);
+}
+
+void ExplorerApp::ExplorerFindSameUrl(const std::wstring& url) {
+    const unsigned gen = ++ex.gen;
+    KillTimer(app.hwnd, kSameTimer);
+    const std::wstring title = L"URL の画像（" + url + L"）";
+    view->SetSameStatus(title + L"　ダウンロードしています…");
+    HWND hwnd = app.hwnd;
+    std::thread([=] {
+        std::vector<std::wstring> headers = {L"Accept: image/*,*/*;q=0.8"};
+        if (url.find(L"pximg.net") != std::wstring::npos) headers.push_back(L"Referer: https://www.pixiv.net/");  // pixiv の画像は Referer が要る
+        const upd::FetchResult f = upd::request(url, headers, nullptr, 128u * 1024 * 1024);
+        std::wstring error;
+        if (!f.ok) error = f.error;
+        else if (f.status != 200) error = L"ダウンロードできませんでした (HTTP " + std::to_wstring(f.status) + L")";
+        else if (f.body.empty()) error = L"中身が空でした";
+        std::wstring tmp;
+        if (error.empty()) {
+            wchar_t dir[MAX_PATH] = L"";
+            GetTempPathW(MAX_PATH, dir);
+            tmp = std::wstring(dir) + L"imgdupe_url_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(gen) + L".img";
+            HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            DWORD written = 0;
+            const bool ok = h != INVALID_HANDLE_VALUE && WriteFile(h, f.body.data(), static_cast<DWORD>(f.body.size()), &written, nullptr) &&
+                            written == f.body.size();
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            if (!ok) error = L"一時ファイルに書けませんでした";
+        }
+        if (!error.empty()) {
+            auto* r = new SameDone;
+            r->gen = gen;
+            r->title = title;
+            r->error = error;
+            if (!PostMessageW(hwnd, WM_SAME_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
+            return;
+        }
+        // 続きは画面のスレッドから（gen を新しくしないよう、同じ番号で探す）
+        auto* path = new std::wstring(std::to_wstring(gen) + L"\n" + tmp + L"\n" + title);
+        if (!PostMessageW(hwnd, WM_SAME_DONE, 1, reinterpret_cast<LPARAM>(path))) delete path;
+    }).detach();
+}
+
+void ExplorerApp::ExplorerAddRoot(const std::wstring& dir) {
+    addFolder(dir);
+    saveSettings();  // バックグラウンドの解析の roots にもなる
+    if (!indexer::isRunning()) indexer::start();
+    else if (Db* db = uiDb()) addCommand(*db, "rescan");
+}
+
+void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
+    const std::wstring ini = iniPath();
+    auto put = [&](const wchar_t* key, int v) { WritePrivateProfileStringW(L"Explorer", key, std::to_wstring(v).c_str(), ini.c_str()); };
+    put(L"sizeMode", s.sizeMode);
+    put(L"customSize", s.customSize);
+    put(L"folderStyle", s.folderStyle);
+    put(L"showTree", s.showTree ? 1 : 0);
+    put(L"showPreview", s.showPreview ? 1 : 0);
+    put(L"treeWidth", s.treeWidth);
+    put(L"previewWidth", s.previewWidth);
+    put(L"resultsHeight", s.resultsHeight);
+    put(L"resultsView", s.resultsView);
+}
+
+ExplorerSettings loadExplorerSettings() {
+    ExplorerSettings s;
+    const std::wstring ini = iniPath();
+    auto get = [&](const wchar_t* key, int def) { return static_cast<int>(GetPrivateProfileIntW(L"Explorer", key, def, ini.c_str())); };
+    s.sizeMode = get(L"sizeMode", s.sizeMode);
+    s.customSize = get(L"customSize", s.customSize);
+    s.folderStyle = get(L"folderStyle", s.folderStyle);
+    s.showTree = get(L"showTree", 1) != 0;
+    s.showPreview = get(L"showPreview", 1) != 0;
+    s.treeWidth = get(L"treeWidth", s.treeWidth);
+    s.previewWidth = get(L"previewWidth", s.previewWidth);
+    s.resultsHeight = get(L"resultsHeight", s.resultsHeight);
+    s.resultsView = get(L"resultsView", s.resultsView);
+    return s;
+}
+
+std::vector<int> ExplorerApp::ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) {
+    std::vector<int> out(items.size(), kStateNoBadge);
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    const std::string d = narrow(dir);
+    const IndexState here = folderIndexState(d, roots);
+    std::unordered_map<std::string, IndexState> files;
+    if (Db* db = uiDb()) {
+        try {
+            files = fileIndexStates(*db, d, roots, kHashVersion);
+        } catch (const std::exception&) {
+        }
+    }
+    const std::string base = d.empty() || d.back() == '\\' || d.back() == '/' ? d : d + "\\";
+    for (size_t i = 0; i < items.size(); ++i) {
+        const std::string name = narrow(items[i].first);
+        if (items[i].second) {
+            IndexState st = folderIndexState(base + name, roots);
+            if (st == IndexState::None)
+                if (Db* db = uiDb()) {
+                    try {
+                        if (folderHasIndexed(*db, base + name)) st = IndexState::Partial;  // 調べる対象の外でも、画像が DB にある
+                    } catch (const std::exception&) {
+                    }
+                }
+            out[i] = static_cast<int>(st);
+        } else {
+            auto it = files.find(name);
+            // DB に無くても、調べる対象のフォルダの中なら、そのうち処理される
+            out[i] = static_cast<int>(it != files.end() ? it->second : here == IndexState::Indexed ? IndexState::Pending : IndexState::None);
+        }
+    }
+    return out;
+}
+
+void saveExplorerDir() {
+    if (ex.view && !ex.view->Dir().empty()) WritePrivateProfileStringW(L"Explorer", L"dir", ex.view->Dir().c_str(), iniPath().c_str());
+}
+
+// 最初に開くフォルダ: 前回のフォルダ、無ければ調べるフォルダの 1 つ目、無ければピクチャ
+std::wstring explorerStartDir() {
+    wchar_t buf[4096] = L"";
+    GetPrivateProfileStringW(L"Explorer", L"dir", L"", buf, 4096, iniPath().c_str());
+    std::wstring d = buf;
+    auto isDir = [](const std::wstring& p) {
+        const DWORD a = p.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(p.c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    if (isDir(d)) return d;
+    for (const auto& f : folderList())
+        if (isDir(f)) return f;
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &p)) && p) d = p;
+    CoTaskMemFree(p);
+    return isDir(d) ? d : L"C:\\";
+}
+
+// タブの並び（見た目の位置）と画面の番号（app.tab: 0 = 重複を探す、1 = 検索、2 = エクスプローラー）
+constexpr int kTabOrder[] = {2, 0, 1};
+int tabPos(int id) {
+    for (int i = 0; i < 3; ++i)
+        if (kTabOrder[i] == id) return i;
+    return 0;
+}
+
 void switchTab(int t) {
     app.tab = t;
-    TabCtrl_SetCurSel(app.tabs, t);
+    TabCtrl_SetCurSel(app.tabs, tabPos(t));
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.searchPage) ShowWindow(h, t == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(app.info, t == 2 ? SW_HIDE : SW_SHOW);  // エクスプローラーは右のプレビューに出す
     layout();
+    if (t == 2) {
+        if (!ex.shown) {
+            ex.shown = true;
+            ex.view->Show(explorerStartDir(), L"");
+        } else {
+            ex.view->Show(L"", L"");
+        }
+        return;
+    }
+    ex.view->Hide();
     if (t == 1) {
         refreshSources();
         refreshSmartFolders(L"");
@@ -3377,7 +3640,7 @@ bool onSearchNotify(NMHDR* nm) {
         return true;
     }
     if (nm->hwndFrom == app.tabs && nm->code == TCN_SELCHANGE) {
-        switchTab(TabCtrl_GetCurSel(app.tabs));
+        switchTab(kTabOrder[std::clamp(TabCtrl_GetCurSel(app.tabs), 0, 2)]);
         return true;
     }
     return false;
@@ -3500,6 +3763,10 @@ void layout() {
     const int infoH = px(72);  // 4 行（パス・画像の情報・ファイルのタグ・検索用タグ）
     const int bottom = H - m - infoH - px(4);
     MoveWindow(app.info, m, bottom + px(4), W - 2 * m, infoH, TRUE);
+    if (app.tab == 2) {
+        ex.view->Move(RECT{m, y, W - m, H - m});
+        return;
+    }
     if (app.tab == 1) {
         layoutSearch(y, W, bottom);
         return;
@@ -3675,12 +3942,14 @@ void createSearchControls();
 void createControls() {
     createToolbar();
     app.tabs = makeControl(WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, IDC_TABS);
-    for (const wchar_t* t : {L"重複を探す", L"検索"}) {
+    for (const wchar_t* t : {L"エクスプローラー", L"重複を探す", L"検索"}) {
         TCITEMW it{};
         it.mask = TCIF_TEXT;
         it.pszText = const_cast<wchar_t*>(t);
         TabCtrl_InsertItem(app.tabs, TabCtrl_GetItemCount(app.tabs), &it);
     }
+    ex.view = std::make_unique<Explorer>();
+    ex.view->Create(app.hwnd, &ex, loadExplorerSettings());
     app.foldersLabel = makeControl(WC_STATICW, L"検索するフォルダ（ウィンドウにドラッグ＆ドロップしても追加できます）", 0,
                                    IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
@@ -3836,7 +4105,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
+    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
@@ -3930,6 +4199,14 @@ bool handleShortcut(const MSG& msg) {
     if (lstrcmpiW(cls, L"Edit") == 0 && !(mods & KMOD_ALT) && !(vk >= VK_F1 && vk <= VK_F24)) {
         const bool ctrlLetter = (mods & KMOD_CTRL) && vk >= 'A' && vk <= 'Z' && !wcschr(L"ACVXYZ", static_cast<wchar_t>(vk));
         if (!ctrlLetter) return false;
+    }
+    // エクスプローラーの中の移動・選ぶキー（矢印・Enter・BackSpace など）はエクスプローラーに渡す
+    if (app.tab == 2 && ex.view && (msg.hwnd == ex.view->Window() || IsChild(ex.view->Window(), msg.hwnd))) {
+        static const UINT nav[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_RETURN, VK_BACK, VK_TAB, VK_F5, VK_ESCAPE};
+        if (mods == 0 && std::find(std::begin(nav), std::end(nav), vk) != std::end(nav)) return false;
+        if (mods == KMOD_SHIFT && vk == VK_TAB) return false;
+        if (mods == KMOD_CTRL && (vk == 'V' || vk == 'L' || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_OEM_PLUS || vk == VK_OEM_MINUS)) return false;
+        if (mods == KMOD_ALT && (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == 'D')) return false;
     }
     auto it = app.keys.find(KeyStroke{mods, vk});
     if (it == app.keys.end()) return false;
@@ -4085,6 +4362,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
                 case CMD_TAB_DUPES: switchTab(0); break;
+                case CMD_TAB_EXPLORER: switchTab(2); break;
                 case CMD_TAB_SEARCH: switchTab(1); break;
                 case CMD_SAVE_SMART:
                     if (app.tab != 1) switchTab(1);
@@ -4186,10 +4464,26 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kProgressTimer) updateProgress();
             if (wp == kSearchTimer) runSearch();
+            if (wp == kSameTimer) {
+                KillTimer(hwnd, kSameTimer);
+                if (!ex.pendingSel.empty()) ex.ExplorerFindSameFile(ex.pendingSel);
+            }
             if (wp == kExitTimer) DestroyWindow(hwnd);  // 確認に時間がかかりすぎたら、そのまま終わる
             return 0;
         case WM_APP_SEARCHED:
             onSearched(reinterpret_cast<SearchDone*>(lp));
+            return 0;
+        case WM_SAME_DONE:
+            if (wp == 1) {
+                // URL の画像を落とし終えた: "番号\n一時ファイル\n見出し"
+                std::unique_ptr<std::wstring> p(reinterpret_cast<std::wstring*>(lp));
+                const size_t a = p->find(L'\n'), b = p->find(L'\n', a + 1);
+                const std::wstring tmp = p->substr(a + 1, b - a - 1);
+                if (static_cast<unsigned>(_wtoi(p->c_str())) != ex.gen) DeleteFileW(tmp.c_str());  // もう別の画像を探している
+                else findSameAsync(tmp, p->substr(b + 1), false, true);
+            } else {
+                onSameDone(reinterpret_cast<SameDone*>(lp));
+            }
             return 0;
         case WM_APP_EXPANDED:
             onExpanded(reinterpret_cast<ExpandDone*>(lp));
@@ -4626,7 +4920,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
     app.thumbThread = std::thread(thumbLoop);
-    switchTab(std::clamp(iniInt(L"tab", 0), 0, 1));
+    switchTab(std::clamp(iniInt(L"tab", 2), 0, 2));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
 

@@ -47,6 +47,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_OPEN, "Open", L"開く(&O)", "Enter"},
     {CMD_EXPLORER, "ShowInExplorer", L"エクスプローラーで表示(&E)", "Ctrl+E"},
     {CMD_COPY_PATH, "CopyPath", L"パスをコピー(&C)", "Ctrl+C"},
+    {CMD_TAB_EXPLORER, "TabExplorer", L"エクスプローラー(&E)", "Ctrl+3"},
     {CMD_TAB_DUPES, "TabDuplicates", L"重複を探す(&D)", "Ctrl+1"},
     {CMD_TAB_SEARCH, "TabSearch", L"検索(&S)", "Ctrl+2"},
     {CMD_SAVE_SMART, "SaveSmartFolder", L"条件をスマートフォルダに保存(&M)...", "Ctrl+Shift+S"},

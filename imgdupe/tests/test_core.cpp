@@ -28,6 +28,7 @@
 #include "lookup.hpp"
 #include "stats.hpp"
 #include "quality.hpp"
+#include "sameimg.hpp"
 #include "aesthetic_weights.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
@@ -2358,6 +2359,76 @@ static void testResolveRedirect() {
     CHECK(resolveRedirect(b, "/go?to=https://x") == "https://huggingface.co/go?to=https://x");
 }
 
+static void testSameImage() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-same-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files = {{"D:\\Pics\\a\\1.jpg", 100, 1}, {"D:\\Pics\\a\\2.jpg", 100, 2}, {"D:\\Pics\\b\\3.png", 300, 3},
+                                      {"D:\\Pics\\b\\4.png", 100, 4}, {"D:\\Pics\\b\\sub\\5.png", 100, 5}, {"D:\\Other\\6.jpg", 100, 6},
+                                      {"D:\\Pics\\a\\7.jpg", 100, 7}};
+    auto ids = upsertScanned(db, files);
+    auto feat = [&](const std::string& p, uint64_t dh, uint64_t dv, int contrast, const char* sha) {
+        Stmt st(db.handle(), "UPDATE images SET dh=?, dv=?, color=?, contrast=?, readable=1, width=10, height=20, sha=? WHERE id=?");
+        st.bind(1, static_cast<int64_t>(dh)).bind(2, static_cast<int64_t>(dv)).bind(3, int64_t(0x808080)).bind(4, int64_t(contrast));
+        if (sha) {
+            Sha256 h{};
+            h.fill(static_cast<uint8_t>(sha[0]));
+            st.bindBlob(5, h.data(), h.size());
+        }
+        st.bind(6, ids[p]);
+        st.step();
+        setStage(db, ids[p], "hash", StageState::Done, kHashVersion);
+    };
+    feat("D:\\Pics\\a\\1.jpg", 0xF0F0, 0xFF00, 40, "A");
+    feat("D:\\Pics\\a\\2.jpg", 0xF0F0, 0xFF00, 40, nullptr);   // SHA が DB に無い（ファイルから求める）
+    feat("D:\\Pics\\b\\3.png", 0xF0F1, 0xFF00, 40, "B");       // 大きさが違う・見た目は近い（距離 1）
+    feat("D:\\Pics\\b\\4.png", 0xF0F0, 0xFF00 ^ 0xFFF, 40, "C");  // 大きさは同じだが SHA が違う・距離 12
+    feat("D:\\Pics\\b\\sub\\5.png", 0, 0, 2, "D");               // 単色に近い
+    feat("D:\\Other\\6.jpg", 0xF0F0 ^ 0x7, 0xFF00, 40, "E");   // 距離 3
+    // 7 はまだハッシュしていない
+    SameImageIndex index;
+    CHECK(index.refresh(db, kHashVersion) && !index.refresh(db, kHashVersion) && index.size() == 6);
+    SameQuery q;
+    q.f.ok = true;
+    q.f.dh = 0xF0F0;
+    q.f.dv = 0xFF00;
+    q.f.r = q.f.g = q.f.b = 0x80;
+    q.f.contrast = 40;
+    q.size = 100;
+    q.hasSha = true;
+    q.sha.fill('A');
+    q.selfPath = "d:/pics/a/1.jpg";  // 大文字小文字・区切りが違っても自分は除く
+    int shaCalls = 0;
+    auto shaOf = [&](const std::string& path, Sha256& out) {
+        ++shaCalls;
+        out.fill(path == "D:\\Pics\\a\\2.jpg" ? 'A' : 'Z');
+        return true;
+    };
+    auto m = index.find(db, q, shaOf);
+    CHECK(m.size() == 3 && m[0].path == "D:\\Pics\\a\\2.jpg" && m[0].exact && m[1].path == "D:\\Pics\\b\\3.png" && m[1].distance == 1 &&
+          !m[1].exact && m[2].path == "D:\\Other\\6.jpg" && m[2].distance == 3 && m[0].width == 10);
+    CHECK(shaCalls == 2);  // 2.jpg と、SHA の無い 7.jpg
+    q.threshold = 12;
+    CHECK(index.find(db, q, shaOf).size() == 4);
+    q.f.ok = false;  // 特徴量が無ければ完全一致だけ
+    CHECK(index.find(db, q, shaOf).size() == 1);
+    auto folders = groupSameByFolder(m);
+    CHECK(folders.size() == 3 && folders[0].folder == "D:\\Pics\\a" && folders[0].exact == 1 && folders[1].folder == "D:\\Pics\\b");
+
+    // インデックスの状態
+    const std::vector<std::string> roots = {"D:\\Pics\\"};
+    auto st = fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion);
+    CHECK(st.size() == 3 && st["1.jpg"] == IndexState::Indexed && st["7.jpg"] == IndexState::Pending && !st.count("3.png"));
+    CHECK(fileIndexStates(db, "D:\\Pics\\b", roots, kHashVersion).size() == 2);  // sub の下は入らない
+    CHECK(fileIndexStates(db, "D:\\Other", {}, kHashVersion).size() == 1);
+    CHECK(folderIndexState("d:\\pics\\b\\sub", roots) == IndexState::Indexed && folderIndexState("D:\\Pics", roots) == IndexState::Indexed &&
+          folderIndexState("D:\\", roots) == IndexState::Partial && folderIndexState("D:\\Other", roots) == IndexState::None &&
+          folderIndexState("D:\\Pictures", roots) == IndexState::None);
+    CHECK(folderHasIndexed(db, "D:\\Other") && folderHasIndexed(db, "D:\\Pics\\b\\") && !folderHasIndexed(db, "D:\\Pic"));
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2385,6 +2456,7 @@ int main() {
     testLinkCheck();
     testQuality();
     testResolveRedirect();
+    testSameImage();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

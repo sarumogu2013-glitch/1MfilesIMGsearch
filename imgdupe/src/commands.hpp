@@ -29,6 +29,7 @@ enum Cmd : int {
     CMD_TAGDICT,
     CMD_REFS,
     CMD_STATS,
+    CMD_TAB_EXPLORER,
     CMD_TAB_DUPES,
     CMD_TAB_SEARCH,
     CMD_SAVE_SMART,
