@@ -12,11 +12,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: 確認（一時）Hugging Face のリダイレクト
         run: |
-          for u in https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx \
-                   https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model.onnx; do
-            echo "== $u"; curl -sI "$u" | grep -i -E "^HTTP|^location" || true
+          for u in https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/b25b82a03f7282e41aa2f257a52c7583b710bd1c/model.onnx \
+                   https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/b25b82a03f7282e41aa2f257a52c7583b710bd1c/selected_tags.csv; do
+            echo "== $u"; curl -sIL -A imgdupe/2.1.10 "$u" | grep -i -E "^HTTP|^location" | cut -c1-300 || true
           done
-          echo "== models.json"; curl -sL https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest/download/models.json | head -c 1500 || true
+          curl -sL https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest/download/models.json | grep '"url"' || true
       - name: MinGW-w64 を入れる
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
       - name: テスト
