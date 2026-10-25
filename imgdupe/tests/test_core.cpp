@@ -26,6 +26,7 @@
 #include "refs.hpp"
 #include "tagrel.hpp"
 #include "lookup.hpp"
+#include "stats.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -2067,6 +2068,73 @@ static void testLookup() {
     CHECK(rep.looked == 0 && !rep.error.empty() && pendingIdLookups(db, 100).size() == 2);
 }
 
+static void testStats() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-stats-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    // FILETIME: 2024-01-15 と 2024-03-10（UTC）
+    auto ft = [](int64_t unix) { return (unix + 11644473600LL) * 10000000LL; };
+    const int64_t jan = 1705276800, mar = 1710028800;
+    std::vector<ScannedFile> files = {{"/a/1.png", 100, ft(jan)}, {"/a/2.jpg", 200, ft(jan)}, {"/a/3.jpg", 300, ft(mar)},
+                                      {"/a/4.gif", 400, ft(mar)}};
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) {
+        for (auto& [p, id] : ids)
+            if (p.find("/" + std::to_string(n) + ".") != std::string::npos) return id;
+        return int64_t(0);
+    };
+    {
+        // 4 はコピーされたもの: 作成日時が更新日時より新しい → 更新日時（3 月）。1 は作成日時が古い（2023-12）→ 作成日時
+        Stmt st(db.handle(), "INSERT INTO file_meta(image_id, format, created) VALUES(?,?,?)");
+        st.bind(1, I(1)).bind(2, std::string("png")).bind(3, int64_t(1702000000));
+        st.step();
+        st.reset();
+        st.bind(1, I(4)).bind(2, std::string("GIF")).bind(3, mar + 86400 * 40);
+        st.step();
+    }
+    auto months = monthlyCounts(db, false);
+    CHECK(months.size() == 3 && months[0].key == "2023-12" && months[0].count == 1 && months[1].key == "2024-01" &&
+          months[1].count == 1 && months[1].bytes == 200 && months[2].key == "2024-03" && months[2].count == 2);
+    auto formats = formatCounts(db);
+    CHECK(formats.size() == 3 && formats[0].key == "JPG" && formats[0].count == 2 && formats[1].key == "GIF" && formats[2].key == "PNG");
+
+    // タグ: miku は 1・2・3（3 は手動で「違う」）、別名 初音ミク（4）も miku にまとめる。rin は確度が低い
+    replaceTags(db, I(1), "tagger", {TagRow{"miku", "character", "tagger", 0.9, false}, TagRow{"rin", "character", "tagger", 0.3, false}});
+    replaceTags(db, I(2), "tagger", {TagRow{"miku", "character", "tagger", 0.6, false}});
+    replaceTags(db, I(3), "tagger", {TagRow{"miku", "character", "tagger", 0.8, false}});
+    replaceTags(db, I(4), "meta", {TagRow{"初音ミク", "character", "meta", 0.95, false}});
+    replaceTags(db, I(2), "meta", {TagRow{"miku", "character", "meta", 0.95, false}, TagRow{"someone", "artist", "meta", 0.95, false}});
+    setManualTag(db, I(3), "miku", false);
+    db.exec("INSERT INTO tag_dict(tag, alias_of) VALUES('初音ミク', 'miku')");
+    auto chars = tagCounts(db, {"character"}, 0.5, 10);
+    CHECK(chars.size() == 1 && chars[0].key == "miku" && chars[0].count == 3 && chars[0].bytes == 700);
+    auto artists = tagCounts(db, {"artist"}, 0.5, 10);
+    CHECK(artists.size() == 1 && artists[0].key == "someone" && artists[0].count == 1);
+    CHECK(tagCounts(db, {"character", "artist"}, 0.2, 10).size() == 3);
+
+    // 概要
+    {
+        db.exec("INSERT INTO groups(id, kind) VALUES(1, 'exact'), (2, 'similar')");
+        Stmt st(db.handle(), "INSERT INTO group_members(group_id, image_id, representative) VALUES(?,?,?)");
+        for (auto [g, n, rep] : std::vector<std::tuple<int, int, int>>{{1, 1, 1}, {1, 2, 0}, {2, 3, 1}, {2, 4, 0}}) {
+            st.bind(1, int64_t(g)).bind(2, I(n)).bind(3, int64_t(rep));
+            st.step();
+            st.reset();
+        }
+        Stmt src(db.handle(), "INSERT INTO sources(image_id, site, post_id, url) VALUES(?, 'pixiv', '1', 'https://x')");
+        src.bind(1, I(1));
+        src.step();
+    }
+    setStage(db, I(1), "hash", StageState::Done, 1);
+    setStage(db, I(2), "hash", StageState::Failed, 1);
+    StatsSummary s = statsSummary(db);
+    CHECK(s.images == 4 && s.bytes == 1000 && s.exactGroups == 1 && s.exactExtra == 1 && s.exactExtraBytes == 200 &&
+          s.similarGroups == 1 && s.similarExtraBytes == 400 && s.tagged == 4 && s.withSource == 1);
+    CHECK(s.stages.size() == 1 && s.stages[0].name == "hash" && s.stages[0].done == 1 && s.stages[0].failed == 1);
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2090,6 +2158,7 @@ int main() {
     testRefs();
     testTagRelations();
     testLookup();
+    testStats();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

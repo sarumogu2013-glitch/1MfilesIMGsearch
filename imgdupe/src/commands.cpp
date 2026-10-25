@@ -62,6 +62,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_DICTIONARY, "Dictionary", L"行動・アイテムの辞書(&D)...", ""},
     {CMD_TAGDICT, "TagDictionary", L"タグ辞書（別名・親子）(&T)...", ""},
     {CMD_REFS, "References", L"見本画像のフォルダを開く(&R)", ""},
+    {CMD_STATS, "Statistics", L"統計(&G)...", ""},
     {CMD_KEY_SETTINGS, "KeySettings", L"ショートカットキーの設定(&K)...", "Ctrl+K"},
     {CMD_INDEXER_TOGGLE, "Indexer", L"バックグラウンドの解析を始める(&B)", ""},
     {CMD_INDEXER_AUTOSTART, "IndexerAutoStart", L"Windows と一緒にバックグラウンドの解析を始める(&W)", ""},

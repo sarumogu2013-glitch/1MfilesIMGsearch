@@ -42,6 +42,7 @@
 #include "ann.hpp"
 #include "clip_win.hpp"
 #include "lookup_win.hpp"
+#include "stats.hpp"
 #include "tagger_win.hpp"
 #include "models_win.hpp"
 #include "resource.h"
@@ -2102,6 +2103,243 @@ void markSelected(bool correct) {
     });
 }
 
+// ---------------------------------------------------------------- 統計の画面
+
+void switchTab(int t);
+
+constexpr UINT WM_STATS_DONE = WM_APP + 53;  // lParam: StatsData*
+
+struct StatsData {
+    StatsSummary summary;
+    std::vector<StatRow> rows[6];  // 作者・キャラ・作品・行動・月・形式
+    std::wstring error;
+};
+
+struct StatsWindow {
+    HWND wnd = nullptr, summary = nullptr, view = nullptr, list = nullptr, note = nullptr;
+    std::unique_ptr<StatsData> data;
+    bool done = false;
+    std::wstring searchTag;  // 閉じた後に検索するタグ
+    int64_t most = 1;        // 棒の長さの基準（一番多い数）
+} statsWin;
+
+enum { IDC_SS_VIEW = 400, IDC_SS_LIST };
+const wchar_t* const kStatViews[] = {L"作者別", L"キャラ別", L"作品別", L"行動・アイテム別", L"月ごとの増え方", L"形式別"};
+const std::vector<std::string> kStatKinds[] = {{"artist"}, {"character"}, {"copyright"}, {"action", "item"}};
+
+std::wstring statsSummaryText(const StatsSummary& s) {
+    std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
+                     L" 枚　出典あり " + withCommas(s.withSource) + L" 枚\r\n";
+    t += L"完全一致 " + withCommas(s.exactGroups) + L" グループ（重なっている分 " + withCommas(s.exactExtra) + L" 枚・" +
+         sizeText(s.exactExtraBytes) + L"）　見た目一致 " + withCommas(s.similarGroups) + L" グループ（" + withCommas(s.similarExtra) +
+         L" 枚・" + sizeText(s.similarExtraBytes) + L"）\r\n解析: ";
+    static const std::pair<const char*, const wchar_t*> names[] = {{"hash", L"ハッシュ"}, {"thumb", L"サムネイル"}, {"meta", L"メタデータ"},
+                                                                   {"names", L"json・フォルダ名"}, {"tagger", L"タガー"}, {"clip", L"CLIP"}};
+    bool first = true;
+    for (const auto& [k, label] : names)
+        for (const auto& st : s.stages)
+            if (st.name == k) {
+                t += (first ? L"" : L"、") + std::wstring(label) + L" " + withCommas(st.done);
+                if (st.failed) t += L"（失敗 " + withCommas(st.failed) + L"）";
+                first = false;
+            }
+    if (first) t += L"まだありません";
+    return t;
+}
+
+void fillStatsList() {
+    StatsWindow& w = statsWin;
+    ListView_DeleteAllItems(w.list);
+    if (!w.data) return;
+    const int view = std::max(0, ComboBox_GetCurSel(w.view));
+    const auto& rows = w.data->rows[view];
+    w.most = 1;
+    for (const auto& r : rows) w.most = std::max(w.most, r.count);
+    SendMessageW(w.list, WM_SETREDRAW, FALSE, 0);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        std::wstring name = widen(rows[i].key);
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = static_cast<int>(i);
+        it.pszText = name.data();
+        ListView_InsertItem(w.list, &it);
+        std::wstring n = withCommas(rows[i].count), b = sizeText(rows[i].bytes);
+        ListView_SetItemText(w.list, static_cast<int>(i), 1, n.data());
+        ListView_SetItemText(w.list, static_cast<int>(i), 2, b.data());
+    }
+    SendMessageW(w.list, WM_SETREDRAW, TRUE, 0);
+    std::wstring note;
+    if (view < 4)
+        note = rows.empty() ? L"まだありません（タガー・json・外部照会などでタグが付くと出ます）"
+                            : L"確度 0.5 以上（手動で「違う」と確定したものは除く）の上位 500 件。ダブルクリックでそのタグを検索します。";
+    else if (view == 4)
+        note = L"ファイルの作成日時と更新日時の古い方の月で数えます。";
+    else
+        note = L"形式が分からない画像は拡張子で数えます。";
+    setText(w.note, note);
+}
+
+void loadStats() {
+    HWND wnd = statsWin.wnd;
+    const std::wstring db = dbPath();
+    std::thread([wnd, db] {
+        auto* p = new StatsData;
+        try {
+            Db d;
+            if (!d.open(narrow(db))) throw std::runtime_error(d.error());
+            p->summary = statsSummary(d);
+            for (int i = 0; i < 4; ++i) p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
+            p->rows[4] = monthlyCounts(d);
+            p->rows[5] = formatCounts(d);
+        } catch (const std::exception& e) {
+            p->error = L"集計できませんでした: " + widen(e.what());
+        }
+        if (!PostMessageW(wnd, WM_STATS_DONE, 0, reinterpret_cast<LPARAM>(p))) delete p;
+    }).detach();
+}
+
+void showStatsWindow() {
+    StatsWindow& w = statsWin;
+    if (w.wnd) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            switch (msg) {
+                case WM_COMMAND:
+                    if (LOWORD(wp) == IDCANCEL) statsWin.done = true;
+                    if (LOWORD(wp) == IDC_SS_VIEW && HIWORD(wp) == CBN_SELCHANGE) fillStatsList();
+                    return 0;
+                case WM_CLOSE: statsWin.done = true; return 0;
+                case WM_STATS_DONE: {
+                    std::unique_ptr<StatsData> p(reinterpret_cast<StatsData*>(lp));
+                    if (h != statsWin.wnd) return 0;  // 閉じた後に届いた
+                    setText(statsWin.summary, p->error.empty() ? statsSummaryText(p->summary) : p->error);
+                    statsWin.data = std::move(p);
+                    fillStatsList();
+                    return 0;
+                }
+                case WM_NOTIFY: {
+                    auto* nm = reinterpret_cast<NMHDR*>(lp);
+                    if (nm->idFrom == IDC_SS_LIST && nm->code == NM_CUSTOMDRAW) {
+                        // 4 列目に棒を描く（一番多いものを列の幅いっぱいに）
+                        auto* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
+                        if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                        if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+                        if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM) && cd->iSubItem == 3 && statsWin.data) {
+                            const int view = std::max(0, ComboBox_GetCurSel(statsWin.view));
+                            const auto& rows = statsWin.data->rows[view];
+                            const size_t i = cd->nmcd.dwItemSpec;
+                            RECT r;
+                            ListView_GetSubItemRect(statsWin.list, static_cast<int>(i), 3, LVIR_BOUNDS, &r);
+                            FillRect(cd->nmcd.hdc, &r, GetSysColorBrush(COLOR_WINDOW));
+                            if (i < rows.size() && rows[i].count > 0) {
+                                const int width = r.right - r.left - px(8);
+                                RECT b{r.left + px(4), r.top + px(3), 0, r.bottom - px(3)};
+                                b.right = b.left + std::max(1, static_cast<int>(width * rows[i].count / statsWin.most));
+                                FillRect(cd->nmcd.hdc, &b, GetSysColorBrush(COLOR_HIGHLIGHT));
+                            }
+                            return CDRF_SKIPDEFAULT;
+                        }
+                        return CDRF_DODEFAULT;
+                    }
+                    if (nm->idFrom == IDC_SS_LIST && nm->code == NM_DBLCLK && statsWin.data) {
+                        const int view = ComboBox_GetCurSel(statsWin.view);
+                        const int i = ListView_GetNextItem(statsWin.list, -1, LVNI_SELECTED);
+                        if (view >= 0 && view < 4 && i >= 0 && i < static_cast<int>(statsWin.data->rows[view].size())) {
+                            const std::string& tag = statsWin.data->rows[view][static_cast<size_t>(i)].key;
+                            if (tag.find(' ') == std::string::npos) {
+                                statsWin.searchTag = widen(tag);
+                                statsWin.done = true;
+                            }
+                        }
+                    }
+                    return 0;
+                }
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeStats";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int cw = px(760), ch = px(560), m = px(10), bw = px(100), bh = px(28), rowH = px(24);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, cw, ch};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    w = StatsWindow{};
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeStats", L"統計", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                            app.inst, nullptr);
+    if (!w.wnd) return;
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int sumH = px(56), noteH = px(22);
+    w.summary = child(WC_STATICW, L"集計しています…", SS_NOPREFIX, -1, m, m, cw - 2 * m, sumH);
+    int y = m + sumH + px(6);
+    child(WC_STATICW, L"表示", SS_NOPREFIX, -1, m, y + px(4), px(40), rowH);
+    w.view = child(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_SS_VIEW, m + px(44), y, px(200), px(240));
+    for (const wchar_t* v : kStatViews) ComboBox_AddString(w.view, v);
+    ComboBox_SetCurSel(w.view, 0);
+    y += rowH + px(8);
+    const int listH = ch - y - m - bh - px(8) - noteH;
+    w.list = child(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, IDC_SS_LIST, m, y, cw - 2 * m, listH,
+                   WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(w.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    const struct {
+        const wchar_t* title;
+        int width;
+        int fmt;
+    } cols[] = {{L"名前", 240, LVCFMT_LEFT}, {L"枚数", 80, LVCFMT_RIGHT}, {L"大きさ", 80, LVCFMT_RIGHT}, {L"", 300, LVCFMT_LEFT}};
+    for (int i = 0; i < 4; ++i) {
+        LVCOLUMNW c{};
+        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+        c.fmt = cols[i].fmt;
+        c.cx = px(cols[i].width);
+        c.pszText = const_cast<wchar_t*>(cols[i].title);
+        ListView_InsertColumn(w.list, i, &c);
+    }
+    w.note = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, y + listH + px(4), cw - 2 * m, noteH);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, cw - m - bw, ch - m - bh, bw, bh);
+    loadStats();
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(w.wnd, SW_SHOW);
+    SetFocus(w.view);
+    MSG msg;
+    while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            w.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(w.wnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(w.wnd);
+    w.wnd = nullptr;
+    w.data.reset();
+    SetActiveWindow(app.hwnd);
+    if (!w.searchTag.empty()) {
+        // そのタグだけで検索する
+        if (app.tab != 1) switchTab(1);
+        clearSearchConditions();
+        SetWindowTextW(app.s.tags, w.searchTag.c_str());
+        scheduleSearch(10);
+    }
+}
+
 // 「出典を調べ直す」: 外部照会の結果を消し、次のバックグラウンドの解析でもう一度調べる（選んだ画像。右クリックした画像が選ばれていなければその 1 枚）
 void relookupImages(int64_t clicked) {
     std::vector<int64_t> ids;
@@ -3534,7 +3772,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -3793,6 +4031,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     expandLinksUi();
                     break;
                 case CMD_LINKS: showLinksWindow(); break;
+                case CMD_STATS: showStatsWindow(); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
                     if (app.tab == 1) markSelected(LOWORD(wp) == CMD_TAG_YES);
