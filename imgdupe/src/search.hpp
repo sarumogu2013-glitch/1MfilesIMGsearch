@@ -12,12 +12,21 @@
 
 namespace imgdupe {
 
-enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence, Aesthetic, Effective };
+enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence, Aesthetic, Effective, FileName, Relevance };
+
+// フリーワードの範囲: すべて（タグ・タイトルなどの文字・ファイル名）、タグに限る、タイトルに限る
+enum class FreeScope { All, Tags, Title };
+// 日付で絞り込む時の日付
+enum class DateField { Taken, Modified, Created };
 
 // 品質での絞り込み（quality.hpp の段階 quality が済んだ画像だけ）
 enum class QualityFilter { Any, Good, Blurry, Soft, LowRes };
 
 struct SearchQuery {
+    // フリーワード（空白で区切る。どの語にも合う画像。"-語" は合うものを除く）。関連度 = 語ごとの合い方の和
+    // （タグがそのまま合う = 確度、タグの頭が合う = 確度 × 0.7、タイトル = 1、ほかの文字 = 0.6、ファイル名 = 0.5）
+    std::string freeText;
+    FreeScope freeScope = FreeScope::All;
     // タグ（別名は tag_dict でまとめる）。tags は全部を持つもの、excludeTags はどれも持たないもの
     std::vector<std::string> tags;
     std::vector<std::string> excludeTags;
@@ -29,7 +38,8 @@ struct SearchQuery {
     // メタデータ（0 / -1 / 空 = 条件なし）
     int minRating = -1;
     bool noRating = false;               // 星なし
-    int64_t takenFrom = 0, takenTo = 0;  // 撮影日時（Unix 秒、takenTo はその秒を含む）
+    int64_t takenFrom = 0, takenTo = 0;  // dateField の日時（Unix 秒、takenTo はその秒を含む）
+    DateField dateField = DateField::Taken;
     bool noTaken = false;                // 撮影日時なし（EXIF なし）
     int minWidth = 0, minHeight = 0;
     int64_t minSize = 0, maxSize = 0;    // バイト
@@ -50,7 +60,7 @@ struct SearchQuery {
     std::string clipText;
     int64_t similarTo = 0;
     // 並べ替え
-    SortKey sort = SortKey::Path;
+    SortKey sort = SortKey::Relevance;  // 関連度（フリーワードが無ければパス順）
     bool descending = false;
     size_t limit = 0;                    // 0 = すべて
 };

@@ -1089,7 +1089,7 @@ static void testSearch() {
     CHECK(back.sort == SortKey::Taken && back.descending && back.sources.empty() && back.limit == 0 && back.review && back.unclassified);
     SearchQuery def;
     CHECK(queryFromJson(queryToJson(SearchQuery{}), def) && def.minRating == -1 && def.minConfidence == 0.5 &&
-          def.sort == SortKey::Path && !def.descending);
+          def.sort == SortKey::Relevance && !def.descending);
     CHECK(!queryFromJson("[1]", def) && !queryFromJson("{", def));
 
     SearchQuery miku;
@@ -2429,6 +2429,69 @@ static void testSameImage() {
     CHECK(folderHasIndexed(db, "D:\\Other") && folderHasIndexed(db, "D:\\Pics\\b\\") && !folderHasIndexed(db, "D:\\Pic"));
 }
 
+static void testFreeSearch() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-free-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files = {{"C:\\p\\miku_live.jpg", 1, 1}, {"C:\\p\\a.jpg", 1, 2}, {"C:\\p\\b.jpg", 1, 3},
+                                      {"C:\\miku\\c.jpg", 1, 4}, {"C:\\p\\d.jpg", 1, 5}};
+    auto ids = upsertScanned(db, files);
+    auto I = [&](const char* p) { return ids[p]; };
+    replaceTags(db, I("C:\\p\\a.jpg"), "tagger", {TagRow{"hatsune_miku", "character", "tagger", 0.9, false},
+                                                   TagRow{"stage", "general", "tagger", 0.8, false}});
+    replaceTags(db, I("C:\\p\\b.jpg"), "tagger", {TagRow{"miku", "character", "tagger", 0.6, false}});
+    replaceTags(db, I("C:\\p\\d.jpg"), "tagger", {TagRow{"miku", "character", "tagger", 0.95, false}});
+    setManualTag(db, I("C:\\p\\d.jpg"), "miku", false);  // 手動で「違う」
+    {
+        Stmt st(db.handle(), "INSERT INTO file_meta(image_id, title) VALUES(?, ?)");
+        st.bind(1, I("C:\\p\\a.jpg")).bind(2, std::string("ライブのステージ"));
+        st.step();
+        Stmt f(db.handle(), "INSERT INTO meta_fts(rowid, title) VALUES(?, ?)");
+        f.bind(1, I("C:\\p\\a.jpg")).bind(2, std::string("ライブのステージ"));
+        f.step();
+    }
+    SearchQuery q;
+    q.freeText = "miku";
+    auto r = search(db, q).ids;
+    // a（語を含むタグ 0.9×0.7=0.63）、b（タグそのもの 0.6）、miku_live.jpg（ファイル名 0.5）。c はフォルダの名前だけ、d は手動で「違う」
+    CHECK(r.size() == 3 && r[0] == I("C:\\p\\a.jpg") && r[1] == I("C:\\p\\b.jpg") && r[2] == I("C:\\p\\miku_live.jpg"));
+    q.descending = true;  // 関連度の低い順
+    CHECK(search(db, q).ids.front() == I("C:\\p\\miku_live.jpg"));
+    q.descending = false;
+    q.freeScope = FreeScope::Tags;
+    CHECK(search(db, q).ids.size() == 2);
+    q.freeScope = FreeScope::Title;
+    CHECK(search(db, q).ids.empty());
+    q.freeText = "ステージ";  // タイトル（3 文字以上は全文検索の索引）
+    CHECK(search(db, q).ids == std::vector<int64_t>({I("C:\\p\\a.jpg")}));
+    q.freeScope = FreeScope::All;
+    q.freeText = "miku stage";  // どちらにも合う
+    CHECK(search(db, q).ids == std::vector<int64_t>({I("C:\\p\\a.jpg")}));
+    q.freeText = "miku -stage";
+    CHECK(search(db, q).ids.size() == 2);
+    q.freeText = "ライブ";  // 2 文字以下ではないが 3 文字（タイトル）
+    CHECK(search(db, q).ids.size() == 1);
+    q.freeText = "";
+    q.sort = SortKey::FileName;
+    r = search(db, q).ids;
+    CHECK(r.size() == 5 && r[0] == I("C:\\p\\a.jpg") && r[3] == I("C:\\p\\d.jpg") && r[4] == I("C:\\p\\miku_live.jpg"));
+    SearchQuery q2;
+    q.freeText = "x";
+    q.freeScope = FreeScope::Title;
+    q.dateField = DateField::Modified;
+    CHECK(queryFromJson(queryToJson(q), q2) && q2.freeText == "x" && q2.freeScope == FreeScope::Title &&
+          q2.dateField == DateField::Modified && q2.sort == SortKey::FileName && hasConditions(q2));
+    // 更新日時で絞る（images.mtime は FILETIME。ここでは 1〜5 なので 1601 年）
+    SearchQuery d;
+    d.dateField = DateField::Modified;
+    d.takenTo = -11644473600LL;  // 1601-01-01 00:00:00
+    CHECK(search(db, d).ids.size() == 5);
+    d.takenTo = -11644473601LL;
+    CHECK(search(db, d).ids.empty());
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2457,6 +2520,7 @@ int main() {
     testQuality();
     testResolveRedirect();
     testSameImage();
+    testFreeSearch();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

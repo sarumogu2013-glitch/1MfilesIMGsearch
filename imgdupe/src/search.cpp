@@ -36,6 +36,17 @@ std::vector<std::string> aliasesOf(Db& db, const std::string& tag) {
     return std::vector<std::string>(out.begin(), out.end());
 }
 
+// DB にあるタグの名前（同じ名前は 1 つ）。索引を飛び飛びにたどるので、タグの行が多くても速い
+std::vector<std::string> allTagNames(Db& db) {
+    std::vector<std::string> out;
+    Stmt st(db.handle(),
+            "WITH RECURSIVE d(t) AS (SELECT min(tag COLLATE NOCASE) FROM tags UNION ALL "
+            "SELECT (SELECT min(tag COLLATE NOCASE) FROM tags WHERE tag > d.t COLLATE NOCASE) FROM d WHERE d.t IS NOT NULL) "
+            "SELECT t FROM d WHERE t IS NOT NULL");
+    while (st.step()) out.push_back(st.text(0));
+    return out;
+}
+
 std::string placeholders(size_t n) {
     std::string s;
     for (size_t i = 0; i < n; ++i) s += i ? ",?" : "?";
@@ -77,7 +88,7 @@ void parseTagQuery(const std::string& text, std::vector<std::string>& tags, std:
 }
 
 SearchResult search(Db& db, const SearchQuery& q) {
-    std::vector<Param> params;
+    std::vector<Param> params, withParams;  // WITH の中の値は、ほかの値より先に結び付ける
     std::string with, joins, where = " WHERE 1";
 
     // タグごとに「確度を合成して、しきい値以上の画像」を作る。手動で確定したものは、その値をそのまま使う
@@ -87,17 +98,17 @@ SearchResult search(Db& db, const SearchQuery& q) {
                           " AS (SELECT image_id, CASE WHEN max(manual)=1 THEN max(CASE WHEN manual=1 THEN confidence END) "
                           "ELSE 1 - exp(sum(ln(1 - min(confidence, 0.999999)))) END AS conf FROM tags WHERE tag COLLATE NOCASE IN (" +
                           placeholders(names.size()) + ")";
-        for (const auto& n : names) params.emplace_back(n);
+        for (const auto& n : names) withParams.emplace_back(n);
         if (!q.sources.empty()) {
             sql += " AND (manual=1 OR source IN (" + placeholders(q.sources.size()) + "))";
-            for (const auto& s : q.sources) params.emplace_back(s);
+            for (const auto& s : q.sources) withParams.emplace_back(s);
         }
         if (!q.excludeSources.empty()) {
             sql += " AND (manual=1 OR source NOT IN (" + placeholders(q.excludeSources.size()) + "))";
-            for (const auto& s : q.excludeSources) params.emplace_back(s);
+            for (const auto& s : q.excludeSources) withParams.emplace_back(s);
         }
         sql += " GROUP BY image_id HAVING conf >= ?)";
-        params.emplace_back(q.minConfidence);
+        withParams.emplace_back(q.minConfidence);
         with += (with.empty() ? "WITH " : ", ") + sql;
     };
     for (size_t i = 0; i < q.tags.size(); ++i) {
@@ -116,6 +127,107 @@ SearchResult search(Db& db, const SearchQuery& q) {
         const std::string n = "x" + std::to_string(i);
         tagCte(n, q.excludeTags[i]);
         where += " AND i.id NOT IN (SELECT image_id FROM " + n + ")";
+    }
+
+    // フリーワード
+    std::string relevance;
+    {
+        std::vector<std::string> words, excludeWords;
+        parseTagQuery(q.freeText, words, excludeWords);
+        auto ftsPhrase = [](const std::string& w) {
+            std::string p = "\"";
+            for (char c : w) p += c == '"' ? std::string("\"\"") : std::string(1, c);
+            return p + "\"";
+        };
+        auto charCount = [](const std::string& w) {
+            size_t n = 0;
+            for (unsigned char c : w)
+                if ((c & 0xC0) != 0x80) ++n;
+            return n;
+        };
+        // 語を含むタグの名前（そのまま合うもの・別名は除く。多すぎる時は 300 個まで）
+        std::vector<std::string> tagNames;
+        if (!words.empty() || !excludeWords.empty())
+            if (q.freeScope != FreeScope::Title) tagNames = allTagNames(db);
+        auto partialTags = [&](const std::string& w) {
+            std::vector<std::string> out;
+            const auto exact = aliasesOf(db, w);
+            const std::string lw = lowerAscii(w);
+            for (const auto& t : tagNames) {
+                if (out.size() >= 300) break;
+                const std::string lt = lowerAscii(t);
+                if (lt.find(lw) == std::string::npos) continue;
+                bool same = false;
+                for (const auto& e : exact) same = same || lowerAscii(e) == lt;
+                if (!same) out.push_back(t);
+            }
+            return out;
+        };
+        // 語 w に合う画像と点数の CTE を name で作る
+        auto wordCte = [&](const std::string& name, const std::string& w) {
+            std::vector<std::string> parts;
+            if (q.freeScope != FreeScope::Title) {
+                tagCte(name + "e", w);  // タグがそのまま合う（別名・確度の合成・手動の確定）
+                parts.push_back("SELECT image_id, conf AS s FROM " + name + "e");
+                // 語を含むタグ（miku → hatsune_miku）。手動で「違う」と確定したものは除く
+                const auto partial = partialTags(w);
+                if (!partial.empty()) {
+                    std::string sql = "SELECT image_id, max(confidence) * 0.7 AS s FROM tags WHERE tag COLLATE NOCASE IN (" +
+                                      placeholders(partial.size()) + ") AND manual=0 AND confidence >= ? AND NOT EXISTS (SELECT 1 FROM tags m "
+                                      "WHERE m.image_id=tags.image_id AND m.tag=tags.tag COLLATE NOCASE AND m.manual=1 AND m.confidence < 0.5)";
+                    for (const auto& t : partial) withParams.emplace_back(t);
+                    withParams.emplace_back(q.minConfidence);
+                    if (!q.sources.empty()) {
+                        sql += " AND source IN (" + placeholders(q.sources.size()) + ")";
+                        for (const auto& s : q.sources) withParams.emplace_back(s);
+                    }
+                    if (!q.excludeSources.empty()) {
+                        sql += " AND source NOT IN (" + placeholders(q.excludeSources.size()) + ")";
+                        for (const auto& s : q.excludeSources) withParams.emplace_back(s);
+                    }
+                    parts.push_back(sql + " GROUP BY image_id");
+                }
+            }
+            if (q.freeScope != FreeScope::Tags) {
+                if (charCount(w) >= 3) {
+                    parts.push_back("SELECT rowid AS image_id, 1.0 AS s FROM meta_fts WHERE meta_fts MATCH ?");
+                    withParams.emplace_back("title : " + ftsPhrase(w));
+                    if (q.freeScope == FreeScope::All) {
+                        parts.push_back("SELECT rowid AS image_id, 0.6 AS s FROM meta_fts WHERE meta_fts MATCH ?");
+                        withParams.emplace_back("{subject comment keywords png_text} : " + ftsPhrase(w));
+                    }
+                } else {
+                    // 2 文字以下は索引を使えないので、そのまま探す
+                    parts.push_back("SELECT image_id, 1.0 AS s FROM file_meta WHERE instr(title, ?)");
+                    withParams.emplace_back(w);
+                    if (q.freeScope == FreeScope::All) {
+                        parts.push_back("SELECT image_id, 0.6 AS s FROM file_meta WHERE instr(subject,?) OR instr(comment,?) OR "
+                                        "instr(keywords,?) OR instr(png_text,?)");
+                        for (int k = 0; k < 4; ++k) withParams.emplace_back(w);
+                    }
+                }
+                if (q.freeScope == FreeScope::All) {
+                    // ファイル名（フォルダの名前は含めない）
+                    parts.push_back("SELECT id AS image_id, 0.5 AS s FROM images WHERE instr(lower(substr(path, length(rtrim(path, "
+                                    "replace(replace(path, '\\', ''), '/', ''))) + 1)), ?)");
+                    withParams.emplace_back(lowerAscii(w));
+                }
+            }
+            std::string u;
+            for (const auto& p : parts) u += (u.empty() ? "" : " UNION ALL ") + p;
+            with += (with.empty() ? "WITH " : ", ") + name + " AS (SELECT image_id, max(s) AS s FROM (" + u + ") GROUP BY image_id)";
+        };
+        for (size_t i = 0; i < words.size(); ++i) {
+            const std::string n = "w" + std::to_string(i);
+            wordCte(n, words[i]);
+            joins += " JOIN " + n + " ON " + n + ".image_id=i.id";
+            relevance += (relevance.empty() ? "" : " + ") + n + ".s";
+        }
+        for (size_t i = 0; i < excludeWords.size(); ++i) {
+            const std::string n = "v" + std::to_string(i);
+            wordCte(n, excludeWords[i]);
+            where += " AND i.id NOT IN (SELECT image_id FROM " + n + ")";
+        }
     }
 
     // 文字（全文検索）
@@ -143,13 +255,18 @@ SearchResult search(Db& db, const SearchQuery& q) {
         params.emplace_back(static_cast<int64_t>(q.minRating));
     }
     if (q.noRating) where += " AND f.rating IS NULL";
-    if (q.takenFrom) {
-        where += " AND f.taken >= ?";
-        params.emplace_back(q.takenFrom);
-    }
-    if (q.takenTo) {
-        where += " AND f.taken <= ?";
-        params.emplace_back(q.takenTo);
+    {
+        // 更新日時は images.mtime（FILETIME）、ほかは file_meta の Unix 秒
+        const char* col = q.dateField == DateField::Modified ? "i.mtime" : q.dateField == DateField::Created ? "f.created" : "f.taken";
+        auto bound = [&](int64_t t) { return q.dateField == DateField::Modified ? (t + 11644473600LL) * 10000000LL : t; };
+        if (q.takenFrom) {
+            where += std::string(" AND ") + col + " >= ?";
+            params.emplace_back(bound(q.takenFrom));
+        }
+        if (q.takenTo) {
+            where += std::string(" AND ") + col + " <= ?";
+            params.emplace_back(q.dateField == DateField::Modified ? bound(q.takenTo + 1) - 1 : q.takenTo);
+        }
     }
     if (q.noTaken) where += " AND f.taken IS NULL";
     if (q.minWidth > 0) {
@@ -222,14 +339,21 @@ SearchResult search(Db& db, const SearchQuery& q) {
         case SortKey::Confidence: key = q.tags.empty() ? "i.path" : "t0.conf"; break;
         case SortKey::Aesthetic: key = "qa.aesthetic"; break;
         case SortKey::Effective: key = "qa.effective"; break;
+        case SortKey::FileName:
+            key = "lower(substr(i.path, length(rtrim(i.path, replace(replace(i.path, '\\', ''), '/', ''))) + 1))";
+            break;
+        case SortKey::Relevance: key = relevance.empty() ? "i.path" : "(" + relevance + ")"; break;
     }
-    const std::string dir = q.descending ? " DESC" : "";
+    // 関連度は高い順が「昇順」（降順にすると低い順）
+    const bool desc = q.sort == SortKey::Relevance && !relevance.empty() ? !q.descending : q.descending;
+    const std::string dir = desc ? " DESC" : "";
     std::string order = " ORDER BY (" + key + ") IS NULL, " + key + dir;
     if (key != "i.path") order += ", i.path";
     if (q.review && !q.tags.empty()) order = " ORDER BY abs(t0.conf - 0.5), i.path";
 
     const std::string from =
         " FROM images i LEFT JOIN file_meta f ON f.image_id=i.id LEFT JOIN quality qa ON qa.image_id=i.id" + joins + where;
+    params.insert(params.begin(), withParams.begin(), withParams.end());
     auto bindAll = [&](Stmt& st) {
         for (size_t i = 0; i < params.size(); ++i) {
             const int idx = static_cast<int>(i + 1);
@@ -401,7 +525,7 @@ bool undoLastTagEdit(Db& db, std::string& description) {
 }
 
 bool hasConditions(const SearchQuery& q) {
-    return !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
+    return !q.freeText.empty() || !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
            q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
            q.minSize > 0 || q.maxSize > 0 || !q.format.empty() || q.animatedOnly || q.unclassified || !q.pathContains.empty() ||
            !q.downloadContains.empty() || q.deadLinks || q.quality != QualityFilter::Any;
@@ -410,7 +534,9 @@ bool hasConditions(const SearchQuery& q) {
 namespace {
 
 const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence",
-                                  "aesthetic", "effective"};
+                                  "aesthetic", "effective", "filename", "relevance"};
+const char* const kScopeNames[] = {"all", "tags", "title"};
+const char* const kDateNames[] = {"taken", "modified", "created"};
 const char* const kQualityNames[] = {"", "good", "blurry", "soft", "lowres"};
 
 void putList(std::string& out, const char* key, const std::vector<std::string>& v) {
@@ -450,6 +576,9 @@ std::string queryToJson(const SearchQuery& q) {
     putList(out, "sources", q.sources);
     putList(out, "excludeSources", q.excludeSources);
     putText(out, "text", q.text);
+    putText(out, "freeText", q.freeText);
+    if (q.freeScope != FreeScope::All) putText(out, "freeScope", kScopeNames[static_cast<int>(q.freeScope)]);
+    if (q.dateField != DateField::Taken) putText(out, "dateField", kDateNames[static_cast<int>(q.dateField)]);
     putInt(out, "minRating", q.minRating, -1);
     putBool(out, "noRating", q.noRating);
     putInt(out, "takenFrom", q.takenFrom);
@@ -497,6 +626,11 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     list("sources", q.sources);
     list("excludeSources", q.excludeSources);
     q.text = j.getString("text");
+    q.freeText = j.getString("freeText");
+    for (int i = 0; i < 3; ++i) {
+        if (j.getString("freeScope") == kScopeNames[i]) q.freeScope = static_cast<FreeScope>(i);
+        if (j.getString("dateField") == kDateNames[i]) q.dateField = static_cast<DateField>(i);
+    }
     num("minRating", q.minRating);
     flag("noRating", q.noRating);
     num("takenFrom", q.takenFrom);
