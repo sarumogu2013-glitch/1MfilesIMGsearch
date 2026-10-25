@@ -73,6 +73,8 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
                                                             int hashVersion);
 // フォルダの状態: roots の中なら Indexed、中に roots があれば Partial、どちらでもなければ None
 IndexState folderIndexState(const std::string& dir, const std::vector<std::string>& roots);
+// パスの画像の ID（無ければ 0）。roots と大文字小文字だけが違う・区切りが / と \ で違うものも探す
+int64_t findImageId(Db& db, const std::string& path, const std::vector<std::string>& roots);
 // フォルダの下（いくつ下でも）の画像が DB にあるか（roots から外したフォルダや --index で作ったもの）
 bool folderHasIndexed(Db& db, const std::string& dir);
 

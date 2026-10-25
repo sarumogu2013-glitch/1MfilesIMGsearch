@@ -2426,6 +2426,8 @@ static void testSameImage() {
     CHECK(folderIndexState("d:\\pics\\b\\sub", roots) == IndexState::Indexed && folderIndexState("D:\\Pics", roots) == IndexState::Indexed &&
           folderIndexState("D:\\", roots) == IndexState::Partial && folderIndexState("D:\\Other", roots) == IndexState::None &&
           folderIndexState("D:\\Pictures", roots) == IndexState::None);
+    CHECK(findImageId(db, "d:\\pics\\a\\1.jpg", roots) == ids["D:\\Pics\\a\\1.jpg"] && findImageId(db, "D:/Other/6.jpg", {}) == ids["D:\\Other\\6.jpg"] &&
+          findImageId(db, "D:\\nothing.jpg", roots) == 0);
     CHECK(folderHasIndexed(db, "D:\\Other") && folderHasIndexed(db, "D:\\Pics\\b\\") && !folderHasIndexed(db, "D:\\Pic"));
 }
 

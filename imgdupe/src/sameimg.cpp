@@ -195,6 +195,25 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
     return out;
 }
 
+int64_t findImageId(Db& db, const std::string& path, const std::vector<std::string>& roots) {
+    std::vector<std::string> cands = {path};
+    const std::string np = normPath(path);
+    for (const auto& r : roots) {
+        const std::string nr = normPath(r);
+        if (!nr.empty() && under(np, nr)) cands.push_back(trimSep(r) + path.substr(trimSep(r).size()));
+    }
+    Stmt st(db.handle(), "SELECT id FROM images WHERE path=?");
+    for (const auto& c : cands)
+        for (const char sep : {'\\', '/'}) {
+            std::string p = c;
+            std::replace(p.begin(), p.end(), sep == '/' ? '\\' : '/', sep);
+            st.bind(1, p);
+            if (st.step()) return st.i64(0);
+            st.reset();
+        }
+    return 0;
+}
+
 bool folderHasIndexed(Db& db, const std::string& dir) {
     for (const char sep : {'\\', '/'}) {
         std::string p = trimSep(dir);

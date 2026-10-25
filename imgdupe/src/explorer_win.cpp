@@ -43,13 +43,18 @@ namespace {
 constexpr wchar_t kHostClass[] = L"imgdupe_explorer";
 constexpr wchar_t kGridClass[] = L"imgdupe_explorer_grid";
 constexpr wchar_t kPreviewClass[] = L"imgdupe_explorer_preview";
+constexpr wchar_t kTrayClass[] = L"imgdupe_explorer_tray";
+const wchar_t kListMarker[] = L"\x01list";  // 戻るの履歴で「検索の結果」を表す
 constexpr UINT WM_THUMB_DONE = WM_APP + 41;  // lParam = ThumbResult*
 constexpr UINT_PTR kStateTimer = 1;
 enum {
   ID_UP = 1, ID_PATH, ID_SIZE, ID_SLIDER, ID_FOLDER, ID_SIZE_LABEL, ID_FOLDER_LABEL,
-  ID_BACK, ID_FORWARD, ID_TREE_BTN, ID_PREVIEW_BTN, ID_TREE, ID_SAME_TEXT, ID_SAME_VIEW, ID_SAME_LIST
+  ID_BACK, ID_FORWARD, ID_TREE_BTN, ID_PREVIEW_BTN, ID_TREE, ID_SAME_TEXT, ID_SAME_VIEW, ID_SAME_LIST,
+  ID_VIEW, ID_SORT, ID_SORT_DIR
 };
-enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT };
+enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_SIMILAR_AI,
+       MENU_RELOOKUP };
+constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
 const int kPresetSizes[3] = {96, 160, 256};
 // IImageList の IID (mingw のライブラリには無いのでここで定義する)
@@ -65,6 +70,8 @@ struct Item {
   bool dir = false;
   bool image = false;
   int state = kStateNoBadge;  // インデックスの状態
+  uint64_t mtime = 0, size = 0;  // 更新日時 (FILETIME)・大きさ
+  size_t order = 0;              // 読んだ順 (検索の結果は関連度などの順)
   bool Thumbable() const { return dir || image; }
 };
 
@@ -302,6 +309,7 @@ class ExplorerImpl {
   HWND upBtn = nullptr, pathText = nullptr, sizeBox = nullptr, slider = nullptr, folderBox = nullptr;
   HWND sizeLabel = nullptr, folderLabel = nullptr;
   HWND backBtn = nullptr, forwardBtn = nullptr, treeBtn = nullptr, previewBtn = nullptr;
+  HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
   HWND sameText = nullptr, sameView = nullptr, sameList = nullptr;
   DropTarget* drop = nullptr;
@@ -325,6 +333,14 @@ class ExplorerImpl {
     std::wstring first;  // 最初の一致
   };
   std::vector<SameFolderRow> sameFolders;
+  // 重複のまとまり (下の一覧の行: 見出しか、パス)
+  int resultsMode = 0;  // 0 = 同じ画像、1 = 重複
+  struct GroupRow {
+    bool header = false;
+    std::wstring text, path;
+  };
+  std::vector<GroupRow> groupRows;
+  bool fillingList = false;
 
   // サムネイル
   std::map<std::wstring, Thumb> cache;
@@ -366,28 +382,36 @@ class ExplorerImpl {
   }
   int Pad() const { return Px(8); }
   int TextH() const { return Px(34); }  // 名前 2 行
-  int CellW() const { return ThumbSize() + Pad() * 2; }
-  int CellH() const { return ThumbSize() + Pad() * 2 + TextH(); }
-  int Cols() const {
+  // 詳細表示 (1 行に 1 つ、上に列の見出し)
+  bool Details() const { return settings.viewMode == 1; }
+  int HeaderH() const { return Details() ? Px(24) : 0; }
+  int GridW() const {
     RECT rc;
     GetClientRect(grid, &rc);
-    return std::max(1, int((rc.right - Pad()) / CellW()));
+    return rc.right;
+  }
+  int CellW() const { return Details() ? GridW() : ThumbSize() + Pad() * 2; }
+  int CellH() const { return Details() ? Px(24) : ThumbSize() + Pad() * 2 + TextH(); }
+  int Cols() const {
+    if (Details()) return 1;
+    return std::max(1, int((GridW() - Pad()) / CellW()));
   }
   int OffsetX() const {
-    RECT rc;
-    GetClientRect(grid, &rc);
-    return std::max(0, int((rc.right - Cols() * CellW()) / 2));
+    if (Details()) return 0;
+    return std::max(0, int((GridW() - Cols() * CellW()) / 2));
   }
   RECT CellRect(int i) const {
     int c = Cols();
-    int x = OffsetX() + (i % c) * CellW(), y = Pad() + (i / c) * CellH() - scrollY;
+    int top = Details() ? HeaderH() : Pad();
+    int x = OffsetX() + (i % c) * CellW(), y = top + (i / c) * CellH() - scrollY;
     return RECT{x, y, x + CellW(), y + CellH()};
   }
   int TotalHeight() const {
     int rows = (int(items.size()) + Cols() - 1) / Cols();
-    return Pad() * 2 + rows * CellH();
+    return (Details() ? HeaderH() : Pad()) + Pad() + rows * CellH();
   }
   int HitTest(POINT pt) const {
+    if (pt.y < HeaderH()) return -1;
     for (int i = 0; i < int(items.size()); i++) {
       RECT r = CellRect(i);
       if (PtInRect(&r, pt)) return i;
@@ -397,7 +421,140 @@ class ExplorerImpl {
 
   // ---------------------------------------------------------------- 一覧
 
+  // 並べ替え (フォルダを先に)。一覧 (検索の結果) で「検索結果の順」なら読んだ順
+  int SortKey() const { return listMode ? listSort : settings.sortKey; }
+  void SortItems() {
+    int key = SortKey();
+    bool desc = settings.sortDesc;
+    std::stable_sort(items.begin(), items.end(), [&](const Item& a, const Item& b) {
+      if (a.dir != b.dir) return a.dir;
+      int c = 0;
+      switch (key) {
+        case 1: c = a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0; break;
+        case 2: c = _wcsicmp(TypeName(a).c_str(), TypeName(b).c_str()); break;
+        case 3: c = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
+        case kListOrder: c = a.order < b.order ? -1 : a.order > b.order ? 1 : 0; break;
+      }
+      if (c == 0 && key != kListOrder) c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
+      return desc ? c > 0 : c < 0;
+    });
+  }
+
+  // 種類 (Windows のエクスプローラーと同じ「JPEG ファイル」など)
+  std::map<std::wstring, std::wstring> typeNames;
+  const std::wstring& TypeName(const Item& it) {
+    std::wstring ext = it.dir ? L"<dir>" : PathFindExtensionW(it.name.c_str());
+    CharLowerBuffW(&ext[0], DWORD(ext.size()));
+    auto f = typeNames.find(ext);
+    if (f != typeNames.end()) return f->second;
+    SHFILEINFOW fi = {};
+    std::wstring name;
+    if (SHGetFileInfoW(it.dir ? L"folder" : (L"x" + ext).c_str(), it.dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, &fi,
+                       sizeof(fi), SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES))
+      name = fi.szTypeName;
+    if (name.empty()) name = it.dir ? L"ファイル フォルダー" : ext.size() > 1 ? ext.substr(1) + L" ファイル" : L"ファイル";
+    return typeNames[ext] = name;
+  }
+
+  void SetSort(int key, bool desc) {
+    if (listMode) {
+      listSort = key;
+    } else {
+      if (key == kListOrder) key = 0;  // フォルダでは「検索結果の順」は名前
+      settings.sortKey = key;
+    }
+    settings.sortDesc = desc;
+    host->ExplorerSettingsChanged(settings);
+    UpdateSortBox();
+    Resort();
+  }
+
+  void UpdateSortBox() {
+    if (!sortBox) return;
+    SendMessageW(sortBox, CB_SETCURSEL, SortKey(), 0);
+    SetWindowTextW(sortDirBtn, settings.sortDesc ? L"降順" : L"昇順");
+  }
+
+  void Resort() {
+    std::wstring keep = SelectedPath();
+    SortItems();
+    sel = -1;
+    for (int i = 0; i < int(items.size()); i++)
+      if (items[size_t(i)].path == keep) sel = i;
+    if (sel < 0 && !items.empty()) sel = 0;
+    UpdateScroll();
+    EnsureVisible(sel);
+    InvalidateRect(grid, nullptr, FALSE);
+  }
+
+  // ---------------------------------------------------------------- 一覧 (検索の結果)
+
+  bool listMode = false;
+  std::wstring listTitle;
+  std::vector<std::wstring> listPaths;
+  int listSort = kListOrder;
+
+  void LoadList(const std::wstring& select) {
+    listMode = true;
+    dir.clear();
+    items.clear();
+    sel = hover = -1;
+    scrollY = 0;
+    gen++;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      queue.clear();
+    }
+    for (const auto& p : listPaths) {
+      Item it;
+      it.path = p;
+      it.name = NameOf(p);
+      it.image = true;
+      it.order = items.size();
+      WIN32_FILE_ATTRIBUTE_DATA a = {};
+      if (GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) {
+        it.mtime = (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+        it.size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+      }
+      it.state = kStateIndexed;  // 検索の結果は DB の画像
+      items.push_back(std::move(it));
+    }
+    SortItems();
+    for (int i = 0; i < int(items.size()); i++)
+      if (!select.empty() && _wcsicmp(items[size_t(i)].path.c_str(), select.c_str()) == 0) sel = i;
+    if (sel < 0 && !items.empty()) sel = 0;
+    SetWindowTextW(pathText, listTitle.c_str());
+    UpdateNavButtons();
+    UpdateSortBox();
+    UpdateScroll();
+    EnsureVisible(sel);
+    InvalidateRect(grid, nullptr, FALSE);
+    UpdatePreview();
+    NotifySelected();
+  }
+
+  void ShowList(const std::wstring& title, std::vector<std::wstring> paths, int select = -1) {
+    if (!listMode && !dir.empty()) {
+      backStack.push_back({dir, SelectedPath()});
+      forwardStack.clear();
+    } else if (listMode) {
+      forwardStack.clear();
+    }
+    listTitle = title;
+    listPaths = std::move(paths);
+    listSort = kListOrder;
+    LoadList(select >= 0 && select < int(listPaths.size()) ? listPaths[size_t(select)] : std::wstring());
+  }
+
   void Load(const std::wstring& d, const std::wstring& select) {
+    if (d == kListMarker) {
+      LoadList(select);
+      return;
+    }
+    if (listMode) {
+      listMode = false;
+      UpdateSortBox();
+    }
     dir = d;
     items.clear();
     sel = hover = -1;
@@ -418,15 +575,14 @@ class ExplorerImpl {
         it.path = Join(dir, it.name);
         it.dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         it.image = !it.dir && IsSupportedImage(it.name);
+        it.mtime = (uint64_t(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        it.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        it.order = items.size();
         items.push_back(std::move(it));
       } while (FindNextFileW(h, &fd));
       FindClose(h);
     }
-    // フォルダを先に、それぞれ名前順
-    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
-      if (a.dir != b.dir) return a.dir;
-      return NaturalLess(a.name, b.name);
-    });
+    SortItems();
     for (int i = 0; i < int(items.size()); i++) {
       if (!select.empty() && _wcsicmp(items[i].path.c_str(), select.c_str()) == 0) sel = i;
     }
@@ -445,6 +601,7 @@ class ExplorerImpl {
 
   // インデックスの状態を読み直す。変わっていれば描き直して true
   bool LoadStates() {
+    if (listMode) return false;
     std::vector<std::pair<std::wstring, bool>> names;
     names.reserve(items.size());
     for (auto& it : items) names.push_back({it.name, it.dir});
@@ -467,19 +624,25 @@ class ExplorerImpl {
   }
 
   void UpdateNavButtons() {
-    EnableWindow(upBtn, !ParentDir(dir).empty());
+    EnableWindow(upBtn, listMode || !ParentDir(dir).empty());
     EnableWindow(backBtn, !backStack.empty());
     EnableWindow(forwardBtn, !forwardStack.empty());
   }
 
   // 別のフォルダへ (戻るの履歴に今の場所を積む)
+  std::wstring Here() const { return listMode ? std::wstring(kListMarker) : dir; }
+
   void Navigate(const std::wstring& d, const std::wstring& select) {
-    if (!dir.empty() && _wcsicmp(d.c_str(), dir.c_str()) != 0) {
+    if (listMode) {
+      backStack.push_back({kListMarker, SelectedPath()});
+      if (backStack.size() > 100) backStack.erase(backStack.begin());
+      forwardStack.clear();
+    } else if (!dir.empty() && _wcsicmp(d.c_str(), dir.c_str()) != 0) {
       backStack.push_back({dir, SelectedPath()});
       if (backStack.size() > 100) backStack.erase(backStack.begin());
       forwardStack.clear();
     }
-    if (_wcsicmp(d.c_str(), dir.c_str()) == 0 && !select.empty()) {
+    if (!listMode && _wcsicmp(d.c_str(), dir.c_str()) == 0 && !select.empty()) {
       // 同じフォルダ: 選び直すだけ
       for (int i = 0; i < int(items.size()); i++) {
         if (_wcsicmp(items[i].path.c_str(), select.c_str()) == 0) {
@@ -496,7 +659,7 @@ class ExplorerImpl {
       MessageBeep(MB_OK);
       return;
     }
-    forwardStack.push_back({dir, SelectedPath()});
+    forwardStack.push_back({Here(), SelectedPath()});
     auto to = backStack.back();
     backStack.pop_back();
     Load(to.first, to.second);
@@ -507,7 +670,7 @@ class ExplorerImpl {
       MessageBeep(MB_OK);
       return;
     }
-    backStack.push_back({dir, SelectedPath()});
+    backStack.push_back({Here(), SelectedPath()});
     auto to = forwardStack.back();
     forwardStack.pop_back();
     Load(to.first, to.second);
@@ -751,6 +914,10 @@ class ExplorerImpl {
   }
 
   void Up() {
+    if (listMode) {  // 検索の結果からは、前のフォルダへ
+      Back();
+      return;
+    }
     std::wstring parent = ParentDir(dir);
     if (parent.empty()) {
       MessageBeep(MB_OK);
@@ -772,6 +939,8 @@ class ExplorerImpl {
     if (it.image) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SAME, L"同じ画像を探す(&S)");
+      AppendMenuW(menu, MF_STRING, MENU_SIMILAR_AI, L"似た画像を探す（AI）(&A)");
+      AppendMenuW(menu, MF_STRING, MENU_RELOOKUP, L"出典を調べ直す(&L)");
     }
     if (it.dir && it.state != kStateIndexed) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -785,6 +954,8 @@ class ExplorerImpl {
       case MENU_SHOW: ShowInShell(path); break;
       case MENU_COPY: CopyText(path); break;
       case MENU_SAME: host->ExplorerFindSameFile(path); break;
+      case MENU_SIMILAR_AI: host->ExplorerFindSimilarAi(path); break;
+      case MENU_RELOOKUP: host->ExplorerRelookup(path); break;
       case MENU_ADD_ROOT:
         host->ExplorerAddRoot(path);
         RefreshStates();
@@ -841,7 +1012,7 @@ class ExplorerImpl {
     RECT rc;
     GetClientRect(grid, &rc);
     RECT r = CellRect(i);
-    if (r.top < 0) ScrollTo(scrollY + r.top - Pad());
+    if (r.top < HeaderH()) ScrollTo(scrollY + r.top - HeaderH() - (Details() ? 0 : Pad()));
     else if (r.bottom > rc.bottom) ScrollTo(scrollY + (r.bottom - rc.bottom) + Pad());
   }
 
@@ -1316,8 +1487,93 @@ class ExplorerImpl {
     StateBadge(dc, box, it.state);
   }
 
+  // 詳細表示の列: 名前・更新日時・種類 (検索の結果ではフォルダ)・サイズ・インデックス。右端の x を返す
+  struct Column {
+    const wchar_t* title;
+    int sortKey;  // 見出しをクリックした時の並び順 (-1 = 並べ替えない)
+    int left, right;
+  };
+  std::vector<Column> DetailColumns() const {
+    int w = GridW();
+    int dateW = Px(140), typeW = listMode ? Px(280) : Px(150), sizeW = Px(90), stateW = Px(96);
+    int nameW = std::max(Px(160), w - dateW - typeW - sizeW - stateW);
+    std::vector<Column> cols = {{L"名前", 0, 0, 0}, {L"更新日時", 1, 0, 0}, {listMode ? L"フォルダ" : L"種類", listMode ? -1 : 2, 0, 0},
+                                {L"サイズ", 3, 0, 0}, {L"インデックス", -1, 0, 0}};
+    int widths[] = {nameW, dateW, typeW, sizeW, stateW};
+    int x = 0;
+    for (size_t i = 0; i < cols.size(); i++) {
+      cols[i].left = x;
+      x += widths[i];
+      cols[i].right = x;
+    }
+    return cols;
+  }
+
+  void PaintDetails(HDC dc, const RECT& rc) {
+    auto cols = DetailColumns();
+    int rowH = CellH(), pad = Px(6);
+    for (int i = 0; i < int(items.size()); i++) {
+      RECT row = CellRect(i);
+      if (row.bottom < HeaderH()) continue;
+      if (row.top > rc.bottom) break;
+      const Item& it = items[size_t(i)];
+      if (i == sel || i == hover) {
+        Fill(dc, row, i == sel ? RGB(204, 232, 255) : RGB(229, 243, 255));
+        if (i == sel) Frame(dc, row, RGB(153, 209, 255));
+      }
+      // 名前: 小さいアイコンと名前
+      HICON icon = IconFor(it);
+      int is = Px(16);
+      if (icon) DrawIconEx(dc, cols[0].left + pad, row.top + (rowH - is) / 2, icon, is, is, 0, nullptr, DI_NORMAL);
+      SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+      auto cell = [&](int c, const std::wstring& text, UINT align) {
+        RECT r = {cols[size_t(c)].left + pad, row.top, cols[size_t(c)].right - pad, row.bottom};
+        DrawTextW(dc, text.c_str(), -1, &r, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+      };
+      RECT nameR = {cols[0].left + pad + is + Px(6), row.top, cols[0].right - pad, row.bottom};
+      DrawTextW(dc, it.name.c_str(), -1, &nameR, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+      FILETIME ft = {DWORD(it.mtime), DWORD(it.mtime >> 32)};
+      if (it.mtime) cell(1, FormatTime(ft), DT_LEFT);
+      SetTextColor(dc, RGB(96, 96, 96));
+      cell(2, listMode ? FolderOf(it.path) : TypeName(const_cast<Item&>(it)), DT_LEFT);
+      if (!it.dir) cell(3, FormatBytes(it.size), DT_RIGHT);
+      if (it.state >= 0) {
+        int r = Px(5), cx = cols[4].left + pad + r, cy = (row.top + row.bottom) / 2;
+        StateBadge(dc, {cx - r * 2, cy - r * 2, cx + r * 2 - Px(1), cy + r * 2 - Px(1)}, it.state);
+        RECT tr = {cols[4].left + pad + r * 3, row.top, cols[4].right - pad, row.bottom};
+        static const wchar_t* names[] = {L"未作成", L"処理待ち", L"作成済み", L"一部"};
+        DrawTextW(dc, names[it.state], -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+      }
+    }
+    // 列の見出し (スクロールしない)
+    RECT hr = {0, 0, rc.right, HeaderH()};
+    Fill(dc, hr, RGB(250, 250, 250));
+    Fill(dc, {0, hr.bottom - 1, rc.right, hr.bottom}, RGB(220, 220, 220));
+    SetTextColor(dc, RGB(76, 96, 122));
+    int key = SortKey();
+    for (const auto& c : cols) {
+      std::wstring t = c.title;
+      if (c.sortKey >= 0 && c.sortKey == key) t += settings.sortDesc ? L" ▼" : L" ▲";
+      RECT r = {c.left + pad, 0, c.right - pad, hr.bottom};
+      DrawTextW(dc, t.c_str(), -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+      if (c.right < rc.right) Fill(dc, {c.right - 1, Px(4), c.right, hr.bottom - Px(4)}, RGB(225, 225, 225));
+    }
+    if (items.empty()) {
+      RECT tr = rc;
+      SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+      DrawTextW(dc, L"(何もありません)", -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+  }
+
   void Paint(HDC dc, const RECT& rc) {
     FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+    if (Details()) {
+      SetBkMode(dc, TRANSPARENT);
+      HGDIOBJ oldFont = SelectObject(dc, nameFont);
+      PaintDetails(dc, rc);
+      SelectObject(dc, oldFont);
+      return;
+    }
     HDC mem = CreateCompatibleDC(dc);
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = SelectObject(dc, nameFont);
@@ -1371,7 +1627,7 @@ class ExplorerImpl {
     RECT rc;
     GetClientRect(preview, &rc);
     int w = rc.right - Px(24);
-    return std::max(Px(48), std::min({w, int(rc.bottom) * 2 / 3, 1024}));
+    return std::max(Px(48), std::min({w, int(rc.bottom) * 2 / 5, 1024}));  // 下にタグと情報を出すので 4 割まで
   }
 
   void ClearPreviewThumb() {
@@ -1390,6 +1646,7 @@ class ExplorerImpl {
     bool same = path == previewPath && previewReady && previewThumb.bucket >= bucket &&
                 (!it || !it->dir || previewThumb.style == settings.folderStyle);
     if (same && !force) return;
+    LoadPreviewTags(it);
     if (path != previewPath) {
       ClearPreviewThumb();
       previewPath = path;
@@ -1495,15 +1752,264 @@ class ExplorerImpl {
     measure.right = nr.right;
     measure.left = nr.left;
     DrawTextW(dc, it->name.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-    RECT ir = {nr.left, measure.bottom + Px(8), nr.right, nr.bottom};
+    // タグ (クリックで検索、ドラッグで取り置き)。ファイルのタグ、続いて検索用のタグ。名前のすぐ下に
+    tagHits.clear();
+    int y = measure.bottom + Px(8);
+    if (it->image && it->path == previewTagsPath) {
+      for (int pass = 0; pass < 2; pass++) {
+        bool any = false;
+        for (const auto& t : previewTags) any = any || t.file == (pass == 0);
+        if (!any) continue;
+        RECT hr = {nr.left, y, nr.right, y + Px(18)};
+        SetTextColor(dc, RGB(90, 90, 90));
+        DrawTextW(dc, pass == 0 ? L"ファイルのタグ" : L"検索用タグ", -1, &hr, DT_LEFT | DT_SINGLELINE);
+        y += Px(20);
+        int x = nr.left;
+        for (size_t i = 0; i < previewTags.size(); i++) {
+          const ExplorerTag& t = previewTags[i];
+          if (t.file != (pass == 0)) continue;
+          SIZE sz = {};
+          GetTextExtentPoint32W(dc, t.tag.c_str(), int(t.tag.size()), &sz);
+          int w = sz.cx + Px(14);
+          if (x > nr.left && x + w > nr.right) {
+            x = nr.left;
+            y += Px(24);
+          }
+          if (y + Px(20) > rc.bottom) break;
+          RECT r = DrawChip(dc, x, y, t.tag, KindColor(t.kind), false);
+          tagHits.push_back({r, i});
+          x = r.right + Px(5);
+        }
+        y += Px(28);
+      }
+      if (previewTags.empty()) {
+        RECT tr = {nr.left, y, nr.right, y + Px(20)};
+        SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+        DrawTextW(dc, L"タグはまだありません", -1, &tr, DT_CENTER | DT_SINGLELINE);
+        y += Px(26);
+      }
+    }
+    RECT ir = {nr.left, y, nr.right, nr.bottom};
     SetTextColor(dc, RGB(96, 96, 96));
     DrawTextW(dc, info.c_str(), -1, &ir, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
     SelectObject(dc, oldFont);
   }
 
+  // ---------------------------------------------------------------- タグ (プレビュー) と取り置き
+
+  std::vector<ExplorerTag> previewTags;
+  std::wstring previewTagsPath;
+  struct TagHit {
+    RECT r;
+    size_t index;
+  };
+  std::vector<TagHit> tagHits;  // プレビューに描いたタグ
+  int tagDown = -1;             // 押したタグ (tagHits の番号)
+  bool tagDragging = false;
+  POINT tagDownPt = {};
+
+  std::vector<std::pair<std::wstring, bool>> tray;  // 取り置いたタグと、検索に使うか
+  struct TrayHit {
+    RECT chip, close;
+    size_t index;
+  };
+  std::vector<TrayHit> trayHits;
+  RECT traySearchR = {}, trayClearR = {};
+  bool trayHot = false;  // タグをドラッグして上に来ている
+
+  // タグの種類の色 (Danbooru に近い): 作者 赤、キャラ 緑、作品 紫、一般 青、ほか 灰か橙
+  static COLORREF KindColor(const std::wstring& kind) {
+    if (kind == L"artist") return RGB(192, 0, 4);
+    if (kind == L"character") return RGB(0, 150, 32);
+    if (kind == L"copyright") return RGB(160, 0, 170);
+    if (kind == L"general") return RGB(0, 100, 220);
+    if (kind == L"action" || kind == L"item") return RGB(204, 110, 0);
+    return RGB(110, 110, 110);
+  }
+
+  // 角の丸いタグの札を描いて、その四角を返す
+  RECT DrawChip(HDC dc, int x, int y, const std::wstring& text, COLORREF color, bool filled, bool closeMark = false) {
+    SIZE sz = {};
+    GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &sz);
+    int h = Px(20), padX = Px(7), closeW = closeMark ? Px(14) : 0;
+    RECT r = {x, y, x + sz.cx + padX * 2 + closeW, y + h};
+    HBRUSH br = CreateSolidBrush(filled ? color : RGB(255, 255, 255));
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, Px(8), Px(8));
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+    SetTextColor(dc, filled ? RGB(255, 255, 255) : color);
+    RECT tr = {r.left + padX, r.top, r.right - padX - closeW, r.bottom};
+    DrawTextW(dc, text.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (closeMark) {
+      RECT cr = {r.right - padX - closeW, r.top, r.right - Px(4), r.bottom};
+      DrawTextW(dc, L"×", -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    return r;
+  }
+
+  void LoadPreviewTags(const Item* it) {
+    std::wstring path = it && it->image ? it->path : std::wstring();
+    if (path == previewTagsPath) return;
+    previewTagsPath = path;
+    previewTags = path.empty() ? std::vector<ExplorerTag>() : host->ExplorerTags(path);
+  }
+
+  void SaveTray() {
+    settings.tray.clear();
+    for (auto& t : tray) settings.tray.push_back(t.first);
+    host->ExplorerSettingsChanged(settings);
+    InvalidateRect(trayWnd, nullptr, FALSE);
+  }
+
+  void AddTray(const std::wstring& tag) {
+    for (auto& t : tray)
+      if (_wcsicmp(t.first.c_str(), tag.c_str()) == 0) {
+        t.second = true;
+        SaveTray();
+        return;
+      }
+    tray.push_back({tag, true});
+    SaveTray();
+  }
+
+  void TraySearch() {
+    std::vector<std::wstring> tags;
+    for (auto& t : tray)
+      if (t.second) tags.push_back(t.first);
+    if (tags.empty()) {
+      MessageBeep(MB_OK);
+      return;
+    }
+    host->ExplorerSearchTags(tags);
+  }
+
+  void PaintTray(HDC dc, const RECT& rc) {
+    Fill(dc, rc, trayHot ? RGB(222, 238, 255) : RGB(244, 246, 250));
+    Fill(dc, {rc.left, rc.bottom - 1, rc.right, rc.bottom}, RGB(220, 220, 220));
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, nameFont);
+    int x = Px(8), y = (rc.bottom - Px(20)) / 2;
+    RECT lr = {x, 0, x + Px(70), rc.bottom};
+    SetTextColor(dc, RGB(90, 90, 90));
+    DrawTextW(dc, L"取り置き", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    x += Px(64);
+    // 右端に「組み合わせて検索」「クリア」（文字の幅に合わせる）
+    auto chipW = [&](const wchar_t* t) {
+      SIZE sz = {};
+      GetTextExtentPoint32W(dc, t, int(wcslen(t)), &sz);
+      return int(sz.cx) + Px(14);
+    };
+    int cw = chipW(L"クリア"), sw = chipW(L"組み合わせて検索");
+    trayClearR = {rc.right - Px(8) - cw, y, rc.right - Px(8), y + Px(20)};
+    traySearchR = {trayClearR.left - Px(6) - sw, y, trayClearR.left - Px(6), y + Px(20)};
+    trayHits.clear();
+    if (tray.empty()) {
+      RECT tr = {x, 0, traySearchR.left, rc.bottom};
+      SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+      DrawTextW(dc, L"プレビューのタグをここにドラッグすると取り置けます。取り置いたタグを組み合わせて検索できます（クリックで使う・使わない、× で外す）",
+                -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    for (size_t i = 0; i < tray.size(); i++) {
+      if (x > traySearchR.left - Px(40)) break;
+      RECT r = DrawChip(dc, x, y, tray[i].first, tray[i].second ? RGB(0, 100, 220) : RGB(150, 150, 150), tray[i].second, true);
+      trayHits.push_back({r, {r.right - Px(20), r.top, r.right, r.bottom}, i});
+      x = r.right + Px(6);
+    }
+    DrawChip(dc, traySearchR.left, traySearchR.top, L"組み合わせて検索", RGB(0, 120, 60), true);
+    DrawChip(dc, trayClearR.left, trayClearR.top, L"クリア", RGB(120, 120, 120), false);
+    SelectObject(dc, oldFont);
+  }
+
+  void TrayClick(POINT pt) {
+    if (PtInRect(&traySearchR, pt)) {
+      TraySearch();
+      return;
+    }
+    if (PtInRect(&trayClearR, pt)) {
+      tray.clear();
+      SaveTray();
+      return;
+    }
+    for (const auto& h : trayHits) {
+      if (PtInRect(&h.close, pt)) {
+        tray.erase(tray.begin() + long(h.index));
+        SaveTray();
+        return;
+      }
+      if (PtInRect(&h.chip, pt)) {
+        tray[h.index].second = !tray[h.index].second;
+        SaveTray();
+        return;
+      }
+    }
+  }
+
+  static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* self = reinterpret_cast<ExplorerImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+      self = reinterpret_cast<ExplorerImpl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(self));
+      self->trayWnd = hwnd;
+    }
+    if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+    switch (msg) {
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HDC buf = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
+        HGDIOBJ old = SelectObject(buf, bmp);
+        self->PaintTray(buf, rc);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+        SelectObject(buf, old);
+        DeleteObject(bmp);
+        DeleteDC(buf);
+        EndPaint(hwnd, &ps);
+        return 0;
+      }
+      case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_LBUTTONUP:
+        self->TrayClick(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+  }
+
+  // プレビューのタグを押した・離した
+  int TagAt(POINT pt) const {
+    for (size_t i = 0; i < tagHits.size(); i++)
+      if (PtInRect(&tagHits[i].r, pt)) return int(i);
+    return -1;
+  }
+
+  void TagMenu(int hit, POINT screen) {
+    const ExplorerTag& t = previewTags[tagHits[size_t(hit)].index];
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, MENU_TAG_SEARCH, L"このタグで検索(&S)");
+    AppendMenuW(menu, MF_STRING, MENU_TAG_TRAY, L"取り置く(&K)");
+    AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, L"コピー(&C)");
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd == MENU_TAG_SEARCH) host->ExplorerSearchTags({t.tag});
+    if (cmd == MENU_TAG_TRAY) AddTray(t.tag);
+    if (cmd == MENU_TAG_COPY) CopyText(t.tag);
+  }
+
   // ---------------------------------------------------------------- 「同じ画像」
 
   void FillSameList() {
+    fillingList = true;
+    ShowWindow(sameView, resultsMode == 0 ? SW_SHOW : SW_HIDE);
     SendMessageW(sameList, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(sameList);
     while (Header_GetItemCount(ListView_GetHeader(sameList)) > 0) ListView_DeleteColumn(sameList, 0);
@@ -1531,7 +2037,11 @@ class ExplorerImpl {
         col++;
       }
     };
-    if (settings.resultsView == 1) {
+    if (resultsMode == 1) {
+      column(0, L"重複（パスをクリックすると、エクスプローラーで表示します）", 900, LVCFMT_LEFT);
+      for (size_t i = 0; i < groupRows.size(); i++)
+        add(int(i), {groupRows[i].header ? L"■ " + groupRows[i].text : L"　　" + groupRows[i].path});
+    } else if (settings.resultsView == 1) {
       column(0, L"フォルダ", 520, LVCFMT_LEFT);
       column(1, L"完全一致", 80, LVCFMT_RIGHT);
       column(2, L"見た目一致", 90, LVCFMT_RIGHT);
@@ -1554,9 +2064,24 @@ class ExplorerImpl {
     }
     SendMessageW(sameList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(sameList, nullptr, TRUE);
+    fillingList = false;
+  }
+
+  void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups) {
+    resultsMode = 1;
+    groupRows.clear();
+    size_t paths = 0;
+    for (auto& g : groups) {
+      groupRows.push_back({true, g.title, L""});
+      for (auto& p : g.paths) groupRows.push_back({false, L"", p});
+      paths += g.paths.size();
+    }
+    SetWindowTextW(sameText, (title + L"　" + std::to_wstring(groups.size()) + L" グループ・" + std::to_wstring(paths) + L" 枚").c_str());
+    FillSameList();
   }
 
   void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches) {
+    resultsMode = 0;
     same = std::move(matches);
     sameFolders.clear();
     std::map<std::wstring, size_t> index;
@@ -1592,24 +2117,36 @@ class ExplorerImpl {
   void GoToSame(int i) {
     if (i < 0) return;
     std::wstring target;
-    if (settings.resultsView == 1) {
+    if (resultsMode == 1) {
+      if (i < int(groupRows.size())) {
+        // 見出しなら、そのまとまりの最初の画像
+        size_t k = size_t(i);
+        while (k < groupRows.size() && groupRows[k].header) k++;
+        if (k < groupRows.size()) target = groupRows[k].path;
+      }
+    } else if (settings.resultsView == 1) {
       if (i < int(sameFolders.size())) target = sameFolders[size_t(i)].first;
     } else if (i < int(same.size())) {
       target = same[size_t(i)].path;
     }
     if (target.empty()) return;
     Navigate(FolderOf(target), target);
-    SetFocus(grid);
   }
 
   void SameContextMenu(int i, POINT screen) {
     if (i < 0) return;
-    std::wstring target = settings.resultsView == 1 ? (i < int(sameFolders.size()) ? sameFolders[size_t(i)].folder : L"")
-                                                    : (i < int(same.size()) ? same[size_t(i)].path : L"");
+    std::wstring target;
+    if (resultsMode == 1) {
+      if (i < int(groupRows.size()) && !groupRows[size_t(i)].header) target = groupRows[size_t(i)].path;
+    } else {
+      target = settings.resultsView == 1 ? (i < int(sameFolders.size()) ? sameFolders[size_t(i)].folder : L"")
+                                         : (i < int(same.size()) ? same[size_t(i)].path : L"");
+    }
     if (target.empty()) return;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_OPEN, L"ここへ移る(&G)");
-    if (settings.resultsView == 0) AppendMenuW(menu, MF_STRING, MENU_SAME, L"開く(&O)");
+    bool folderRow = resultsMode == 0 && settings.resultsView == 1;
+    if (!folderRow) AppendMenuW(menu, MF_STRING, MENU_SAME, L"開く(&O)");
     AppendMenuW(menu, MF_STRING, MENU_SHOW, L"エクスプローラーで表示(&E)");
     AppendMenuW(menu, MF_STRING, MENU_COPY, L"パスをコピー(&C)");
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
@@ -1618,7 +2155,7 @@ class ExplorerImpl {
       case MENU_OPEN: GoToSame(i); break;
       case MENU_SAME: host->ExplorerOpen(target); break;
       case MENU_SHOW:
-        if (settings.resultsView == 1) ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (folderRow) ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         else ShowInShell(target);
         break;
       case MENU_COPY: CopyText(target); break;
@@ -1630,6 +2167,7 @@ class ExplorerImpl {
   int BarH() const { return Px(34); }
   int SplitW() const { return Px(5); }
   int SameHeaderH() const { return Px(28); }
+  int TrayH() const { return Px(30); }
 
   // パネルの幅 (窓が狭い時はサムネイルの一覧に Px(160) は残す)
   void PanelWidths(int total, int* tw, int* pw) const {
@@ -1645,7 +2183,7 @@ class ExplorerImpl {
 
   // 下の「同じ画像」の高さ (窓が低い時は上に Px(160) は残す)
   int ResultsH(int total) const {
-    return std::max(SameHeaderH() + Px(40), std::min(Px(settings.resultsHeight), total - BarH() - Px(160)));
+    return std::max(SameHeaderH() + Px(40), std::min(Px(settings.resultsHeight), total - BarH() - TrayH() - Px(160)));
   }
 
   void LayoutBar() {
@@ -1664,17 +2202,27 @@ class ExplorerImpl {
     x += toggleW + Px(6);
     int right = rc.right - m;
     MoveWindow(previewBtn, right - toggleW, m, toggleW, bh, TRUE);
-    right -= toggleW + Px(8);
-    int folderW = Px(150), sizeW = Px(64), sliderW = Px(120), labelW = Px(44);
+    right -= toggleW + Px(6);
+    // 右から: 表紙・大きさ・並び順・表示
+    int folderW = Px(130), sizeW = Px(60), sliderW = Px(90), sortW = Px(118), dirW = Px(44), viewW = Px(92);
     int fx = right - folderW;
     MoveWindow(folderBox, fx, m, folderW, Px(200), TRUE);
-    MoveWindow(folderLabel, fx - labelW, m + Px(5), labelW - Px(4), bh - Px(5), TRUE);
-    int sx = fx - labelW - Px(6) - sliderW;
+    int sx = fx - Px(4) - sliderW;
     MoveWindow(slider, sx, m, sliderW, bh, TRUE);
     int bx = sx - sizeW - Px(2);
     MoveWindow(sizeBox, bx, m, sizeW, Px(200), TRUE);
-    MoveWindow(sizeLabel, bx - labelW, m + Px(5), labelW - Px(4), bh - Px(5), TRUE);
-    MoveWindow(pathText, x, m + Px(1), std::max(Px(60), int(bx - labelW - x - Px(6))), bh - Px(2), TRUE);
+    int dx = bx - Px(8) - dirW;
+    MoveWindow(sortDirBtn, dx, m, dirW, bh, TRUE);
+    int ox = dx - Px(2) - sortW;
+    MoveWindow(sortBox, ox, m, sortW, Px(220), TRUE);
+    int vx = ox - Px(6) - viewW;
+    MoveWindow(viewBox, vx, m, viewW, Px(200), TRUE);
+    ShowWindow(sizeLabel, SW_HIDE);
+    ShowWindow(folderLabel, SW_HIDE);
+    MoveWindow(pathText, x, m + Px(1), std::max(Px(60), int(vx - x - Px(6))), bh - Px(2), TRUE);
+    // 取り置いたタグ
+    MoveWindow(trayWnd, 0, h, rc.right, TrayH(), TRUE);
+    h += TrayH();
 
     int resultsH = ResultsH(rc.bottom);
     int top = h, bodyH = std::max(0, int(rc.bottom - h - resultsH - SplitW()));
@@ -1694,9 +2242,9 @@ class ExplorerImpl {
     MoveWindow(grid, gx, top, std::max(0, gr - gx), bodyH, TRUE);
     // 「同じ画像」
     int sy = top + bodyH + SplitW();
-    int viewW = Px(120);
-    MoveWindow(sameText, m, sy + Px(5), std::max(0, int(rc.right - viewW - m * 3)), SameHeaderH() - Px(6), TRUE);
-    MoveWindow(sameView, rc.right - m - viewW, sy + Px(2), viewW, Px(200), TRUE);
+    int sameViewW = Px(120);
+    MoveWindow(sameText, m, sy + Px(5), std::max(0, int(rc.right - sameViewW - m * 3)), SameHeaderH() - Px(6), TRUE);
+    MoveWindow(sameView, rc.right - m - sameViewW, sy + Px(2), sameViewW, Px(200), TRUE);
     MoveWindow(sameList, 0, sy + SameHeaderH(), rc.right, std::max(0, int(rc.bottom - sy - SameHeaderH())), TRUE);
     InvalidateRect(hwnd, nullptr, TRUE);
   }
@@ -1705,7 +2253,7 @@ class ExplorerImpl {
   int SplitAt(POINT pt) const {
     RECT rc;
     GetClientRect(hwnd, &rc);
-    if (pt.y < BarH()) return 0;
+    if (pt.y < BarH() + TrayH()) return 0;
     int resultsH = ResultsH(rc.bottom);
     int splitY = rc.bottom - resultsH - SplitW();
     if (pt.y >= splitY && pt.y < splitY + SplitW()) return 3;
@@ -1790,8 +2338,21 @@ class ExplorerImpl {
         auto* nm = reinterpret_cast<NMHDR*>(lp);
         if (nm->hwndFrom == self->tree) return self->TreeNotify(nm);
         if (nm->hwndFrom == self->sameList) {
-          if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
-            self->GoToSame(ListView_GetNextItem(self->sameList, -1, LVNI_SELECTED));
+          // 行を選んだら (クリック・矢印キー)、エクスプローラーでその画像を表示する
+          if (nm->code == LVN_ITEMCHANGED && !self->fillingList) {
+            auto* lv = reinterpret_cast<NMLISTVIEW*>(lp);
+            if ((lv->uChanged & LVIF_STATE) && (lv->uNewState & LVIS_SELECTED) && !(lv->uOldState & LVIS_SELECTED)) self->GoToSame(lv->iItem);
+          }
+          if (nm->code == NM_DBLCLK || nm->code == NM_RETURN) {
+            int i = ListView_GetNextItem(self->sameList, -1, LVNI_SELECTED);
+            self->GoToSame(i);
+            if (self->resultsMode == 1 || self->settings.resultsView == 0) {
+              // ダブルクリックは開く
+              std::wstring t = self->resultsMode == 1 ? (i >= 0 && i < int(self->groupRows.size()) ? self->groupRows[size_t(i)].path : L"")
+                                                      : (i >= 0 && i < int(self->same.size()) ? self->same[size_t(i)].path : L"");
+              if (!t.empty()) self->host->ExplorerOpen(t);
+            }
+          }
           if (nm->code == NM_RCLICK) {
             POINT pt;
             GetCursorPos(&pt);
@@ -1838,6 +2399,27 @@ class ExplorerImpl {
               self->UpdatePreview();
               SetFocus(self->grid);
             }
+            return 0;
+          case ID_VIEW:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+              self->settings.viewMode = int(SendMessageW(self->viewBox, CB_GETCURSEL, 0, 0));
+              self->host->ExplorerSettingsChanged(self->settings);
+              self->scrollY = 0;
+              self->UpdateScroll();
+              self->EnsureVisible(self->sel);
+              InvalidateRect(self->grid, nullptr, FALSE);
+              SetFocus(self->grid);
+            }
+            return 0;
+          case ID_SORT:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+              self->SetSort(int(SendMessageW(self->sortBox, CB_GETCURSEL, 0, 0)), self->settings.sortDesc);
+              SetFocus(self->grid);
+            }
+            return 0;
+          case ID_SORT_DIR:
+            self->SetSort(self->SortKey(), !self->settings.sortDesc);
+            SetFocus(self->grid);
             return 0;
           case ID_SAME_VIEW:
             if (HIWORD(wp) == CBN_SELCHANGE) {
@@ -1923,11 +2505,75 @@ class ExplorerImpl {
         if (!self->dragSplit) self->UpdatePreview();
         return 0;
       case WM_LBUTTONDBLCLK:
-        self->Open(self->sel);
+        if (self->TagAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}) < 0) self->Open(self->sel);
         return 0;
-      case WM_LBUTTONDOWN:
-        SetFocus(self->grid);
+      case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        if (self->tagDragging || self->TagAt(pt) >= 0) {
+          SetCursor(LoadCursor(nullptr, self->tagDragging ? IDC_SIZEALL : IDC_HAND));
+          return TRUE;
+        }
+        break;
+      }
+      case WM_LBUTTONDOWN: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        self->tagDown = self->TagAt(pt);
+        self->tagDragging = false;
+        self->tagDownPt = pt;
+        if (self->tagDown >= 0) SetCapture(hwnd);
+        else SetFocus(self->grid);
         return 0;
+      }
+      case WM_MOUSEMOVE:
+        if (self->tagDown >= 0 && GetCapture() == hwnd) {
+          POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+          if (!self->tagDragging && (abs(pt.x - self->tagDownPt.x) > self->Px(4) || abs(pt.y - self->tagDownPt.y) > self->Px(4)))
+            self->tagDragging = true;
+          if (self->tagDragging) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            POINT sp = pt;
+            ClientToScreen(hwnd, &sp);
+            bool hot = WindowFromPoint(sp) == self->trayWnd;
+            if (hot != self->trayHot) {
+              self->trayHot = hot;
+              InvalidateRect(self->trayWnd, nullptr, FALSE);
+            }
+          }
+        }
+        return 0;
+      case WM_LBUTTONUP:
+        if (self->tagDown >= 0 && GetCapture() == hwnd) {
+          ReleaseCapture();
+          int hit = self->tagDown;
+          self->tagDown = -1;
+          if (hit < int(self->tagHits.size())) {
+            const std::wstring tag = self->previewTags[self->tagHits[size_t(hit)].index].tag;
+            if (self->tagDragging) {
+              POINT sp = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+              ClientToScreen(hwnd, &sp);
+              if (WindowFromPoint(sp) == self->trayWnd) self->AddTray(tag);
+            } else {
+              self->host->ExplorerSearchTags({tag});
+            }
+          }
+          self->tagDragging = false;
+          if (self->trayHot) {
+            self->trayHot = false;
+            InvalidateRect(self->trayWnd, nullptr, FALSE);
+          }
+        }
+        return 0;
+      case WM_RBUTTONUP: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int hit = self->TagAt(pt);
+        if (hit >= 0) {
+          ClientToScreen(hwnd, &pt);
+          self->TagMenu(hit, pt);
+        }
+        return 0;
+      }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
   }
@@ -2024,6 +2670,13 @@ class ExplorerImpl {
       case WM_LBUTTONDOWN:
       case WM_RBUTTONDOWN: {
         SetFocus(grid);
+        if (msg == WM_LBUTTONDOWN && GET_Y_LPARAM(lp) < HeaderH()) {
+          // 列の見出し: その列で並べる (同じ列なら向きを変える)
+          for (const auto& c : DetailColumns())
+            if (GET_X_LPARAM(lp) >= c.left && GET_X_LPARAM(lp) < c.right && c.sortKey >= 0)
+              SetSort(c.sortKey, c.sortKey == SortKey() ? !settings.sortDesc : false);
+          return 0;
+        }
         int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
         if (h >= 0) Select(h);
         return 0;
@@ -2152,6 +2805,12 @@ class ExplorerImpl {
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     pc.lpszClassName = kPreviewClass;
     RegisterClassExW(&pc);
+    WNDCLASSEXW tc = {sizeof(tc)};
+    tc.lpfnWndProc = TrayProc;
+    tc.hInstance = inst;
+    tc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    tc.lpszClassName = kTrayClass;
+    RegisterClassExW(&tc);
     HDC sdc = GetDC(nullptr);
     dpi = GetDeviceCaps(sdc, LOGPIXELSX);
     ReleaseDC(nullptr, sdc);
@@ -2184,6 +2843,14 @@ class ExplorerImpl {
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(kMinSize, kMaxSize));
     SendMessageW(slider, TBM_SETPAGESIZE, 0, 32);
     folderLabel = make(L"STATIC", L"表紙", SS_RIGHT, ID_FOLDER_LABEL);
+    viewBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_VIEW);
+    for (const wchar_t* t : {L"サムネイル", L"詳細"}) SendMessageW(viewBox, CB_ADDSTRING, 0, LPARAM(t));
+    settings.viewMode = std::max(0, std::min(1, settings.viewMode));
+    SendMessageW(viewBox, CB_SETCURSEL, settings.viewMode, 0);
+    sortBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SORT);
+    for (const wchar_t* t : {L"名前順", L"更新日時順", L"種類順", L"サイズ順", L"検索結果の順"}) SendMessageW(sortBox, CB_ADDSTRING, 0, LPARAM(t));
+    settings.sortKey = std::max(0, std::min(3, settings.sortKey));
+    sortDirBtn = make(L"BUTTON", L"昇順", BS_PUSHBUTTON, ID_SORT_DIR);
     folderBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_FOLDER);
     for (const wchar_t* t : {L"1 枚目", L"1・2 枚目", L"最後と 1 枚目", L"最後", L"最後の一つ前と最後"})
       SendMessageW(folderBox, CB_ADDSTRING, 0, LPARAM(t));
@@ -2198,6 +2865,8 @@ class ExplorerImpl {
     SetWindowSubclass(tree, ChildKeyProc, 1, DWORD_PTR(this));
     TreeInit();
     CreateWindowExW(0, kPreviewClass, nullptr, WS_CHILD, 0, 0, 10, 10, hwnd, nullptr, inst, this);
+    CreateWindowExW(0, kTrayClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
+    for (const auto& t : settings.tray) tray.push_back({t, true});
     // 「同じ画像」
     sameText = make(L"STATIC", L"画像を選ぶか、画像のファイル・URL をここにドロップすると、同じ画像（インデックスを作ったフォルダの中）を探します。"
                                L"　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部",
@@ -2219,6 +2888,7 @@ class ExplorerImpl {
     settings.customSize = std::max(kMinSize, std::min(kMaxSize, settings.customSize));
     SendMessageW(sizeBox, CB_SETCURSEL, settings.sizeMode, 0);
     SendMessageW(slider, TBM_SETPOS, TRUE, CurrentLogicalSize());
+    UpdateSortBox();
     // ドロップ (ファイル・ブラウザーからの画像の URL)
     OleInitialize(nullptr);
     drop = new DropTarget([this](const std::vector<std::wstring>& files, const std::wstring& url) { Dropped(files, url); });
@@ -2281,3 +2951,12 @@ void Explorer::RefreshStates() { impl_->RefreshStates(); }
 void Explorer::SetSameStatus(const std::wstring& text) { SetWindowTextW(impl_->sameText, text.c_str()); }
 
 void Explorer::SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches) { impl_->SetSame(title, std::move(matches)); }
+
+void Explorer::ShowList(const std::wstring& title, std::vector<std::wstring> paths, int select) {
+  impl_->ShowList(title, std::move(paths), select);
+  SetFocus(impl_->grid);
+}
+
+void Explorer::SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups) { impl_->SetGroups(title, std::move(groups)); }
+
+void Explorer::AddTrayTag(const std::wstring& tag) { impl_->AddTray(tag); }

@@ -30,6 +30,7 @@ enum Cmd : int {
     CMD_REFS,
     CMD_STATS,
     CMD_TAB_EXPLORER,
+    CMD_FIND_SAME,
     CMD_TAB_DUPES,
     CMD_TAB_SEARCH,
     CMD_SAVE_SMART,

@@ -130,6 +130,13 @@ enum : int {
     IDC_S_UNCLASSIFIED,
     IDC_S_DEADLINKS,
     IDC_S_CLIP,
+    IDC_S_FREE,
+    IDC_S_SCOPE,
+    IDC_S_GO,
+    IDC_S_ADVANCED,
+    IDC_S_DATEFIELD,
+    IDC_DUPBAR,
+    IDC_RIBBON_LINE,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
 constexpr int kDefaultThreshold = 10;
@@ -197,9 +204,16 @@ struct App {
     struct SearchCtl {
         HWND tags, conf, confValue, sources, text, clip, rating, format, quality, from, to, noTaken, unclassified, deadLinks, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
-        std::vector<HWND> labels;  // 見出し（並べる順）
+        HWND free, scope, go, advanced, dateField;
+        // 見出し（リボンと詳細検索）
+        HWND lSort, lClip, lSmart, lRating, lFormat, lQuality, lWidth, lSize, lSizeTo, lPath, lDownload, lDate, lDateTo, lConf, lSources;
+        std::vector<HWND> labels;
     } s{};
     std::vector<HWND> searchPage;
+    std::vector<HWND> advancedPage;  // 詳細検索（普段は隠す）
+    bool advancedShown = false;
+    HWND dupBar = nullptr, ribbonLine = nullptr;  // 重複を探すリボンのボタン、リボンの下の線
+    std::vector<std::wstring> searchPaths;        // 検索の結果のパス（searchIds と同じ並び。エクスプローラーに出した分）
     std::vector<int64_t> searchIds;
     size_t searchTotal = 0;
     unsigned searchGen = 0;
@@ -250,19 +264,42 @@ struct App {
 
 App app;
 
+// エクスプローラーの画面のホスト（中身は「エクスプローラーの画面」のところ）
+struct ExplorerApp : ExplorerHost {
+    std::unique_ptr<Explorer> view;
+    SameImageIndex index;          // 見た目一致を探すための、DB の全部の画像の dHash
+    std::atomic<unsigned> gen{0};  // 新しく探し始めたら古い結果は捨てる
+    std::wstring pendingSel;       // 選んでから少し待って探す画像
+    bool shown = false;
+
+    void ExplorerOpen(const std::wstring& path) override;
+    void ExplorerSelected(const std::wstring& path, bool image) override;
+    void ExplorerFindSameFile(const std::wstring& path) override;
+    void ExplorerFindSameUrl(const std::wstring& url) override;
+    void ExplorerAddRoot(const std::wstring& dir) override;
+    void ExplorerSettingsChanged(const ExplorerSettings& s) override;
+    std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
+    std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) override;
+    void ExplorerSearchTags(const std::vector<std::wstring>& tags) override;
+    void ExplorerFindSimilarAi(const std::wstring& path) override;
+    void ExplorerRelookup(const std::wstring& path) override;
+} ex;
+
 int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
 
 // ---------------------------------------------------------------- ツールバー
 
 int stopImage = 0, startImage = 0;  // 検索開始ボタンの絵（検索中は中止の絵にする）
 
-void tbEnable(int id, bool on) { SendMessageW(app.toolbar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0)); }
+void tbEnable(int id, bool on) {
+    for (HWND bar : {app.toolbar, app.dupBar}) SendMessageW(bar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0));
+}
 
 void tbSetText(int id, const wchar_t* text) {
     TBBUTTONINFOW bi{sizeof(bi)};
     bi.dwMask = TBIF_TEXT;
     bi.pszText = const_cast<wchar_t*>(text);
-    SendMessageW(app.toolbar, TB_SETBUTTONINFOW, id, reinterpret_cast<LPARAM>(&bi));
+    for (HWND bar : {app.toolbar, app.dupBar}) SendMessageW(bar, TB_SETBUTTONINFOW, id, reinterpret_cast<LPARAM>(&bi));
 }
 
 // ---------------------------------------------------------------- 設定
@@ -663,6 +700,17 @@ void showResult(Result&& r, bool query) {
     if (app.result.unreadable) s += L"　読めない画像 " + withCommas(app.result.unreadable) + L" 枚";
     if (app.result.flatSkipped) s += L"　単色に近いため比べなかった画像 " + withCommas(app.result.flatSkipped) + L" 枚";
     setText(app.status, s);
+    // 結果は、エクスプローラーの下の一覧にパスで出す（クリックでその画像を表示）
+    std::vector<ExplorerGroup> groups;
+    for (size_t i = 0; i < app.result.groups.size(); ++i) {
+        const Group& g = app.result.groups[i];
+        ExplorerGroup eg;
+        eg.title = (query ? std::wstring(L"似た画像") : L"#" + std::to_wstring(i + 1) + L"　" + widen(kindName(g.kind))) + L"　" +
+                   withCommas(g.members.size()) + L" 枚" + (query ? L"" : L"・消せば " + sizeText(g.reclaim) + L" 空く");
+        for (const auto& m : g.members) eg.paths.push_back(widen(app.result.files[m.index].path));
+        groups.push_back(std::move(eg));
+    }
+    ex.view->SetGroups(query ? L"1 枚で検索" : L"重複", std::move(groups));
 }
 
 // ---------------------------------------------------------------- 検索
@@ -670,7 +718,7 @@ void showResult(Result&& r, bool query) {
 void setRunning(bool on) {
     app.running = on;
     tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"検索開始");
-    SendMessageW(app.toolbar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
+    SendMessageW(app.dupBar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
     for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat, app.variants}) EnableWindow(h, !on);
     for (int id : {CMD_ADD_FOLDER, CMD_QUERY}) tbEnable(id, !on);
     tbEnable(CMD_EXPORT, !on && !app.result.groups.empty());
@@ -1118,11 +1166,7 @@ std::wstring memberPath(int item) {
 const ImageInfo* resultInfo(int item);
 
 // 今の画面で選んでいる画像のパス
-std::wstring selectedPath() {
-    if (app.tab == 0) return memberPath(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED));
-    const ImageInfo* info = resultInfo(ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED));
-    return info ? widen(info->path) : L"";
-}
+std::wstring selectedPath() { return ex.view ? ex.view->Selected() : L""; }
 
 // 画像の右クリックのメニュー
 void findSimilar(int64_t imageId, const std::wstring& name);
@@ -1231,9 +1275,11 @@ struct SearchDone {
     bool rest = false;  // 2 回目（先頭の後の残り全部）
     bool clip = false;  // 内容（CLIP）で似ている順に上位だけ
     std::vector<float> scores;
+    std::vector<std::wstring> paths;  // ids と同じ並び
 };
 
-constexpr size_t kFirstResults = 2000;  // まず先頭だけ並べて見せる（残りは裏で）
+constexpr size_t kFirstResults = 2000;  // 内容（CLIP）で似ている順に出す数
+constexpr size_t kListResults = 20000;  // エクスプローラーに出す検索の結果の数（多い時は先頭だけ）
 
 Db* uiDb() {
     if (!app.uiDb) {
@@ -1296,12 +1342,22 @@ std::optional<int64_t> pickerDate(HWND h, bool endOfDay) {
     return civilToUnix(st.wYear, st.wMonth, st.wDay, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
 }
 
+// 並べ替えの選択肢（検索のリボンの並び）
+const SortKey kSortChoices[] = {SortKey::Relevance, SortKey::FileName, SortKey::Path,   SortKey::Modified, SortKey::Created,
+                                SortKey::Taken,     SortKey::Resolution, SortKey::Size, SortKey::Rating,   SortKey::Title,
+                                SortKey::Confidence, SortKey::Aesthetic, SortKey::Effective};
+
 SearchQuery searchQueryFromUi() {
     SearchQuery q;
-    parseTagQuery(narrow(editText(app.s.tags)), q.tags, q.excludeTags);
+    // フリーワード: 「タグに限る」はタグの名前どおり（別名を含む）、ほかはタグ・タイトル・ファイル名などから探して関連度で並べる
+    const std::string free = narrow(editText(app.s.free));
+    const int scope = std::max(0, ComboBox_GetCurSel(app.s.scope));
+    if (scope == 1) parseTagQuery(free, q.tags, q.excludeTags);
+    else q.freeText = free;
+    q.freeScope = scope == 2 ? FreeScope::Title : FreeScope::All;
     q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
     q.excludeSources.assign(app.uncheckedSources.begin(), app.uncheckedSources.end());
-    q.text = narrow(editText(app.s.text));
+    q.dateField = static_cast<DateField>(std::clamp(ComboBox_GetCurSel(app.s.dateField), 0, 2));
     if (app.similarTo) q.similarTo = app.similarTo;
     else q.clipText = narrow(editText(app.s.clip));
     const int rating = ComboBox_GetCurSel(app.s.rating);  // 0: 指定なし、1〜5: ★n 以上、6: 星なし
@@ -1325,11 +1381,9 @@ SearchQuery searchQueryFromUi() {
     q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
     q.pathContains = narrow(editText(app.s.path));
     q.downloadContains = narrow(editText(app.s.download));
-    static const SortKey sorts[] = {SortKey::Path,   SortKey::Modified, SortKey::Created,    SortKey::Taken,
-                                    SortKey::Resolution, SortKey::Size, SortKey::Rating,     SortKey::Title,
-                                    SortKey::Confidence, SortKey::Aesthetic, SortKey::Effective};
     const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
-    q.sort = sorts[std::min<int>(sort, static_cast<int>(std::size(sorts)) - 1)];
+    q.sort = kSortChoices[std::min<int>(sort, static_cast<int>(std::size(kSortChoices)) - 1)];
+    if (q.sort == SortKey::Relevance && scope == 1 && !q.tags.empty()) q.sort = SortKey::Confidence;  // タグの関連度は確度
     q.descending = Button_GetCheck(app.s.desc) == BST_CHECKED;
     q.review = Button_GetCheck(app.s.review) == BST_CHECKED;
     return q;
@@ -1337,13 +1391,18 @@ SearchQuery searchQueryFromUi() {
 
 // 条件が変わったら、少し待ってから探す（スライダーを動かしている間や、文字を打っている間は探さない）
 void scheduleSearch(UINT delayMs) {
-    if (app.tab != 1) return;
+    if (!app.searchShown) return;  // まだ一度も検索していない（条件を変えただけでは探し始めない）
     SetTimer(app.hwnd, kSearchTimer, delayMs, nullptr);
 }
 
 void runSearch() {
     KillTimer(app.hwnd, kSearchTimer);
     SearchQuery q = searchQueryFromUi();
+    if (!hasConditions(q) && q.clipText.empty() && !q.similarTo && !q.review) {
+        setText(app.s.count, L"フリーワードか条件を入れてください（何も無いと全部の画像になります）");
+        return;
+    }
+    app.searchShown = true;
     const unsigned gen = ++app.searchGen;
     setText(app.s.count, L"検索中…");
     const std::string db = narrow(dbPath());
@@ -1385,28 +1444,27 @@ void runSearch() {
                 done->result.total = rr.total;
                 done->scores = rr.scores;
             } else {
-                q.limit = kFirstResults;
+                q.limit = kListResults;
                 done->result = search(d, q);
-                more = done->result.total > done->result.ids.size();
+            }
+            // エクスプローラーに出すパス
+            Stmt st(d.handle(), "SELECT path FROM images WHERE id=?");
+            for (int64_t id : done->result.ids) {
+                st.bind(1, id);
+                done->paths.push_back(st.step() ? widen(st.text(0)) : std::wstring());
+                st.reset();
             }
         } catch (const std::exception& e) {
             done->error = widen(e.what());
         }
+        (void)more;
         if (!PostMessageW(hwnd, WM_APP_SEARCHED, 0, reinterpret_cast<LPARAM>(done))) delete done;
-        if (!more) return;
-        auto* rest = new SearchDone{gen, {}, L"", true};
-        try {
-            q.limit = 0;
-            rest->result = search(d, q);
-        } catch (const std::exception& e) {
-            rest->error = widen(e.what());
-        }
-        if (!PostMessageW(hwnd, WM_APP_SEARCHED, 0, reinterpret_cast<LPARAM>(rest))) delete rest;
     }).detach();
 }
 
 void showSearchInfo(int item);
 
+// 検索の結果を、エクスプローラーの真ん中に出す
 void onSearched(SearchDone* p) {
     std::unique_ptr<SearchDone> done(p);
     if (done->gen != app.searchGen) return;  // 古い条件の結果
@@ -1414,18 +1472,11 @@ void onSearched(SearchDone* p) {
         setText(app.s.count, L"検索できませんでした: " + done->error);
         return;
     }
-    if (done->rest) {
-        // 先頭は同じ並びなので、表示とサムネイルはそのままにして、残りを足す
-        app.searchIds = std::move(done->result.ids);
-        extendView(kSearchView, static_cast<int>(app.searchIds.size()));
-        setText(app.s.count, withCommas(app.searchTotal) + L" 件");
-        return;
-    }
     app.searchIds = std::move(done->result.ids);
+    app.searchPaths = std::move(done->paths);
     app.searchTotal = done->result.total;
     app.searchScores = std::move(done->scores);
     app.infoCache.clear();
-    resetView(kSearchView, static_cast<int>(app.searchIds.size()));
     const bool review = Button_GetCheck(app.s.review) == BST_CHECKED;
     std::wstring count;
     if (!app.searchTotal) count = review ? L"確かめる画像はありません" : L"見つかりません";
@@ -1434,15 +1485,17 @@ void onSearched(SearchDone* p) {
                 withCommas(app.searchIds.size()) + L" 件";
     else
         count = withCommas(app.searchTotal) + L" 件" +
-                (app.searchTotal > app.searchIds.size() ? L"（残りを読み込んでいます…）" : review ? L"（迷っている順）" : L"");
+                (app.searchTotal > app.searchIds.size() ? L"（先頭の " + withCommas(app.searchIds.size()) + L" 件を出しています）"
+                 : review                               ? L"（迷っている順）"
+                                                        : L"");
     setText(app.s.count, count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
     app.searchNotice.clear();
-    showSearchInfo(-1);
-    if (app.reselect >= 0 && !app.searchIds.empty()) {
-        const int item = std::min(app.reselect, static_cast<int>(app.searchIds.size()) - 1);
-        ListView_SetItemState(app.s.results, item, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_EnsureVisible(app.s.results, item, FALSE);
-    }
+    std::wstring what = editText(app.s.free);
+    if (what.empty()) what = done->clip ? (app.similarTo ? app.similarLabel : editText(app.s.clip)) : L"条件";
+    std::vector<std::wstring> paths;
+    for (const auto& pth : app.searchPaths)
+        if (!pth.empty()) paths.push_back(pth);
+    ex.view->ShowList(L"検索: " + what + L"（" + count + L"）", std::move(paths), app.reselect);
     app.reselect = -1;
 }
 
@@ -1561,8 +1614,10 @@ void findSimilar(int64_t imageId, const std::wstring& name) {
 
 void clearSearchConditions() {
     app.similarTo = 0;
-    for (HWND h : {app.s.tags, app.s.text, app.s.clip, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
+    for (HWND h : {app.s.free, app.s.tags, app.s.text, app.s.clip, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
         SetWindowTextW(h, L"");
+    ComboBox_SetCurSel(app.s.scope, 0);
+    ComboBox_SetCurSel(app.s.dateField, 0);
     SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
     setText(app.s.confValue, L"0.50");
     ComboBox_SetCurSel(app.s.rating, 0);
@@ -1688,10 +1743,17 @@ void refreshSmartFolders(const std::wstring& select) {
 
 // 保存した条件を画面に戻す（画面に無い項目は使わない）
 void applyQueryToUi(const SearchQuery& q) {
+    // フリーワードの欄に戻す（タグの条件は「タグに限る」、前の版の「文字」はフリーワード）
     std::wstring tags;
     for (const auto& t : q.tags) tags += (tags.empty() ? L"" : L" ") + widen(t);
     for (const auto& t : q.excludeTags) tags += (tags.empty() ? L"-" : L" -") + widen(t);
-    SetWindowTextW(app.s.tags, tags.c_str());
+    if (!tags.empty()) {
+        SetWindowTextW(app.s.free, tags.c_str());
+        ComboBox_SetCurSel(app.s.scope, 1);
+    } else {
+        SetWindowTextW(app.s.free, widen(!q.freeText.empty() ? q.freeText : q.text).c_str());
+        ComboBox_SetCurSel(app.s.scope, q.freeScope == FreeScope::Title ? 2 : 0);
+    }
     const int conf = std::clamp(static_cast<int>(q.minConfidence * 100 + 0.5), 0, 100);
     SendMessageW(app.s.conf, TBM_SETPOS, TRUE, conf);
     wchar_t v[16];
@@ -1703,7 +1765,6 @@ void applyQueryToUi(const SearchQuery& q) {
         for (const auto& n : app.sourceNames)
             if (std::find(q.sources.begin(), q.sources.end(), n) == q.sources.end()) app.uncheckedSources.insert(n);
     refreshSources();
-    SetWindowTextW(app.s.text, widen(q.text).c_str());
     app.similarTo = 0;
     if (q.similarTo) {
         ImageInfo info;
@@ -1747,14 +1808,12 @@ void applyQueryToUi(const SearchQuery& q) {
     setNum(app.s.maxKb, q.maxSize / 1024);
     SetWindowTextW(app.s.path, widen(q.pathContains).c_str());
     SetWindowTextW(app.s.download, widen(q.downloadContains).c_str());
-    static const SortKey sorts[] = {SortKey::Path,   SortKey::Modified, SortKey::Created,    SortKey::Taken,
-                                    SortKey::Resolution, SortKey::Size, SortKey::Rating,     SortKey::Title,
-                                    SortKey::Confidence, SortKey::Aesthetic, SortKey::Effective};
-    for (size_t i = 0; i < std::size(sorts); ++i)
-        if (sorts[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
+    for (size_t i = 0; i < std::size(kSortChoices); ++i)
+        if (kSortChoices[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
+    ComboBox_SetCurSel(app.s.dateField, static_cast<int>(q.dateField));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(app.s.review, q.review ? BST_CHECKED : BST_UNCHECKED);
-    scheduleSearch(10);
+    runSearch();
 }
 
 void saveSmartFolderUi() {
@@ -2101,11 +2160,16 @@ void showLinksWindow() {
 
 // ---------------------------------------------------------------- タグの確定（確認キュー・一括のタグ付け）
 
+// エクスプローラーで選んでいる検索の結果（searchIds の番号）
 std::vector<int> selectedResults() {
     std::vector<int> out;
-    for (int i = ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED); i >= 0;
-         i = ListView_GetNextItem(app.s.results, i, LVNI_SELECTED))
-        if (i < static_cast<int>(app.searchIds.size())) out.push_back(i);
+    const std::wstring sel = ex.view ? ex.view->Selected() : L"";
+    if (sel.empty()) return out;
+    for (size_t i = 0; i < app.searchPaths.size() && i < app.searchIds.size(); ++i)
+        if (lstrcmpiW(app.searchPaths[i].c_str(), sel.c_str()) == 0) {
+            out.push_back(static_cast<int>(i));
+            break;
+        }
     return out;
 }
 
@@ -2467,7 +2531,10 @@ void undoTagEdit() {
         return;
     }
     app.searchNotice = L"元に戻しました: " + widen(desc);
-    app.reselect = std::max(0, ListView_GetNextItem(app.s.results, -1, LVNI_FOCUSED));
+    {
+        const auto sel = selectedResults();
+        app.reselect = sel.empty() ? 0 : sel.front();
+    }
     refreshSources();
     scheduleSearch(10);
 }
@@ -2799,10 +2866,8 @@ void showDictionaryWindow() {
                     dictWin.applying = false;
                     EnableWindow(dictWin.save, TRUE);
                     setText(dictWin.status, *m);
-                    if (app.tab == 1) {
-                        refreshSources();
-                        scheduleSearch(10);
-                    }
+                    refreshSources();
+                    scheduleSearch(10);
                     return 0;
                 }
             }
@@ -3014,10 +3079,8 @@ void showTagDictWindow() {
                     tagDictBusy(false);
                     setText(tagDictWin.status, *m);
                     tagDictRefreshCounts();
-                    if (app.tab == 1) {
-                        refreshSources();
-                        scheduleSearch(10);
-                    }
+                    refreshSources();
+                    scheduleSearch(10);
                     return 0;
                 }
             }
@@ -3107,21 +3170,6 @@ struct SameDone {
     std::vector<ExplorerMatch> matches;
 };
 
-struct ExplorerApp : ExplorerHost {
-    std::unique_ptr<Explorer> view;
-    SameImageIndex index;          // 見た目一致を探すための、DB の全部の画像の dHash
-    std::atomic<unsigned> gen{0};  // 新しく探し始めたら古い結果は捨てる
-    std::wstring pendingSel;       // 選んでから少し待って探す画像
-    bool shown = false;
-
-    void ExplorerOpen(const std::wstring& path) override;
-    void ExplorerSelected(const std::wstring& path, bool image) override;
-    void ExplorerFindSameFile(const std::wstring& path) override;
-    void ExplorerFindSameUrl(const std::wstring& url) override;
-    void ExplorerAddRoot(const std::wstring& dir) override;
-    void ExplorerSettingsChanged(const ExplorerSettings& s) override;
-    std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
-} ex;
 
 std::wstring fileNameOf(const std::wstring& path) {
     const size_t sep = path.find_last_of(L"\\/");
@@ -3190,10 +3238,83 @@ void onSameDone(SameDone* p) {
 
 void ExplorerApp::ExplorerOpen(const std::wstring& path) { openPath(path); }
 
+// 選んだだけでは同じ画像を探さない（右クリック・ドロップ・URL の時だけ）。ツールバーの「開く」などを使えるようにする
 void ExplorerApp::ExplorerSelected(const std::wstring& path, bool image) {
-    KillTimer(app.hwnd, kSameTimer);
-    pendingSel = image ? path : L"";
-    if (image) SetTimer(app.hwnd, kSameTimer, 250, nullptr);  // 矢印キーで次々に選んでいる間は探さない
+    for (int id : {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH}) tbEnable(id, !path.empty());
+    tbEnable(CMD_FIND_SAME, image);
+}
+
+// 画像のタグ（ファイルのタグと、確度を合成した検索用のタグ。確度の高い順）
+std::vector<ExplorerTag> ExplorerApp::ExplorerTags(const std::wstring& path) {
+    std::vector<ExplorerTag> out;
+    Db* db = uiDb();
+    if (!db) return out;
+    try {
+        std::vector<std::string> roots;
+        for (const auto& f : folderList()) roots.push_back(narrow(f));
+        const int64_t id = findImageId(*db, narrow(path), roots);
+        if (!id) return out;
+        struct Agg {
+            std::string kind;
+            std::vector<double> ps;
+            int manual = -1;
+            bool file = false, dbOnly = false;
+        };
+        std::vector<std::pair<std::string, Agg>> agg;
+        for (const auto& t : tagsOf(*db, id)) {
+            if (t.kind == "rating") continue;  // general / sensitive などの年齢区分は出さない
+            auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return lstrcmpiA(a.first.c_str(), t.tag.c_str()) == 0; });
+            if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{t.kind}});
+            if (t.source == kSourceEmbedded) it->second.file = true;
+            else it->second.dbOnly = true;
+            if (t.manual) it->second.manual = t.confidence > 0.5 ? 1 : 0;
+            else it->second.ps.push_back(t.confidence);
+        }
+        std::vector<std::pair<double, ExplorerTag>> rows;
+        for (const auto& [tag, a] : agg) {
+            const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
+            if (a.file) rows.push_back({2.0, ExplorerTag{widen(tag), widen(a.kind), 1.0, true}});
+            if (a.dbOnly && p >= 0.35) rows.push_back({p, ExplorerTag{widen(tag), widen(a.kind), p, false}});
+        }
+        std::stable_sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        for (auto& r : rows) out.push_back(std::move(r.second));
+    } catch (const std::exception&) {
+    }
+    return out;
+}
+
+// タグで検索する（タグをクリック・取り置いたタグを組み合わせて）: 検索のリボンに出して、すぐ探す
+void ExplorerApp::ExplorerSearchTags(const std::vector<std::wstring>& tags) {
+    std::wstring text;
+    for (const auto& t : tags) text += (text.empty() ? L"" : L" ") + t;
+    if (app.tab != 1) switchTab(1);
+    SetWindowTextW(app.s.free, text.c_str());
+    ComboBox_SetCurSel(app.s.scope, 1);  // タグに限る（名前どおり）
+    runSearch();
+}
+
+void ExplorerApp::ExplorerFindSimilarAi(const std::wstring& path) {
+    Db* db = uiDb();
+    if (!db) return;
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    const int64_t id = findImageId(*db, narrow(path), roots);
+    if (!id) {
+        MessageBoxW(app.hwnd, L"この画像はまだインデックスにありません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    if (app.tab != 1) switchTab(1);
+    findSimilar(id, fileNameOf(path));
+    runSearch();
+}
+
+void ExplorerApp::ExplorerRelookup(const std::wstring& path) {
+    Db* db = uiDb();
+    if (!db) return;
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    const int64_t id = findImageId(*db, narrow(path), roots);
+    if (id) relookupImages(id);
 }
 
 void ExplorerApp::ExplorerFindSameFile(const std::wstring& path) {
@@ -3259,6 +3380,18 @@ void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
     put(L"previewWidth", s.previewWidth);
     put(L"resultsHeight", s.resultsHeight);
     put(L"resultsView", s.resultsView);
+    put(L"viewMode", s.viewMode);
+    put(L"sortKey", s.sortKey);
+    put(L"sortDesc", s.sortDesc ? 1 : 0);
+    // 取り置いたタグ（タブで区切る）。ini はシステムの文字コードなので、どの文字でも残せる DB に持つ
+    std::string tray;
+    for (const auto& t : s.tray) tray += (tray.empty() ? "" : "\t") + narrow(t);
+    if (Db* db = uiDb()) {
+        try {
+            db->setSetting("explorer:tray", tray);
+        } catch (const std::exception&) {
+        }
+    }
 }
 
 ExplorerSettings loadExplorerSettings() {
@@ -3274,6 +3407,22 @@ ExplorerSettings loadExplorerSettings() {
     s.previewWidth = get(L"previewWidth", s.previewWidth);
     s.resultsHeight = get(L"resultsHeight", s.resultsHeight);
     s.resultsView = get(L"resultsView", s.resultsView);
+    s.viewMode = get(L"viewMode", s.viewMode);
+    s.sortKey = get(L"sortKey", s.sortKey);
+    s.sortDesc = get(L"sortDesc", 0) != 0;
+    std::string tray;
+    if (Db* db = uiDb()) {
+        try {
+            tray = db->setting("explorer:tray");
+        } catch (const std::exception&) {
+        }
+    }
+    for (size_t a = 0; a < tray.size();) {
+        size_t b = tray.find('\t', a);
+        if (b == std::string::npos) b = tray.size();
+        if (b > a) s.tray.push_back(widen(tray.substr(a, b - a)));
+        a = b + 1;
+    }
     return s;
 }
 
@@ -3342,240 +3491,233 @@ int tabPos(int id) {
     return 0;
 }
 
+// リボンの切り替え（app.tab: 2 = ホーム、0 = 重複を探す、1 = 検索）。画面はいつもエクスプローラー
 void switchTab(int t) {
     app.tab = t;
     TabCtrl_SetCurSel(app.tabs, tabPos(t));
+    layout();  // 先に並べてから出す（前の場所に絵が残らないように）
+    ShowWindow(app.toolbar, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.searchPage) ShowWindow(h, t == 1 ? SW_SHOW : SW_HIDE);
-    ShowWindow(app.info, t == 2 ? SW_HIDE : SW_SHOW);  // エクスプローラーは右のプレビューに出す
-    layout();
-    if (t == 2) {
-        if (!ex.shown) {
-            ex.shown = true;
-            ex.view->Show(explorerStartDir(), L"");
-        } else {
-            ex.view->Show(L"", L"");
-        }
-        return;
+    for (HWND h : app.advancedPage) ShowWindow(h, t == 1 && app.advancedShown ? SW_SHOW : SW_HIDE);
+    RedrawWindow(app.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    if (!ex.shown) {
+        ex.shown = true;
+        ex.view->Show(explorerStartDir(), L"");
     }
-    ex.view->Hide();
     if (t == 1) {
         refreshSources();
         refreshSmartFolders(L"");
-        if (!app.searchShown) {
-            app.searchShown = true;
-            scheduleSearch(10);
-        }
-        showSearchInfo(ListView_GetNextItem(app.s.results, -1, LVNI_SELECTED));
-        SetFocus(app.s.tags);
-    } else {
-        showInfo(ListView_GetNextItem(app.thumbs, -1, LVNI_SELECTED));
+        SetFocus(app.s.free);
     }
 }
 
-void layoutSearch(int y, int W, int bottom) {
-    const int m = px(8), panelW = px(300), rowH = px(24), labelH = px(18), gap = px(6);
+void toggleAdvanced() {
+    app.advancedShown = !app.advancedShown;
+    SetWindowTextW(app.s.advanced, app.advancedShown ? L"詳細検索 ▲" : L"詳細検索 ▼");
+    iniSet(L"advancedSearch", app.advancedShown ? L"1" : L"0");
+    switchTab(app.tab);
+}
+
+// 検索のリボン（3 段）
+void layoutSearch(int y, int W) {
+    const int m = px(8), rowH = px(24), gap = px(6), labelY = px(4);
     int x = m, cy = y;
-    size_t li = 0;
-    auto label = [&](int ly, int lx, int w) {
-        if (li < app.s.labels.size()) MoveWindow(app.s.labels[li++], lx, ly, w, labelH, TRUE);
+    auto put = [&](HWND h, int w, int height = 0) {
+        MoveWindow(h, x, cy, w, height ? height : rowH, TRUE);
+        x += w + gap;
     };
-    auto full = [&](HWND h, int height) {
-        label(cy, x, panelW);
-        cy += labelH + px(2);
-        MoveWindow(h, x, cy, panelW, height, TRUE);
-        cy += height + gap;
+    auto lbl = [&](HWND h, int w) {
+        MoveWindow(h, x, cy + labelY, w, rowH - labelY, TRUE);
+        x += w + px(2);
     };
-    // スマートフォルダ
-    label(cy, x, panelW);
-    cy += labelH + px(2);
-    const int bw = px(56);
-    MoveWindow(app.s.smart, x, cy, panelW - 2 * (bw + px(4)), px(300), TRUE);
-    MoveWindow(app.s.smartSave, x + panelW - 2 * bw - px(4), cy, bw, rowH, TRUE);
-    MoveWindow(app.s.smartDelete, x + panelW - bw, cy, bw, rowH, TRUE);
-    cy += rowH + gap;
-    full(app.s.tags, rowH);
-    // 確度
-    label(cy, x, panelW);
-    cy += labelH;
-    MoveWindow(app.s.conf, x, cy, panelW - px(50), rowH + px(4), TRUE);
-    MoveWindow(app.s.confValue, x + panelW - px(46), cy + px(4), px(46), labelH, TRUE);
-    cy += rowH + px(4) + gap;
-    full(app.s.sources, px(72));
-    // 文字・内容（AI）
-    {
-        const int hw = (panelW - gap) / 2;
-        label(cy, x, hw);
-        label(cy, x + hw + gap, hw);
-        cy += labelH + px(2);
-        MoveWindow(app.s.text, x, cy, hw, rowH, TRUE);
-        MoveWindow(app.s.clip, x + hw + gap, cy, hw, rowH, TRUE);
-        cy += rowH + gap;
-    }
-    // 星・形式・品質
-    const int half = (panelW - gap) / 2;
-    {
-        const int third = (panelW - 2 * gap) / 3;
-        label(cy, x, third);
-        label(cy, x + third + gap, third);
-        label(cy, x + 2 * (third + gap), third);
-        cy += labelH + px(2);
-        MoveWindow(app.s.rating, x, cy, third, px(240), TRUE);
-        MoveWindow(app.s.format, x + third + gap, cy, third, px(240), TRUE);
-        MoveWindow(app.s.quality, x + 2 * (third + gap), cy, third, px(240), TRUE);
-        SendMessageW(app.s.quality, CB_SETDROPPEDWIDTH, px(200), 0);
-        SendMessageW(app.s.format, CB_SETDROPPEDWIDTH, px(140), 0);
-    }
-    cy += rowH + gap;
-    // 撮影日
-    label(cy, x, panelW);
-    cy += labelH + px(2);
-    const int dw = (panelW - px(24)) / 2;
-    MoveWindow(app.s.from, x, cy, dw, rowH, TRUE);
-    label(cy + px(4), x + dw + px(4), px(16));
-    MoveWindow(app.s.to, x + panelW - dw, cy, dw, rowH, TRUE);
-    cy += rowH + px(2);
-    {
-        const int third = (panelW - 2 * gap) / 3;
-        MoveWindow(app.s.noTaken, x, cy, third, rowH, TRUE);
-        MoveWindow(app.s.unclassified, x + third + gap, cy, third, rowH, TRUE);
-        MoveWindow(app.s.deadLinks, x + 2 * (third + gap), cy, third, rowH, TRUE);
-    }
-    cy += rowH + gap;
-    // 幅・ファイルサイズ
-    label(cy, x, px(90));
-    label(cy, x + px(100), panelW - px(100));
-    cy += labelH + px(2);
-    MoveWindow(app.s.minW, x, cy, px(80), rowH, TRUE);
-    MoveWindow(app.s.minKb, x + px(100), cy, px(80), rowH, TRUE);
-    label(cy + px(4), x + px(184), px(16));
-    MoveWindow(app.s.maxKb, x + px(204), cy, px(80), rowH, TRUE);
-    cy += rowH + gap;
-    // パス・ダウンロード元
-    label(cy, x, half);
-    label(cy, x + half + gap, half);
-    cy += labelH + px(2);
-    MoveWindow(app.s.path, x, cy, half, rowH, TRUE);
-    MoveWindow(app.s.download, x + half + gap, cy, half, rowH, TRUE);
-    cy += rowH + gap;
-    // 並べ替え
-    label(cy, x, panelW);
-    cy += labelH + px(2);
-    MoveWindow(app.s.sort, x, cy, panelW - px(80), px(300), TRUE);
-    MoveWindow(app.s.desc, x + panelW - px(72), cy, px(72), rowH, TRUE);
-
-    // 右: 件数・条件をクリア・結果
-    const int rx = 2 * m + panelW, rw = std::max(0, W - rx - m), cw = px(110), top = rowH + px(4);
-    // 右から: 条件をクリア・フォルダに展開・タグ…・違う・正しい・確認キュー
-    int bx = rx + rw;
-    auto right = [&](HWND h, int w) {
-        bx -= w;
-        MoveWindow(h, bx, y, w, rowH, TRUE);
-        bx -= gap;
-    };
-    right(app.s.clear, cw);
-    right(app.s.expand, cw);
-    bx -= gap;
-    right(app.s.bulk, px(70));
-    right(app.s.no, px(56));
-    right(app.s.yes, px(56));
-    right(app.s.review, px(96));
-    MoveWindow(app.s.count, rx, y + (rowH - labelH) / 2, std::max(0, bx - rx), labelH, TRUE);
-    MoveWindow(app.s.results, rx, y + top, rw, std::max(0, bottom - y - top), TRUE);
+    const int freeW = std::clamp(W / 3, px(240), px(560));
+    put(app.s.free, freeW);
+    put(app.s.scope, px(120), px(200));
+    put(app.s.go, px(64));
+    x += px(10);
+    lbl(app.s.lSort, px(58));
+    put(app.s.sort, px(150), px(320));
+    put(app.s.desc, px(56));
+    x += px(10);
+    put(app.s.advanced, px(100));
+    put(app.s.clear, px(100));
+    cy += rowH + px(5);
+    x = m;
+    lbl(app.s.lClip, px(70));
+    put(app.s.clip, px(200));
+    x += px(10);
+    lbl(app.s.lSmart, px(84));
+    put(app.s.smart, px(170), px(300));
+    put(app.s.smartSave, px(56));
+    put(app.s.smartDelete, px(48));
+    x += px(10);
+    put(app.s.review, px(96));
+    put(app.s.yes, px(56));
+    put(app.s.no, px(48));
+    put(app.s.bulk, px(56));
+    x += px(10);
+    put(app.s.expand, px(118));
+    cy += rowH + px(5);
+    x = m;
+    MoveWindow(app.s.count, m, cy + px(2), W - 2 * m, rowH - px(4), TRUE);
 }
 
-void createSearchControls() {
-    auto label = [&](const wchar_t* text) {
-        HWND h = makeControl(WC_STATICW, text, SS_NOPREFIX, IDC_S_LABEL);
-        app.s.labels.push_back(h);
-        app.searchPage.push_back(h);
+// 詳細検索（3 段。右に出どころの一覧）
+void layoutAdvanced(int y, int W, int h) {
+    const int m = px(8), rowH = px(24), gap = px(6), labelY = px(4);
+    const int srcW = px(260);
+    int x = m, cy = y;
+    auto put = [&](HWND hw, int w, int height = 0) {
+        MoveWindow(hw, x, cy, w, height ? height : rowH, TRUE);
+        x += w + gap;
     };
-    auto edit = [&](int id, DWORD style = 0) {
-        HWND h = makeControl(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL | style, id, WS_EX_CLIENTEDGE);
-        app.searchPage.push_back(h);
+    auto lbl = [&](HWND hw, int w) {
+        MoveWindow(hw, x, cy + labelY, w, rowH - labelY, TRUE);
+        x += w + px(2);
+    };
+    lbl(app.s.lRating, px(24));
+    put(app.s.rating, px(96), px(240));
+    lbl(app.s.lFormat, px(32));
+    put(app.s.format, px(110), px(260));
+    lbl(app.s.lQuality, px(32));
+    put(app.s.quality, px(170), px(200));
+    lbl(app.s.lWidth, px(80));
+    put(app.s.minW, px(60));
+    lbl(app.s.lSize, px(118));
+    put(app.s.minKb, px(64));
+    lbl(app.s.lSizeTo, px(14));
+    put(app.s.maxKb, px(64));
+    cy += rowH + px(5);
+    x = m;
+    lbl(app.s.lDate, px(30));
+    put(app.s.dateField, px(90), px(200));
+    put(app.s.from, px(120));
+    lbl(app.s.lDateTo, px(14));
+    put(app.s.to, px(120));
+    put(app.s.noTaken, px(96));
+    put(app.s.unclassified, px(130));
+    put(app.s.deadLinks, px(90));
+    cy += rowH + px(5);
+    x = m;
+    lbl(app.s.lPath, px(80));
+    put(app.s.path, px(200));
+    lbl(app.s.lDownload, px(130));
+    put(app.s.download, px(200));
+    lbl(app.s.lConf, px(30));
+    put(app.s.conf, px(140), rowH + px(4));
+    put(app.s.confValue, px(40));
+    // 右に出どころ
+    const int sx = std::max(x, W - m - srcW);
+    MoveWindow(app.s.lSources, sx, y, srcW, px(18), TRUE);
+    MoveWindow(app.s.sources, sx, y + px(18), srcW, std::max(px(40), h - px(24)), TRUE);
+}
+
+// 検索のリボン（フリーワード・範囲・並べ替えなど）と、詳細検索（普段は隠す）の部品
+void createSearchControls() {
+    auto label = [&](const wchar_t* text, std::vector<HWND>& page) {
+        HWND h = makeControl(WC_STATICW, text, SS_NOPREFIX, IDC_S_LABEL);
+        page.push_back(h);
         return h;
     };
-    auto combo = [&](int id, std::initializer_list<const wchar_t*> items) {
+    auto edit = [&](int id, std::vector<HWND>& page, DWORD style = 0) {
+        HWND h = makeControl(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL | style, id, WS_EX_CLIENTEDGE);
+        page.push_back(h);
+        return h;
+    };
+    auto combo = [&](int id, std::vector<HWND>& page, std::initializer_list<const wchar_t*> items) {
         HWND h = makeControl(WC_COMBOBOXW, L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, id);
         for (const wchar_t* t : items) ComboBox_AddString(h, t);
         ComboBox_SetCurSel(h, 0);
-        app.searchPage.push_back(h);
+        page.push_back(h);
         return h;
     };
-    // 見出しの順は layoutSearch で並べる順と同じ
-    label(L"スマートフォルダ（保存した条件）");
-    app.s.smart = combo(IDC_S_SMART, {});
-    app.s.smartSave = makeControl(WC_BUTTONW, L"保存…", WS_TABSTOP, IDC_S_SMART_SAVE);
-    app.s.smartDelete = makeControl(WC_BUTTONW, L"削除", WS_TABSTOP, IDC_S_SMART_DELETE);
-    app.searchPage.insert(app.searchPage.end(), {app.s.smartSave, app.s.smartDelete});
-    label(L"タグ（空白で区切る。-タグ で除外）");
-    app.s.tags = edit(IDC_S_TAGS);
-    label(L"確度（右へ動かすほど確実なものだけ）");
-    app.s.conf = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, IDC_S_CONF);
-    SendMessageW(app.s.conf, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
-    app.s.confValue = makeControl(WC_STATICW, L"0.50", SS_RIGHT, IDC_S_CONF_VALUE);
-    app.searchPage.insert(app.searchPage.end(), {app.s.conf, app.s.confValue});
-    label(L"出どころ（チェックしたものだけで確度を計算）");
-    app.s.sources = makeControl(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL,
-                                IDC_S_SOURCES, WS_EX_CLIENTEDGE);
-    ListView_SetExtendedListViewStyle(app.s.sources, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
-    addColumn(app.s.sources, 0, L"", 270);
-    app.searchPage.push_back(app.s.sources);
-    label(L"文字（タイトルなど）");
-    label(L"内容（AI。夕焼けの海 など）");
-    app.s.text = edit(IDC_S_TEXT);
-    app.s.clip = edit(IDC_S_CLIP);
-    label(L"星");
-    label(L"形式");
-    label(L"品質");
-    app.s.rating = combo(IDC_S_RATING, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
-    app.s.format = combo(IDC_S_FORMAT, {L"すべて", L"JPEG", L"PNG", L"GIF", L"WebP", L"HEIF", L"BMP", L"TIFF", L"JPEG XR",
-                                        L"アニメーション"});
-    app.s.quality = combo(IDC_S_QUALITY, {L"すべて", L"くっきり", L"ぼやけている", L"拡大・細かさ不足", L"低解像度（実質 800px 未満）"});
-    label(L"撮影日（チェックを入れた日だけ使う）");
-    label(L"〜");
+    auto button = [&](const wchar_t* text, int id, std::vector<HWND>& page, DWORD style = 0) {
+        HWND h = makeControl(WC_BUTTONW, text, WS_TABSTOP | style, id);
+        page.push_back(h);
+        return h;
+    };
+    auto& sp = app.searchPage;
+    auto& ap = app.advancedPage;
+    // 1 段目: フリーワード・範囲・検索・並べ替え・詳細検索・クリア
+    app.s.free = edit(IDC_S_FREE, sp);
+    SendMessageW(app.s.free, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"フリーワード（空白で区切る。-語 で除く）"));
+    app.s.scope = combo(IDC_S_SCOPE, sp, {L"すべて", L"タグに限る", L"タイトルに限る"});
+    app.s.go = button(L"検索", IDC_S_GO, sp, BS_DEFPUSHBUTTON);
+    app.s.lSort = label(L"並べ替え", sp);
+    app.s.sort = combo(IDC_S_SORT, sp, {L"関連度", L"ファイル名", L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ",
+                                        L"星", L"タイトル", L"確度（1 つ目のタグ）", L"見栄え（AI）", L"実質の解像度"});
+    app.s.desc = button(L"降順", IDC_S_DESC, sp, BS_AUTOCHECKBOX);
+    app.s.advanced = button(L"詳細検索 ▼", IDC_S_ADVANCED, sp);
+    app.s.clear = button(L"条件をクリア", IDC_S_CLEAR, sp);
+    // 2 段目: 内容（AI）・スマートフォルダ・確認キュー・フォルダに展開
+    app.s.lClip = label(L"内容（AI）", sp);
+    app.s.clip = edit(IDC_S_CLIP, sp);
+    SendMessageW(app.s.clip, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"夕焼けの海 など"));
+    app.s.lSmart = label(L"保存した条件", sp);
+    app.s.smart = combo(IDC_S_SMART, sp, {});
+    app.s.smartSave = button(L"保存…", IDC_S_SMART_SAVE, sp);
+    app.s.smartDelete = button(L"削除", IDC_S_SMART_DELETE, sp);
+    app.s.review = button(L"確認キュー", IDC_S_REVIEW, sp, BS_AUTOCHECKBOX);
+    app.s.yes = button(L"正しい", IDC_S_YES, sp);
+    app.s.no = button(L"違う", IDC_S_NO, sp);
+    app.s.bulk = button(L"タグ…", IDC_S_BULK, sp);
+    app.s.expand = button(L"フォルダに展開…", IDC_S_EXPAND, sp);
+    // 3 段目: 件数
+    app.s.count = makeControl(WC_STATICW, L"フリーワードを入れて Enter（検索ボタン）で探します。結果はエクスプローラーに出します。",
+                              SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
+    sp.push_back(app.s.count);
+
+    // 詳細検索
+    app.s.lRating = label(L"星", ap);
+    app.s.rating = combo(IDC_S_RATING, ap, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
+    app.s.lFormat = label(L"形式", ap);
+    app.s.format = combo(IDC_S_FORMAT, ap, {L"すべて", L"JPEG", L"PNG", L"GIF", L"WebP", L"HEIF", L"BMP", L"TIFF", L"JPEG XR", L"アニメーション"});
+    app.s.lQuality = label(L"品質", ap);
+    app.s.quality = combo(IDC_S_QUALITY, ap, {L"すべて", L"くっきり", L"ぼやけている", L"拡大・細かさ不足", L"低解像度（実質 800px 未満）"});
+    app.s.lWidth = label(L"幅（px）以上", ap);
+    app.s.minW = edit(IDC_S_MINW, ap, ES_NUMBER);
+    app.s.lSize = label(L"ファイルサイズ（KB）", ap);
+    app.s.minKb = edit(IDC_S_MINKB, ap, ES_NUMBER);
+    app.s.lSizeTo = label(L"〜", ap);
+    app.s.maxKb = edit(IDC_S_MAXKB, ap, ES_NUMBER);
+    app.s.lPath = label(L"パス（一部）", ap);
+    app.s.path = edit(IDC_S_PATH, ap);
+    app.s.lDownload = label(L"ダウンロード元（URL）", ap);
+    app.s.download = edit(IDC_S_DOWNLOAD, ap);
+    app.s.lDate = label(L"日付", ap);
+    app.s.dateField = combo(IDC_S_DATEFIELD, ap, {L"撮影日", L"更新日時", L"作成日時"});
     app.s.from = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_FROM);
+    app.s.lDateTo = label(L"〜", ap);
     app.s.to = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_TO);
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
-    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日なし", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
-    app.s.unclassified = makeControl(WC_BUTTONW, L"未分類", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_UNCLASSIFIED);
-    app.s.deadLinks = makeControl(WC_BUTTONW, L"リンク切れ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DEADLINKS);
-    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken, app.s.unclassified, app.s.deadLinks});
-    label(L"幅（px）以上");
-    label(L"ファイルサイズ（KB）");
-    app.s.minW = edit(IDC_S_MINW, ES_NUMBER);
-    label(L"〜");
-    app.s.minKb = edit(IDC_S_MINKB, ES_NUMBER);
-    app.s.maxKb = edit(IDC_S_MAXKB, ES_NUMBER);
-    label(L"パス（一部）");
-    label(L"ダウンロード元（URL）");
-    app.s.path = edit(IDC_S_PATH);
-    app.s.download = edit(IDC_S_DOWNLOAD);
-    label(L"並べ替え");
-    app.s.sort = combo(IDC_S_SORT, {L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ", L"星",
-                                    L"タイトル", L"確度（1 つ目のタグ）", L"見栄え（AI）", L"実質の解像度"});
-    app.s.desc = makeControl(WC_BUTTONW, L"降順", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DESC);
-    app.s.clear = makeControl(WC_BUTTONW, L"条件をクリア", WS_TABSTOP, IDC_S_CLEAR);
-    app.s.expand = makeControl(WC_BUTTONW, L"フォルダに展開…", WS_TABSTOP, IDC_S_EXPAND);
-    app.s.review = makeControl(WC_BUTTONW, L"確認キュー", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_REVIEW);
-    app.s.yes = makeControl(WC_BUTTONW, L"正しい", WS_TABSTOP, IDC_S_YES);
-    app.s.no = makeControl(WC_BUTTONW, L"違う", WS_TABSTOP, IDC_S_NO);
-    app.s.bulk = makeControl(WC_BUTTONW, L"タグ…", WS_TABSTOP, IDC_S_BULK);
-    app.searchPage.insert(app.searchPage.end(), {app.s.expand, app.s.review, app.s.yes, app.s.no, app.s.bulk});
-    app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
-    app.searchPage.insert(app.searchPage.end(), {app.s.desc, app.s.clear, app.s.count});
+    ap.insert(ap.end(), {app.s.from, app.s.to});
+    app.s.noTaken = button(L"撮影日なし", IDC_S_NOTAKEN, ap, BS_AUTOCHECKBOX);
+    app.s.unclassified = button(L"未分類（タグなし）", IDC_S_UNCLASSIFIED, ap, BS_AUTOCHECKBOX);
+    app.s.deadLinks = button(L"リンク切れ", IDC_S_DEADLINKS, ap, BS_AUTOCHECKBOX);
+    app.s.lConf = label(L"確度", ap);
+    app.s.conf = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, IDC_S_CONF);
+    SendMessageW(app.s.conf, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(app.s.conf, TBM_SETPOS, TRUE, 50);
+    app.s.confValue = makeControl(WC_STATICW, L"0.50", SS_LEFT, IDC_S_CONF_VALUE);
+    ap.insert(ap.end(), {app.s.conf, app.s.confValue});
+    app.s.lSources = label(L"出どころ（チェックしたものだけで確度を計算）", ap);
+    app.s.sources = makeControl(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, IDC_S_SOURCES,
+                                WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(app.s.sources, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+    addColumn(app.s.sources, 0, L"", 240);
+    ap.push_back(app.s.sources);
 
-    app.s.results = makeControl(WC_LISTVIEWW, L"",
-                                WS_TABSTOP | LVS_ICON | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_AUTOARRANGE,
-                                IDC_S_RESULTS, WS_EX_CLIENTEDGE);
-    ListView_SetExtendedListViewStyle(app.s.results, LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
-    ListView_SetIconSpacing(app.s.results, app.thumbSize + px(20), app.thumbSize + px(44));
+    // 前の画面の部品（使わないが、条件の読み書きの都合で残す。いつも隠す）
+    app.s.tags = makeControl(WC_EDITW, L"", 0, IDC_S_TAGS);
+    app.s.text = makeControl(WC_EDITW, L"", 0, IDC_S_TEXT);
+    app.s.results = makeControl(WC_LISTVIEWW, L"", LVS_ICON | LVS_OWNERDATA, IDC_S_RESULTS);
     app.views[kSearchView].lv = app.s.results;
     resetView(kSearchView, 0);
-    app.searchPage.push_back(app.s.results);
-    for (HWND h : app.searchPage) ShowWindow(h, SW_HIDE);
+    for (HWND h : {app.s.tags, app.s.text, app.s.results}) ShowWindow(h, SW_HIDE);
+    for (HWND h : sp) ShowWindow(h, SW_HIDE);
+    for (HWND h : ap) ShowWindow(h, SW_HIDE);
 }
 
 // 検索の画面の通知（処理したら true）
@@ -3656,11 +3798,17 @@ bool onSearchCommand(WPARAM wp) {
                 scheduleSearch(500);  // 言葉のベクトル化は少し重いので、長めに待つ
             }
             return true;
-        case IDC_S_TAGS: case IDC_S_TEXT: case IDC_S_MINW: case IDC_S_MINKB: case IDC_S_MAXKB: case IDC_S_PATH:
+        case IDC_S_MINW: case IDC_S_MINKB: case IDC_S_MAXKB: case IDC_S_PATH:
         case IDC_S_DOWNLOAD:
             if (code == EN_CHANGE) scheduleSearch(300);  // 打ち終わるのを少し待つ
             return true;
-        case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_QUALITY: case IDC_S_SORT:
+        case IDC_S_GO:
+            runSearch();
+            return true;
+        case IDC_S_ADVANCED:
+            toggleAdvanced();
+            return true;
+        case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_QUALITY: case IDC_S_SORT: case IDC_S_SCOPE: case IDC_S_DATEFIELD:
             if (code == CBN_SELCHANGE) scheduleSearch(30);
             return true;
         case IDC_S_NOTAKEN: case IDC_S_DESC: case IDC_S_UNCLASSIFIED: case IDC_S_DEADLINKS:
@@ -3701,12 +3849,12 @@ bool onSearchCommand(WPARAM wp) {
 }
 
 void saveSearchSettings() {
-    WritePrivateProfileStringW(L"Search", L"tags", editText(app.s.tags).c_str(), iniPath().c_str());
-    WritePrivateProfileStringW(L"Search", L"text", editText(app.s.text).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"free", editText(app.s.free).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"scope", std::to_wstring(ComboBox_GetCurSel(app.s.scope)).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"clip", app.similarTo ? L"" : editText(app.s.clip).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"confidence",
                                std::to_wstring(SendMessageW(app.s.conf, TBM_GETPOS, 0, 0)).c_str(), iniPath().c_str());
-    WritePrivateProfileStringW(L"Search", L"sort", std::to_wstring(ComboBox_GetCurSel(app.s.sort)).c_str(), iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"sortChoice", std::to_wstring(ComboBox_GetCurSel(app.s.sort)).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"descending", Button_GetCheck(app.s.desc) == BST_CHECKED ? L"1" : L"0",
                                iniPath().c_str());
     std::wstring unchecked;
@@ -3718,10 +3866,9 @@ void saveSearchSettings() {
 
 void loadSearchSettings() {
     wchar_t buf[4096];
-    GetPrivateProfileStringW(L"Search", L"tags", L"", buf, 4096, iniPath().c_str());
-    SetWindowTextW(app.s.tags, buf);
-    GetPrivateProfileStringW(L"Search", L"text", L"", buf, 4096, iniPath().c_str());
-    SetWindowTextW(app.s.text, buf);
+    GetPrivateProfileStringW(L"Search", L"free", L"", buf, 4096, iniPath().c_str());
+    SetWindowTextW(app.s.free, buf);
+    ComboBox_SetCurSel(app.s.scope, std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"scope", 0, iniPath().c_str())), 0, 2));
     GetPrivateProfileStringW(L"Search", L"clip", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.clip, buf);
     const int conf = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"confidence", 50, iniPath().c_str())), 0, 100);
@@ -3729,7 +3876,8 @@ void loadSearchSettings() {
     wchar_t v[16];
     swprintf(v, 16, L"%.2f", conf / 100.0);
     setText(app.s.confValue, v);
-    ComboBox_SetCurSel(app.s.sort, std::max(0, static_cast<int>(GetPrivateProfileIntW(L"Search", L"sort", 0, iniPath().c_str()))));
+    // 並べ替えは選択肢の並びが変わったので、新しいキーに持つ（既定は関連度）
+    ComboBox_SetCurSel(app.s.sort, std::max(0, static_cast<int>(GetPrivateProfileIntW(L"Search", L"sortChoice", 0, iniPath().c_str()))));
     Button_SetCheck(app.s.desc, GetPrivateProfileIntW(L"Search", L"descending", 0, iniPath().c_str()) ? BST_CHECKED : BST_UNCHECKED);
     GetPrivateProfileStringW(L"Search", L"uncheckedSources", L"", buf, 4096, iniPath().c_str());
     app.uncheckedSources.clear();
@@ -3745,61 +3893,51 @@ void loadSearchSettings() {
 
 // ---------------------------------------------------------------- 画面
 
-void layoutSearch(int y, int W, int bottom);
-
+// 上にリボン（見出しと、その下に選んだリボンの中身）、検索のリボンなら詳細検索、残りはエクスプローラー
 void layout() {
     RECT rc;
     GetClientRect(app.hwnd, &rc);
     const int W = rc.right, H = rc.bottom;
-    const int m = px(8), btnW = px(150), btnH = px(28), rowH = px(26);
-    SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
-    RECT tr;
-    GetWindowRect(app.toolbar, &tr);
-    int y = (tr.bottom - tr.top) + px(2);
-    // 画面の切り替えのタブ（タブの見出しだけを使う）
-    const int tabH = px(26);
+    const int m = px(6), rowH = px(24);
+    int y = px(2);
+    const int tabH = px(24), panelH = px(84), advH = px(92);
     MoveWindow(app.tabs, m, y, W - 2 * m, tabH, TRUE);
-    y += tabH + px(6);
-    const int infoH = px(72);  // 4 行（パス・画像の情報・ファイルのタグ・検索用タグ）
-    const int bottom = H - m - infoH - px(4);
-    MoveWindow(app.info, m, bottom + px(4), W - 2 * m, infoH, TRUE);
+    y += tabH + px(2);
     if (app.tab == 2) {
-        ex.view->Move(RECT{m, y, W - m, H - m});
-        return;
+        MoveWindow(app.toolbar, m, y, W - 2 * m, panelH - px(4), TRUE);
+    } else if (app.tab == 0) {
+        // 重複を探す: 左にボタン、続いて調べるフォルダ、右にしきい値などと進み具合
+        SIZE bar{};
+        SendMessageW(app.dupBar, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar));
+        const int barW = std::max<int>(bar.cx, px(300));
+        MoveWindow(app.dupBar, m, y, barW, panelH - px(4), TRUE);
+        int x = m + barW + px(8);
+        MoveWindow(app.foldersLabel, x, y, px(300), px(16), TRUE);
+        MoveWindow(app.folders, x, y + px(17), px(300), panelH - px(22), TRUE);
+        x += px(300) + px(12);
+        int cy = y + px(2);
+        MoveWindow(app.thresholdCaption, x, cy + px(4), px(58), rowH - px(4), TRUE);
+        MoveWindow(app.threshold, x + px(60), cy, px(150), rowH + px(4), TRUE);
+        MoveWindow(app.thresholdLabel, x + px(214), cy + px(4), px(110), rowH - px(4), TRUE);
+        cy += rowH + px(4);
+        MoveWindow(app.exact, x, cy, px(110), rowH, TRUE);
+        MoveWindow(app.flat, x + px(114), cy, px(180), rowH, TRUE);
+        MoveWindow(app.variants, x + px(298), cy, px(150), rowH, TRUE);
+        cy += rowH + px(4);
+        MoveWindow(app.progress, x, cy + px(4), px(150), px(14), TRUE);
+        MoveWindow(app.status, x + px(158), cy + px(1), std::max(0, W - m - x - px(158)), px(20), TRUE);
+    } else {
+        layoutSearch(y, W);
     }
-    if (app.tab == 1) {
-        layoutSearch(y, W, bottom);
-        return;
+    y += panelH;
+    if (app.tab == 1 && app.advancedShown) {
+        layoutAdvanced(y, W, advH);
+        y += advH;
     }
-    MoveWindow(app.foldersLabel, m, y, W - 2 * m, px(18), TRUE);
-    y += px(20);
-    const int listH = px(70);
-    MoveWindow(app.folders, m, y, W - 3 * m - btnW, listH, TRUE);
-    MoveWindow(app.add, W - m - btnW, y, btnW, btnH, TRUE);
-    MoveWindow(app.remove, W - m - btnW, y + btnH + px(4), btnW, btnH, TRUE);
-    y += listH + px(8);
-
-    int x = m;
-    MoveWindow(app.thresholdCaption, x, y + px(5), px(64), px(18), TRUE);
-    x += px(66);
-    MoveWindow(app.threshold, x, y, px(170), rowH + px(4), TRUE);
-    x += px(172);
-    MoveWindow(app.thresholdLabel, x, y + px(5), px(110), px(18), TRUE);
-    x += px(112);
-    MoveWindow(app.exact, x, y + px(2), px(110), rowH, TRUE);
-    x += px(114);
-    MoveWindow(app.flat, x, y + px(2), px(200), rowH, TRUE);
-    x += px(204);
-    MoveWindow(app.variants, x, y + px(2), px(220), rowH, TRUE);
-    y += rowH + px(10);
-
-    MoveWindow(app.progress, m, y + px(3), px(220), px(16), TRUE);
-    MoveWindow(app.status, m + px(228), y + px(1), W - 2 * m - px(228), px(20), TRUE);
-    y += px(26);
-
-    const int listW = std::max(px(260), (W - 3 * m) * 2 / 5);
-    MoveWindow(app.groups, m, y, listW, std::max(0, bottom - y), TRUE);
-    MoveWindow(app.thumbs, 2 * m + listW, y, std::max(0, W - 3 * m - listW), std::max(0, bottom - y), TRUE);
+    MoveWindow(app.ribbonLine, 0, y, W, 2, TRUE);
+    y += px(3);
+    ex.view->Move(RECT{0, y, W, H});
+    RedrawWindow(app.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 HWND makeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD exStyle) {
@@ -3878,46 +4016,50 @@ struct ToolButton {
     const wchar_t* tip;    // ツールチップ
     bool enabled;
 };
+// リボン（ホーム）のボタン。重複を探すリボンのボタンは kDupButtons
 const ToolButton kToolButtons[] = {
+    {CMD_OPEN, 0xE8E5, L"開", L"開く", false},
+    {CMD_EXPLORER, 0xE838, L"場", L"場所を表示", false},
+    {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
+    {0, 0, nullptr, nullptr, false},
+    {CMD_FIND_SAME, 0xE71E, L"同", L"同じ画像を探す", true},
+    {0, 0, nullptr, nullptr, false},
+    {CMD_STATS, 0xE9D2, L"統", L"統計", true},
+    {CMD_SETTINGS, 0xE713, L"設", L"設定", true},
+    {CMD_KEY_SETTINGS, 0xE765, L"鍵", L"キー", true},
+    {CMD_CHECK_UPDATE, 0xE895, L"更", L"アップデート", true},
+    {CMD_HELP, 0xE897, L"?", L"使い方", true},
+};
+const ToolButton kDupButtons[] = {
     {CMD_ADD_FOLDER, 0xE8F4, L"追", L"フォルダを追加", true},
+    {CMD_REMOVE_FOLDER, 0xE738, L"外", L"フォルダを外す", true},
+    {0, 0, nullptr, nullptr, false},
     {CMD_SEARCH, 0xE721, L"検", L"検索開始", true},
     {CMD_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
     {CMD_EXPORT, 0xE74E, L"保", L"結果を保存", false},
-    {0, 0, nullptr, nullptr, false},
-    {CMD_OPEN, 0xE8E5, L"開", L"開く", false},
-    {CMD_EXPLORER, 0xE838, L"場", L"エクスプローラーで表示", false},
-    {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
-    {0, 0, nullptr, nullptr, false},
-    {CMD_KEY_SETTINGS, 0xE765, L"鍵", L"ショートカットキーの設定", true},
-    {CMD_CHECK_UPDATE, 0xE895, L"更", L"アップデートを確認", true},
-    {CMD_HELP, 0xE897, L"?", L"使い方", true},
 };
 
-void createToolbar() {
-    app.toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
-                                  WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_TOP | CCS_NODIVIDER,
-                                  0, 0, 0, 0, app.hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR)),
-                                  app.inst, nullptr);
-    SendMessageW(app.toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-
-    const int size = px(20);
+// リボンのボタンの並び（大きな絵の下に名前。Massiguraedit と同じ記号フォントの絵）
+template <size_t N>
+HWND createRibbonBar(const ToolButton (&defs)[N], int id) {
+    HWND bar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
+                               WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER,
+                               0, 0, 0, 0, app.hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+    SendMessageW(bar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    const int size = px(28);
     const wchar_t* face = fontExists(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons"
                           : fontExists(L"Segoe MDL2 Assets") ? L"Segoe MDL2 Assets"
                                                               : nullptr;
     HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32, 0, 16);
     auto add = [&](wchar_t glyph, const std::wstring& text) {
         HBITMAP bmp = (face && glyph) ? makeGlyphIcon(size, face, std::wstring(1, glyph), 0.8, RGB(40, 40, 40))
-                                      : makeGlyphIcon(size, L"MS UI Gothic", text, text.size() > 1 ? 0.5 : 0.75,
-                                                      RGB(40, 40, 40));
+                                      : makeGlyphIcon(size, L"MS UI Gothic", text, text.size() > 1 ? 0.5 : 0.75, RGB(40, 40, 40));
         const int n = ImageList_Add(images, bmp, nullptr);
         DeleteObject(bmp);
         return n;
     };
-
-    // 文字はツールチップだけに出す（MIXEDBUTTONS で BTNS_SHOWTEXT を付けなければ、ボタンには絵だけ）
-    SendMessageW(app.toolbar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
     std::vector<TBBUTTON> buttons;
-    for (const ToolButton& d : kToolButtons) {
+    for (const ToolButton& d : defs) {
         TBBUTTON b{};
         if (!d.id) {
             b.fsStyle = BTNS_SEP;
@@ -3926,23 +4068,30 @@ void createToolbar() {
             if (d.id == CMD_SEARCH) startImage = b.iBitmap;
             b.idCommand = d.id;
             b.fsState = d.enabled ? TBSTATE_ENABLED : 0;
-            b.fsStyle = BTNS_BUTTON;
-            b.iString = reinterpret_cast<INT_PTR>(d.tip);
+            b.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+            b.iString = reinterpret_cast<INT_PTR>(d.tip);  // 絵の下に出す
         }
         buttons.push_back(b);
     }
-    stopImage = add(0xE71A, L"止");
-    SendMessageW(app.toolbar, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
-    SendMessageW(app.toolbar, TB_ADDBUTTONSW, buttons.size(), reinterpret_cast<LPARAM>(buttons.data()));
-    SendMessageW(app.toolbar, TB_AUTOSIZE, 0, 0);
+    if (id == IDC_DUPBAR) stopImage = add(0xE71A, L"止");
+    SendMessageW(bar, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
+    SendMessageW(bar, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(64), px(58)));
+    SendMessageW(bar, TB_ADDBUTTONSW, buttons.size(), reinterpret_cast<LPARAM>(buttons.data()));
+    SendMessageW(bar, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+    return bar;
+}
+
+void createToolbar() {
+    app.toolbar = createRibbonBar(kToolButtons, IDC_TOOLBAR);
+    app.dupBar = createRibbonBar(kDupButtons, IDC_DUPBAR);
 }
 
 void createSearchControls();
 
 void createControls() {
-    createToolbar();
     app.tabs = makeControl(WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, IDC_TABS);
-    for (const wchar_t* t : {L"エクスプローラー", L"重複を探す", L"検索"}) {
+    createToolbar();
+    for (const wchar_t* t : {L"ホーム", L"重複を探す", L"検索"}) {
         TCITEMW it{};
         it.mask = TCIF_TEXT;
         it.pszText = const_cast<wchar_t*>(t);
@@ -3950,12 +4099,14 @@ void createControls() {
     }
     ex.view = std::make_unique<Explorer>();
     ex.view->Create(app.hwnd, &ex, loadExplorerSettings());
-    app.foldersLabel = makeControl(WC_STATICW, L"検索するフォルダ（ウィンドウにドラッグ＆ドロップしても追加できます）", 0,
-                                   IDC_FOLDERS_LABEL);
+    app.ribbonLine = makeControl(WC_STATICW, L"", SS_ETCHEDHORZ, IDC_RIBBON_LINE);
+    app.foldersLabel = makeControl(WC_STATICW, L"調べるフォルダ（インデックスも作ります）", SS_NOPREFIX, IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
                               IDC_FOLDERS, WS_EX_CLIENTEDGE);
     app.add = makeControl(WC_BUTTONW, L"フォルダを追加…", WS_TABSTOP, CMD_ADD_FOLDER);
     app.remove = makeControl(WC_BUTTONW, L"選んだフォルダを外す", WS_TABSTOP, CMD_REMOVE_FOLDER);
+    ShowWindow(app.add, SW_HIDE);  // リボンのボタンを使う
+    ShowWindow(app.remove, SW_HIDE);
     app.thresholdCaption = makeControl(WC_STATICW, L"しきい値", 0, IDC_THRESHOLD_CAPTION);
     app.threshold = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS, IDC_THRESHOLD);
     SendMessageW(app.threshold, TBM_SETRANGE, TRUE, MAKELPARAM(0, kMaxThreshold));
@@ -3987,11 +4138,14 @@ void createControls() {
     app.views[kDupView].lv = app.thumbs;
     resetView(kDupView, 0);
 
-    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);  // 4 行まで（省略の指定をすると 1 行になる）
-    app.dupPage = {app.foldersLabel, app.folders, app.add,      app.remove,   app.thresholdCaption, app.threshold,
-                   app.thresholdLabel, app.exact, app.flat, app.variants,     app.progress, app.status,           app.groups,
-                   app.thumbs};
+    app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);
+    // 結果は下の一覧（重複）とエクスプローラーに出すので、前の画面の一覧と情報欄は使わない
+    for (HWND h : {app.groups, app.thumbs, app.info}) ShowWindow(h, SW_HIDE);
+    app.dupPage = {app.dupBar, app.foldersLabel, app.folders, app.thresholdCaption, app.threshold, app.thresholdLabel,
+                   app.exact, app.flat, app.variants, app.progress, app.status};
     createSearchControls();
+    app.advancedShown = iniInt(L"advancedSearch", 0) != 0;
+    SetWindowTextW(app.s.advanced, app.advancedShown ? L"詳細検索 ▲" : L"詳細検索 ▼");
 }
 
 std::wstring groupFolderText(const Group& g) {
@@ -4107,7 +4261,7 @@ void appendMainMenus(HMENU root) {
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
     popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
-    popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
+    popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
     popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
@@ -4190,6 +4344,10 @@ bool handleShortcut(const MSG& msg) {
     if (GetKeyState(VK_CONTROL) < 0) mods |= KMOD_CTRL;
     if (GetKeyState(VK_SHIFT) < 0) mods |= KMOD_SHIFT;
     if (GetKeyState(VK_MENU) < 0) mods |= KMOD_ALT;
+    if (msg.message == WM_KEYDOWN && vk == VK_RETURN && mods == 0 && (msg.hwnd == app.s.free || msg.hwnd == app.s.clip)) {
+        runSearch();  // フリーワード・内容の欄で Enter
+        return true;
+    }
     // 文字の入力欄では、文字・カーソル移動・コピーなどのキーはそのまま入力欄に渡す
     wchar_t cls[32] = L"";
     GetClassNameW(msg.hwnd, cls, 32);
@@ -4201,7 +4359,7 @@ bool handleShortcut(const MSG& msg) {
         if (!ctrlLetter) return false;
     }
     // エクスプローラーの中の移動・選ぶキー（矢印・Enter・BackSpace など）はエクスプローラーに渡す
-    if (app.tab == 2 && ex.view && (msg.hwnd == ex.view->Window() || IsChild(ex.view->Window(), msg.hwnd))) {
+    if (ex.view && (msg.hwnd == ex.view->Window() || IsChild(ex.view->Window(), msg.hwnd))) {
         static const UINT nav[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_RETURN, VK_BACK, VK_TAB, VK_F5, VK_ESCAPE};
         if (mods == 0 && std::find(std::begin(nav), std::end(nav), vk) != std::end(nav)) return false;
         if (mods == KMOD_SHIFT && vk == VK_TAB) return false;
@@ -4363,6 +4521,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_KEY_SETTINGS: showKeyMapWindow(hwnd, &keyHost); break;
                 case CMD_TAB_DUPES: switchTab(0); break;
                 case CMD_TAB_EXPLORER: switchTab(2); break;
+                case CMD_FIND_SAME: {
+                    const std::wstring p = ex.view->Selected();
+                    if (!p.empty() && imgdupe::isImageExt(narrow(p))) ex.ExplorerFindSameFile(p);
+                    break;
+                }
                 case CMD_TAB_SEARCH: switchTab(1); break;
                 case CMD_SAVE_SMART:
                     if (app.tab != 1) switchTab(1);
@@ -4380,10 +4543,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_STATS: showStatsWindow(); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
-                    if (app.tab == 1) markSelected(LOWORD(wp) == CMD_TAG_YES);
+                    markSelected(LOWORD(wp) == CMD_TAG_YES);
                     break;
                 case CMD_BULK_TAG:
-                    if (app.tab == 1) bulkTagUi();
+                    bulkTagUi();
                     break;
                 case CMD_UNDO:
                     if (app.tab != 1) switchTab(1);
@@ -4885,7 +5048,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&wc);
 
     const std::wstring title = L"imgdupe - 重複画像検索 " + widen(IMGDUPE_VERSION);
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                 px(1180), px(780), nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
 
