@@ -8,6 +8,7 @@
 #include "ann.hpp"
 #include "dict.hpp"
 #include "refs.hpp"
+#include "quality.hpp"
 #include "tagrel.hpp"
 #include "image_win.hpp"
 #include "models.hpp"
@@ -283,6 +284,27 @@ size_t applyReferences(const std::wstring& dataDir, imgdupe::Db& db, bool force)
     const size_t n = imgdupe::applyReferences(db, vecs, sets);
     db.setSetting("refs:state", state);
     return n;
+}
+
+size_t applyAesthetic(const std::wstring& dataDir, imgdupe::Db& db) {
+    const Files f = findFiles(dataDir);
+    imgdupe::VectorIndex vecs;
+    if (!f.ok || !enabled(dataDir) || !vecs.load(narrow(vectorPath(dataDir))) || vecs.version() != f.version || vecs.dim() != 512)
+        return 0;
+    // モデルが変わったら点数を付け直す。ベクトルが増えていなければ何もしない
+    if (db.setting("aesthetic:model") != vecs.version()) {
+        db.exec("UPDATE quality SET aesthetic=NULL");
+        db.setSetting("aesthetic:model", vecs.version());
+    }
+    const std::string state = std::to_string(vecs.records());
+    if (db.setting("aesthetic:state") == state) return 0;
+    const size_t n = imgdupe::applyAesthetic(db, vecs);
+    db.setSetting("aesthetic:state", state);
+    return n;
+}
+
+bool qualityEnabled(const std::wstring& dataDir) {
+    return GetPrivateProfileIntW(L"imgdupe", L"qualityEnabled", 1, (dataDir + L"\\imgdupe.ini").c_str()) != 0;
 }
 
 size_t applyTagParents(imgdupe::Db& db, bool force) {

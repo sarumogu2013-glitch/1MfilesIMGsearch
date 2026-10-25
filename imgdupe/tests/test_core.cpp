@@ -27,6 +27,8 @@
 #include "tagrel.hpp"
 #include "lookup.hpp"
 #include "stats.hpp"
+#include "quality.hpp"
+#include "aesthetic_weights.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -2218,6 +2220,132 @@ static void testLinkCheck() {
     CHECK(rep.linksChecked == 0 && !rep.error.empty() && pendingLinkChecks(db, clock, 30, 100).size() == 3);
 }
 
+static void testQuality() {
+    // 白い雑音（画素ごとに違う値）: 元の大きさなら細かさ 1、半分の大きさから双一次で 2 倍にすると半分くらい
+    std::mt19937 rng(7);
+    auto noise = [&](int n) {
+        GrayImage g;
+        g.width = g.height = n;
+        g.px.resize(static_cast<size_t>(n) * n);
+        for (auto& p : g.px) p = static_cast<uint8_t>(rng() % 256);
+        return g;
+    };
+    auto upscale2 = [](const GrayImage& s) {
+        GrayImage g;
+        g.width = s.width * 2;
+        g.height = s.height * 2;
+        g.px.resize(static_cast<size_t>(g.width) * g.height);
+        for (int y = 0; y < g.height; ++y)
+            for (int x = 0; x < g.width; ++x) {
+                const float u = std::clamp((x + 0.5f) / 2 - 0.5f, 0.0f, s.width - 1.0f), v = std::clamp((y + 0.5f) / 2 - 0.5f, 0.0f, s.height - 1.0f);
+                const int x0 = static_cast<int>(u), y0 = static_cast<int>(v), x1 = std::min(x0 + 1, s.width - 1), y1 = std::min(y0 + 1, s.height - 1);
+                const float fx = u - x0, fy = v - y0;
+                auto P = [&](int xx, int yy) { return static_cast<float>(s.px[static_cast<size_t>(yy) * s.width + xx]); };
+                const float a = P(x0, y0) * (1 - fx) + P(x1, y0) * fx, b = P(x0, y1) * (1 - fx) + P(x1, y1) * fx;
+                g.px[static_cast<size_t>(y) * g.width + x] = static_cast<uint8_t>(std::lround(a * (1 - fy) + b * fy));
+            }
+        return g;
+    };
+    auto blur = [](const GrayImage& s, int r) {
+        GrayImage g = s;
+        for (int y = 0; y < s.height; ++y)
+            for (int x = 0; x < s.width; ++x) {
+                int sum = 0, n = 0;
+                for (int dy = -r; dy <= r; ++dy)
+                    for (int dx = -r; dx <= r; ++dx) {
+                        const int xx = std::clamp(x + dx, 0, s.width - 1), yy = std::clamp(y + dy, 0, s.height - 1);
+                        sum += s.px[static_cast<size_t>(yy) * s.width + xx];
+                        ++n;
+                    }
+                g.px[static_cast<size_t>(y) * s.width + x] = static_cast<uint8_t>(sum / n);
+            }
+        return g;
+    };
+    const GrayImage native = noise(512);
+    QualityResult a = measureQuality(native);
+    QualityResult b = measureQuality(upscale2(noise(256)));
+    QualityResult c = measureQuality(blur(blur(native, 2), 2));
+    std::printf("quality: native %.2f %.2f / up2 %.2f %.2f / blur %.2f %.2f\n", a.detail, a.sharpness, b.detail, b.sharpness, c.detail, c.sharpness);
+    CHECK(a.detail > 0.9 && a.effectiveSide > 460 && a.sharpness > kBlurryBelow);
+    CHECK(b.detail > 0 && b.detail < kSoftBelow && b.effectiveSide < 400);
+    CHECK(c.detail > 0 && c.detail < kSoftBelow && c.sharpness < kBlurryBelow);
+    CHECK(measureQuality(native, 0.5).effectiveSide == 1024);  // 縮めて読んだ時は元の大きさで
+    GrayImage flat;
+    flat.width = flat.height = 64;
+    flat.px.assign(64 * 64, 128);
+    CHECK(measureQuality(flat).detail < 0 && measureQuality(flat).sharpness < 0 && measureQuality(flat).effectiveSide == 64);
+    // 見栄え: 重みの向きのベクトルは点数が高く、逆向きは低い
+    std::vector<float> v(kAestheticWeights, kAestheticWeights + 512);
+    normalizeVector(v);
+    const double hi = aestheticScore(v.data());
+    for (float& x : v) x = -x;
+    CHECK(hi > 20 && aestheticScore(v.data()) < -10);
+    CHECK(std::abs(hi + aestheticScore(v.data()) - 2 * kAestheticBias) < 1e-3);
+
+    // 段階 quality・見栄え・検索
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-quality-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files = {{"/q/native.png", 1, 1}, {"/q/up.png", 1, 2}, {"/q/blur.png", 1, 3}, {"/q/bad.png", 1, 4}};
+    auto ids = upsertScanned(db, files);
+    std::map<std::string, GrayImage> imgs = {{"/q/native.png", native}, {"/q/up.png", upscale2(noise(256))}, {"/q/blur.png", blur(blur(native, 2), 2)}};
+    QualityAnalyzer qa(
+        [&](const std::string& path, int maxSide, std::vector<uint8_t>& bgra, int& w, int& h, int& ow, int& oh) {
+            auto it = imgs.find(path);
+            if (it == imgs.end()) return false;
+            CHECK(maxSide == kQualityDecodeSide);
+            w = ow = it->second.width;
+            h = oh = it->second.height;
+            bgra.resize(static_cast<size_t>(w) * h * 4);
+            for (size_t i = 0; i < it->second.px.size(); ++i) {
+                bgra[i * 4] = bgra[i * 4 + 1] = bgra[i * 4 + 2] = it->second.px[i];
+                bgra[i * 4 + 3] = 255;
+            }
+            return true;
+        },
+        {}, {});
+    std::atomic<bool> cancel{false};
+    StageReport sr = runStage(db, qa, 2, cancel);
+    CHECK(sr.processed == 4 && sr.failed == 1);
+    SearchQuery q;
+    q.quality = QualityFilter::Good;
+    CHECK(search(db, q).ids == std::vector<int64_t>({ids["/q/native.png"]}));
+    q.quality = QualityFilter::Soft;
+    CHECK(search(db, q).ids.size() == 2);
+    q.quality = QualityFilter::Blurry;
+    CHECK(search(db, q).ids == std::vector<int64_t>({ids["/q/blur.png"]}));
+    q.quality = QualityFilter::LowRes;
+    CHECK(search(db, q).ids.size() == 3);  // どれも 800 未満
+    SearchQuery q2;
+    CHECK(queryFromJson(queryToJson(q), q2) && q2.quality == QualityFilter::LowRes && hasConditions(q2));
+    ImageInfo info;
+    CHECK(imageInfo(db, ids["/q/native.png"], info) && info.detail > 0.9 && info.effective > 460 && info.aesthetic < 0);
+    // 見栄え（CLIP のベクトルから）
+    const std::string vpath = (dir / "v.bin").string();
+    {
+        VectorWriter w;
+        CHECK(w.open(vpath, 512, "m"));
+        std::vector<float> good(kAestheticWeights, kAestheticWeights + 512), bad = good;
+        normalizeVector(good);
+        for (float& x : bad) x = -x;
+        normalizeVector(bad);
+        w.append(ids["/q/native.png"], good.data());
+        w.append(ids["/q/up.png"], bad.data());
+    }
+    VectorIndex vecs;
+    CHECK(vecs.load(vpath));
+    CHECK(applyAesthetic(db, vecs) == 2 && applyAesthetic(db, vecs) == 0);
+    SearchQuery s;
+    s.sort = SortKey::Aesthetic;
+    s.descending = true;
+    auto sorted = search(db, s).ids;
+    CHECK(sorted.size() == 4 && sorted[0] == ids["/q/native.png"] && sorted[1] == ids["/q/up.png"]);
+    s.sort = SortKey::Effective;
+    CHECK(search(db, s).ids[0] == ids["/q/native.png"]);
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2243,6 +2371,7 @@ int main() {
     testLookup();
     testStats();
     testLinkCheck();
+    testQuality();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

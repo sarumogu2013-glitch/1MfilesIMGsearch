@@ -39,6 +39,11 @@ std::wstring refsDir(const std::wstring& dataDir);  // <dataDir>\refs
 // タグ辞書の親子関係を当てる（タグや関係が前回から変わっていなければ何もしない。CLIP が無くても使う）
 size_t applyTagParents(imgdupe::Db& db, bool force);
 
+// 見栄えの点数（LAION の aesthetic predictor。CLIP が ViT-B/32 の 512 次元の時だけ）を、まだ無い画像に付ける
+size_t applyAesthetic(const std::wstring& dataDir, imgdupe::Db& db);
+// 段階 quality（くっきり度・細かさ）を使うか（imgdupe.ini の [imgdupe] qualityEnabled。既定 1）
+bool qualityEnabled(const std::wstring& dataDir);
+
 struct LoadResult {
     std::shared_ptr<imgdupe::Analyzer> analyzer;
     std::wstring device;

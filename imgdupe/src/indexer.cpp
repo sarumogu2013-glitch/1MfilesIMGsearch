@@ -6,6 +6,7 @@
 
 #include "clip.hpp"
 #include "names.hpp"
+#include "quality.hpp"
 
 namespace imgdupe {
 
@@ -168,6 +169,16 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             cb.afterClip(db, opt.threads, cancel, &progress.prog);
             rep.cancelled = cancel.load();
         }
+    }
+    // 品質（くっきり度・細かさ）
+    if (!rep.cancelled && cb.decodeQuality && cb.qualityEnabled && cb.qualityEnabled() &&
+        !pendingImages(db, kStageQuality, kQualityVersion, 1).empty()) {
+        progress.phase = static_cast<int>(IndexPhase::Quality);
+        QualityAnalyzer qa(cb.decodeQuality, cb.threadInit, cb.threadExit);
+        sr = runStage(db, qa, opt.threads, cancel, &progress.prog);
+        rep.quality = sr.processed - sr.failed;
+        rep.failed += sr.failed;
+        rep.cancelled = sr.cancelled;
     }
     if (!rep.cancelled && cb.lookup) {
         progress.phase = static_cast<int>(IndexPhase::Lookup);

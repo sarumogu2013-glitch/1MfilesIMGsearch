@@ -101,6 +101,7 @@ enum : int {
     IDC_S_TEXT,
     IDC_S_RATING,
     IDC_S_FORMAT,
+    IDC_S_QUALITY,
     IDC_S_FROM,
     IDC_S_TO,
     IDC_S_NOTAKEN,
@@ -191,7 +192,7 @@ struct App {
 
     // 検索の画面
     struct SearchCtl {
-        HWND tags, conf, confValue, sources, text, clip, rating, format, from, to, noTaken, unclassified, deadLinks, minW, minKb, maxKb, path, download,
+        HWND tags, conf, confValue, sources, text, clip, rating, format, quality, from, to, noTaken, unclassified, deadLinks, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
@@ -1312,13 +1313,15 @@ SearchQuery searchQueryFromUi() {
     q.noTaken = Button_GetCheck(app.s.noTaken) == BST_CHECKED;
     q.unclassified = Button_GetCheck(app.s.unclassified) == BST_CHECKED;
     q.deadLinks = Button_GetCheck(app.s.deadLinks) == BST_CHECKED;
+    q.quality = static_cast<QualityFilter>(std::clamp(ComboBox_GetCurSel(app.s.quality), 0, 4));
     q.minWidth = _wtoi(editText(app.s.minW).c_str());
     q.minSize = static_cast<int64_t>(_wtoi(editText(app.s.minKb).c_str())) * 1024;
     q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
     q.pathContains = narrow(editText(app.s.path));
     q.downloadContains = narrow(editText(app.s.download));
-    static const SortKey sorts[] = {SortKey::Path,      SortKey::Modified, SortKey::Created, SortKey::Taken, SortKey::Resolution,
-                                    SortKey::Size,      SortKey::Rating,   SortKey::Title,   SortKey::Confidence};
+    static const SortKey sorts[] = {SortKey::Path,   SortKey::Modified, SortKey::Created,    SortKey::Taken,
+                                    SortKey::Resolution, SortKey::Size, SortKey::Rating,     SortKey::Title,
+                                    SortKey::Confidence, SortKey::Aesthetic, SortKey::Effective};
     const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
     q.sort = sorts[std::min<int>(sort, static_cast<int>(std::size(sorts)) - 1)];
     q.descending = Button_GetCheck(app.s.desc) == BST_CHECKED;
@@ -1477,6 +1480,16 @@ void showSearchInfo(int item) {
     if (info->rating > 0) line += L"　" + stars(info->rating);
     if (info->taken) line += L"　撮影 " + dateText(info->taken);
     if (!info->title.empty()) line += L"　「" + widen(info->title) + L"」";
+    {
+        wchar_t qt[96] = L"";
+        if (info->detail >= 0)
+            swprintf(qt, 96, L"　細かさ %.2f（実質 %dpx）・くっきり %.2f", info->detail, info->effective, std::max(0.0, info->sharpness));
+        line += qt;
+        if (info->aesthetic >= 0) {
+            swprintf(qt, 96, L"　見栄え %.1f", info->aesthetic);
+            line += qt;
+        }
+    }
     if (item >= 0 && item < static_cast<int>(app.searchScores.size())) {
         wchar_t sc[48];
         swprintf(sc, 48, L"　似ている度合い %.3f", app.searchScores[item]);
@@ -1548,6 +1561,7 @@ void clearSearchConditions() {
     setText(app.s.confValue, L"0.50");
     ComboBox_SetCurSel(app.s.rating, 0);
     ComboBox_SetCurSel(app.s.format, 0);
+    ComboBox_SetCurSel(app.s.quality, 0);
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
     Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
@@ -1702,6 +1716,7 @@ void applyQueryToUi(const SearchQuery& q) {
     if (q.animatedOnly) format = ComboBox_FindStringExact(app.s.format, -1, L"アニメーション");
     else if (!q.format.empty()) format = ComboBox_FindStringExact(app.s.format, -1, widen(q.format).c_str());
     ComboBox_SetCurSel(app.s.format, std::max(0, format));
+    ComboBox_SetCurSel(app.s.quality, static_cast<int>(q.quality));
     auto setDate = [](HWND h, int64_t t) {
         if (!t) {
             DateTime_SetSystemtime(h, GDT_NONE, nullptr);
@@ -1726,8 +1741,9 @@ void applyQueryToUi(const SearchQuery& q) {
     setNum(app.s.maxKb, q.maxSize / 1024);
     SetWindowTextW(app.s.path, widen(q.pathContains).c_str());
     SetWindowTextW(app.s.download, widen(q.downloadContains).c_str());
-    static const SortKey sorts[] = {SortKey::Path,      SortKey::Modified, SortKey::Created, SortKey::Taken, SortKey::Resolution,
-                                    SortKey::Size,      SortKey::Rating,   SortKey::Title,   SortKey::Confidence};
+    static const SortKey sorts[] = {SortKey::Path,   SortKey::Modified, SortKey::Created,    SortKey::Taken,
+                                    SortKey::Resolution, SortKey::Size, SortKey::Rating,     SortKey::Title,
+                                    SortKey::Confidence, SortKey::Aesthetic, SortKey::Effective};
     for (size_t i = 0; i < std::size(sorts); ++i)
         if (sorts[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
@@ -2157,12 +2173,14 @@ const std::vector<std::string> kStatKinds[] = {{"artist"}, {"character"}, {"copy
 std::wstring statsSummaryText(const StatsSummary& s) {
     std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
                      L" 枚　出典あり " + withCommas(s.withSource) + L" 枚" +
-                     (s.deadLinks ? L"（リンク切れ " + withCommas(s.deadLinks) + L" 枚）" : L"") + L"\r\n";
+                     (s.deadLinks ? L"（リンク切れ " + withCommas(s.deadLinks) + L" 枚）" : L"") +
+                     (s.blurry || s.soft ? L"　ぼやけ " + withCommas(s.blurry) + L" 枚・細かさ不足 " + withCommas(s.soft) + L" 枚" : L"") + L"\r\n";
     t += L"完全一致 " + withCommas(s.exactGroups) + L" グループ（重なっている分 " + withCommas(s.exactExtra) + L" 枚・" +
          sizeText(s.exactExtraBytes) + L"）　見た目一致 " + withCommas(s.similarGroups) + L" グループ（" + withCommas(s.similarExtra) +
          L" 枚・" + sizeText(s.similarExtraBytes) + L"）\r\n解析: ";
     static const std::pair<const char*, const wchar_t*> names[] = {{"hash", L"ハッシュ"}, {"thumb", L"サムネイル"}, {"meta", L"メタデータ"},
-                                                                   {"names", L"json・フォルダ名"}, {"tagger", L"タガー"}, {"clip", L"CLIP"}};
+                                                                   {"names", L"json・フォルダ名"}, {"tagger", L"タガー"}, {"clip", L"CLIP"},
+                                                                   {"quality", L"品質"}};
     bool first = true;
     for (const auto& [k, label] : names)
         for (const auto& st : s.stages)
@@ -2451,13 +2469,13 @@ void undoTagEdit() {
 // ---------------------------------------------------------------- 設定の画面（imgdupe.ini と同じ内容を画面から変える）
 
 struct SettingsWindow {
-    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
+    HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, quality = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
          variantSim = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2471,6 +2489,7 @@ void applySettings() {
             indexer::start();
         }
     }
+    iniSet(L"qualityEnabled", Button_GetCheck(w.quality) == BST_CHECKED ? L"1" : L"0");
     const int tagger = Button_GetCheck(w.tagger) == BST_CHECKED ? 1 : 0;
     const int clipOn = Button_GetCheck(w.clip) == BST_CHECKED ? 1 : 0;
     const int cpu = Button_GetCheck(w.gpu) == BST_CHECKED ? 0 : 1;
@@ -2554,7 +2573,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(608), m = px(12);
+    const int cw = px(560), ch = px(632), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2582,8 +2601,10 @@ void showSettingsWindow() {
     int gy = group(L"アップデート", px(52));
     w.autoUpdate = child(WC_BUTTONW, L"終了する時に新しい版を確かめる（1 日 1 回）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOUPDATE,
                          in, gy, iw, rowH);
-    gy = group(L"バックグラウンドの解析", px(52));
+    gy = group(L"バックグラウンドの解析", px(76));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
+    w.quality = child(WC_BUTTONW, L"画像の品質（ぼやけ・拡大された画像）を調べる（1 枚ずつ読み直すので時間がかかります）",
+                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_QUALITY, in, gy + rowH + px(2), iw, rowH);
     gy = group(L"AI 解析", px(174));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
@@ -2625,6 +2646,7 @@ void showSettingsWindow() {
     // 今の設定を出す
     Button_SetCheck(w.autoUpdate, iniInt(L"autoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.quality, clip::qualityEnabled(app.dataDir) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.clip, iniInt(L"clipEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
     setText(w.variantSim, [&] {
@@ -3127,13 +3149,20 @@ void layoutSearch(int y, int W, int bottom) {
         MoveWindow(app.s.clip, x + hw + gap, cy, hw, rowH, TRUE);
         cy += rowH + gap;
     }
-    // 星・形式
+    // 星・形式・品質
     const int half = (panelW - gap) / 2;
-    label(cy, x, half);
-    label(cy, x + half + gap, half);
-    cy += labelH + px(2);
-    MoveWindow(app.s.rating, x, cy, half, px(240), TRUE);
-    MoveWindow(app.s.format, x + half + gap, cy, half, px(240), TRUE);
+    {
+        const int third = (panelW - 2 * gap) / 3;
+        label(cy, x, third);
+        label(cy, x + third + gap, third);
+        label(cy, x + 2 * (third + gap), third);
+        cy += labelH + px(2);
+        MoveWindow(app.s.rating, x, cy, third, px(240), TRUE);
+        MoveWindow(app.s.format, x + third + gap, cy, third, px(240), TRUE);
+        MoveWindow(app.s.quality, x + 2 * (third + gap), cy, third, px(240), TRUE);
+        SendMessageW(app.s.quality, CB_SETDROPPEDWIDTH, px(200), 0);
+        SendMessageW(app.s.format, CB_SETDROPPEDWIDTH, px(140), 0);
+    }
     cy += rowH + gap;
     // 撮影日
     label(cy, x, panelW);
@@ -3236,9 +3265,11 @@ void createSearchControls() {
     app.s.clip = edit(IDC_S_CLIP);
     label(L"星");
     label(L"形式");
+    label(L"品質");
     app.s.rating = combo(IDC_S_RATING, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
     app.s.format = combo(IDC_S_FORMAT, {L"すべて", L"JPEG", L"PNG", L"GIF", L"WebP", L"HEIF", L"BMP", L"TIFF", L"JPEG XR",
                                         L"アニメーション"});
+    app.s.quality = combo(IDC_S_QUALITY, {L"すべて", L"くっきり", L"ぼやけている", L"拡大・細かさ不足", L"低解像度（実質 800px 未満）"});
     label(L"撮影日（チェックを入れた日だけ使う）");
     label(L"〜");
     app.s.from = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_FROM);
@@ -3261,7 +3292,7 @@ void createSearchControls() {
     app.s.download = edit(IDC_S_DOWNLOAD);
     label(L"並べ替え");
     app.s.sort = combo(IDC_S_SORT, {L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ", L"星",
-                                    L"タイトル", L"確度（1 つ目のタグ）"});
+                                    L"タイトル", L"確度（1 つ目のタグ）", L"見栄え（AI）", L"実質の解像度"});
     app.s.desc = makeControl(WC_BUTTONW, L"降順", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DESC);
     app.s.clear = makeControl(WC_BUTTONW, L"条件をクリア", WS_TABSTOP, IDC_S_CLEAR);
     app.s.expand = makeControl(WC_BUTTONW, L"フォルダに展開…", WS_TABSTOP, IDC_S_EXPAND);
@@ -3366,7 +3397,7 @@ bool onSearchCommand(WPARAM wp) {
         case IDC_S_DOWNLOAD:
             if (code == EN_CHANGE) scheduleSearch(300);  // 打ち終わるのを少し待つ
             return true;
-        case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_SORT:
+        case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_QUALITY: case IDC_S_SORT:
             if (code == CBN_SELCHANGE) scheduleSearch(30);
             return true;
         case IDC_S_NOTAKEN: case IDC_S_DESC: case IDC_S_UNCLASSIFIED: case IDC_S_DEADLINKS:
@@ -4388,6 +4419,11 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
         clip::applyDictionary(app.dataDir, db, false);
         clip::applyReferences(app.dataDir, db, false);
         clip::applyTagParents(db, false);  // 辞書や見本で付いたタグの親も
+        clip::applyAesthetic(app.dataDir, db);
+    };
+    cb.qualityEnabled = [] { return clip::qualityEnabled(app.dataDir); };
+    cb.decodeQuality = [](const std::string& path, int maxSide, std::vector<uint8_t>& bgra, int& w, int& h, int& ow, int& oh) {
+        return imgwin::decodeBgra(widen(path), maxSide, bgra, w, h, &ow, &oh);
     };
     return cb;
 }

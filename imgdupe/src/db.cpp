@@ -231,6 +231,17 @@ CREATE INDEX IF NOT EXISTS tag_relations_kind ON tag_relations(kind, tag);
 const char* const kSchemaV7Columns[] = {"sources.link_status INTEGER", "sources.link_checked INTEGER"};
 const char* const kSchemaV7 = "CREATE INDEX IF NOT EXISTS sources_link ON sources(link_checked);";
 
+// 版 8: 品質スコア（くっきり度・細かさ・実質の解像度は段階 quality、見栄えは CLIP のベクトルから）
+const char* const kSchemaV8 = R"SQL(
+CREATE TABLE IF NOT EXISTS quality(
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    sharpness REAL,
+    detail REAL,
+    effective INTEGER,
+    aesthetic REAL
+);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -349,7 +360,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         if (i == 6)

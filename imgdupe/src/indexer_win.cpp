@@ -196,6 +196,11 @@ void runOnce(const std::vector<std::wstring>& roots) {
         clip::applyDictionary(g->dataDir, db, false);
         clip::applyReferences(g->dataDir, db, false);
         clip::applyTagParents(db, false);  // 辞書や見本で付いたタグの親も
+        clip::applyAesthetic(g->dataDir, db);
+    };
+    cb.qualityEnabled = [] { return clip::qualityEnabled(g->dataDir); };
+    cb.decodeQuality = [](const std::string& path, int maxSide, std::vector<uint8_t>& bgra, int& w, int& h, int& ow, int& oh) {
+        return imgwin::decodeBgra(widen(path), maxSide, bgra, w, h, &ow, &oh);
     };
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
@@ -329,6 +334,9 @@ std::wstring statusText() {
             case IndexPhase::Clip:
                 swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Quality:
+                swprintf(t, 128, L"品質 %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
                 break;
             case IndexPhase::Lookup:
                 swprintf(t, 128, L"出典の照会 %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));

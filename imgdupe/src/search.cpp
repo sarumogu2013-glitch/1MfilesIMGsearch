@@ -1,6 +1,7 @@
 #include "search.hpp"
 
 #include "json.hpp"
+#include "quality.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -196,6 +197,15 @@ SearchResult search(Db& db, const SearchQuery& q) {
         where += " AND instr(lower(f.zone_url), ?) > 0";
         params.emplace_back(lowerAscii(q.downloadContains));
     }
+    switch (q.quality) {
+        case QualityFilter::Any: break;
+        case QualityFilter::Good:
+            where += " AND qa.sharpness >= " + std::to_string(kBlurryBelow) + " AND qa.detail >= " + std::to_string(kSoftBelow);
+            break;
+        case QualityFilter::Blurry: where += " AND qa.sharpness < " + std::to_string(kBlurryBelow); break;
+        case QualityFilter::Soft: where += " AND qa.detail < " + std::to_string(kSoftBelow); break;
+        case QualityFilter::LowRes: where += " AND qa.effective > 0 AND qa.effective < " + std::to_string(kLowResBelow); break;
+    }
     if (q.deadLinks) where += " AND EXISTS (SELECT 1 FROM sources s WHERE s.image_id=i.id AND s.link_status=0)";
 
     // 並べ替え（空欄は最後。同じなら パス順）
@@ -210,13 +220,16 @@ SearchResult search(Db& db, const SearchQuery& q) {
         case SortKey::Rating: key = "f.rating"; break;
         case SortKey::Title: key = "NULLIF(f.title, '')"; break;
         case SortKey::Confidence: key = q.tags.empty() ? "i.path" : "t0.conf"; break;
+        case SortKey::Aesthetic: key = "qa.aesthetic"; break;
+        case SortKey::Effective: key = "qa.effective"; break;
     }
     const std::string dir = q.descending ? " DESC" : "";
     std::string order = " ORDER BY (" + key + ") IS NULL, " + key + dir;
     if (key != "i.path") order += ", i.path";
     if (q.review && !q.tags.empty()) order = " ORDER BY abs(t0.conf - 0.5), i.path";
 
-    const std::string from = " FROM images i LEFT JOIN file_meta f ON f.image_id=i.id" + joins + where;
+    const std::string from =
+        " FROM images i LEFT JOIN file_meta f ON f.image_id=i.id LEFT JOIN quality qa ON qa.image_id=i.id" + joins + where;
     auto bindAll = [&](Stmt& st) {
         for (size_t i = 0; i < params.size(); ++i) {
             const int idx = static_cast<int>(i + 1);
@@ -243,8 +256,9 @@ SearchResult search(Db& db, const SearchQuery& q) {
 
 bool imageInfo(Db& db, int64_t id, ImageInfo& out) {
     Stmt st(db.handle(),
-            "SELECT i.path,i.size,i.mtime,f.taken,i.width,i.height,f.rating,f.title,f.format FROM images i "
-            "LEFT JOIN file_meta f ON f.image_id=i.id WHERE i.id=?");
+            "SELECT i.path,i.size,i.mtime,f.taken,i.width,i.height,f.rating,f.title,f.format,"
+            "qa.sharpness,qa.detail,qa.effective,qa.aesthetic FROM images i "
+            "LEFT JOIN file_meta f ON f.image_id=i.id LEFT JOIN quality qa ON qa.image_id=i.id WHERE i.id=?");
     st.bind(1, id);
     if (!st.step()) return false;
     out.id = id;
@@ -257,6 +271,10 @@ bool imageInfo(Db& db, int64_t id, ImageInfo& out) {
     out.rating = st.isNull(6) ? -1 : static_cast<int>(st.i64(6));
     out.title = st.text(7);
     out.format = st.text(8);
+    out.sharpness = st.isNull(9) ? -1 : st.f64(9);
+    out.detail = st.isNull(10) ? -1 : st.f64(10);
+    out.effective = st.isNull(11) ? 0 : static_cast<int>(st.i64(11));
+    out.aesthetic = st.isNull(12) ? -1 : st.f64(12);
     return true;
 }
 
@@ -386,12 +404,14 @@ bool hasConditions(const SearchQuery& q) {
     return !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
            q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
            q.minSize > 0 || q.maxSize > 0 || !q.format.empty() || q.animatedOnly || q.unclassified || !q.pathContains.empty() ||
-           !q.downloadContains.empty() || q.deadLinks;
+           !q.downloadContains.empty() || q.deadLinks || q.quality != QualityFilter::Any;
 }
 
 namespace {
 
-const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence"};
+const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence",
+                                  "aesthetic", "effective"};
+const char* const kQualityNames[] = {"", "good", "blurry", "soft", "lowres"};
 
 void putList(std::string& out, const char* key, const std::vector<std::string>& v) {
     if (v.empty()) return;
@@ -445,6 +465,7 @@ std::string queryToJson(const SearchQuery& q) {
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
     putBool(out, "deadLinks", q.deadLinks);
+    if (q.quality != QualityFilter::Any) putText(out, "quality", kQualityNames[static_cast<int>(q.quality)]);
     putBool(out, "review", q.review);
     putText(out, "clipText", q.clipText);
     putInt(out, "similarTo", q.similarTo);
@@ -488,6 +509,11 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     q.format = j.getString("format");
     flag("animatedOnly", q.animatedOnly);
     flag("deadLinks", q.deadLinks);
+    {
+        const std::string qn = j.getString("quality");
+        for (int i = 1; i < 5; ++i)
+            if (qn == kQualityNames[i]) q.quality = static_cast<QualityFilter>(i);
+    }
     flag("unclassified", q.unclassified);
     q.pathContains = j.getString("path");
     q.downloadContains = j.getString("download");

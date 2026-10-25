@@ -201,10 +201,12 @@ bool fittedPixels(IWICImagingFactory* wic, IWICBitmapSource* src, UINT box, std:
 // ファイルを読み、box×box に収まるよう縮めて、EXIF の向きを直した画素
 // （回転は自分で行う。WIC の回転は環境によって動かないため）
 bool orientedPixels(IWICImagingFactory* wic, const std::wstring& path, UINT box, std::vector<BYTE>& px, UINT& w,
-                    UINT& h) {
+                    UINT& h, UINT* origW = nullptr, UINT* origH = nullptr) {
     Com<IWICBitmapFrameDecode> frame;
     UINT fw = 0, fh = 0;
     if (!openFrame(path, frame, fw, fh)) return false;
+    if (origW) *origW = fw;
+    if (origH) *origH = fh;
     const int orientation = readOrientation(frame.get(), path);
     Com<IWICBitmapSource> src;
     fastSource(wic, frame.get(), fw, fh, box, src);
@@ -273,12 +275,14 @@ HBITMAP thumbFromBytes(const std::vector<uint8_t>& bytes, int box, COLORREF bg) 
     return composeThumb(px, w, h, box, bg);
 }
 
-bool decodeBgra(const std::wstring& path, int box, std::vector<uint8_t>& px, int& w, int& h) {
+bool decodeBgra(const std::wstring& path, int box, std::vector<uint8_t>& px, int& w, int& h, int* origW, int* origH) {
     IWICImagingFactory* wic = factory();
-    UINT tw = 0, th = 0;
-    if (!wic || !orientedPixels(wic, path, static_cast<UINT>(box), px, tw, th)) return false;
+    UINT tw = 0, th = 0, ow = 0, oh = 0;
+    if (!wic || !orientedPixels(wic, path, static_cast<UINT>(box), px, tw, th, &ow, &oh)) return false;
     w = static_cast<int>(tw);
     h = static_cast<int>(th);
+    if (origW) *origW = static_cast<int>(ow);  // 向きを直す前の大きさ（長い辺を見るだけなら同じ）
+    if (origH) *origH = static_cast<int>(oh);
     return true;
 }
 

@@ -41,6 +41,10 @@ struct IndexCallbacks {
     std::function<int()> clipVersion;
     std::function<void(Db&)> prepareClip;
     std::function<std::shared_ptr<Analyzer>(std::string& error)> makeClip;
+    // 7. 品質（段階 quality。無いか false を返せば飛ばす）
+    std::function<bool()> qualityEnabled;
+    std::function<bool(const std::string& path, int maxSide, std::vector<uint8_t>& bgra, int& w, int& h, int& origW, int& origH)>
+        decodeQuality;
     // CLIP の後（差分グループ）
     std::function<void(Db&, unsigned threads, const std::atomic<bool>& cancel, Progress*)> afterClip;
     // 8. 外部照会（投稿サイトのタグ。通信するので、設定で有効にした時だけ）
@@ -49,7 +53,7 @@ struct IndexCallbacks {
     std::function<void(Db&)> merge;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Lookup, Merge, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Quality, Lookup, Merge, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
@@ -57,7 +61,7 @@ struct IndexProgress {
 };
 
 struct IndexReport {
-    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, clipped = 0, failed = 0;
+    size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, clipped = 0, quality = 0, failed = 0;
     std::string taggerError;  // モデルを読めなかった時の理由
     std::string clipError;
     bool cancelled = false;

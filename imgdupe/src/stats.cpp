@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <map>
 
+#include "quality.hpp"
+
 namespace imgdupe {
 
 namespace {
@@ -54,6 +56,14 @@ StatsSummary statsSummary(Db& db) {
     {
         Stmt st(db.handle(), "SELECT count(DISTINCT image_id) FROM sources WHERE link_status=0");
         if (st.step()) s.deadLinks = st.i64(0);
+    }
+    {
+        Stmt st(db.handle(), "SELECT coalesce(sum(sharpness < ?),0), coalesce(sum(detail < ?),0) FROM quality");
+        st.bind(1, kBlurryBelow).bind(2, kSoftBelow);
+        if (st.step()) {
+            s.blurry = st.i64(0);
+            s.soft = st.i64(1);
+        }
     }
     {
         Stmt st(db.handle(), "SELECT stage, sum(state=1), sum(state=2) FROM stages GROUP BY stage");

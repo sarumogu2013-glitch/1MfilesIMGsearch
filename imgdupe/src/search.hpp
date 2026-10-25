@@ -12,7 +12,10 @@
 
 namespace imgdupe {
 
-enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence };
+enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence, Aesthetic, Effective };
+
+// 品質での絞り込み（quality.hpp の段階 quality が済んだ画像だけ）
+enum class QualityFilter { Any, Good, Blurry, Soft, LowRes };
 
 struct SearchQuery {
     // タグ（別名は tag_dict でまとめる）。tags は全部を持つもの、excludeTags はどれも持たないもの
@@ -36,6 +39,9 @@ struct SearchQuery {
     std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
     bool deadLinks = false;              // 出典の投稿が消えている（リンク切れ）画像
+    // Good: くっきりしていて画素ほどの細かさがある、Blurry: ぼやけている、Soft: 拡大された・ぼやけた（細かさが足りない）、
+    // LowRes: 実質の解像度（長い辺）が kLowResBelow 未満
+    QualityFilter quality = QualityFilter::Any;
     // 確認キュー: 1 つ目のタグをまだ手動で確定していない画像のうち、確度が kReviewMax 未満のものを、
     // 迷っている順（確度が 0.5 に近い順）に並べる（sort は使わない）
     bool review = false;
@@ -66,6 +72,8 @@ struct ImageInfo {
     int64_t size = 0, mtime = 0, taken = 0;
     int width = 0, height = 0, rating = -1;
     std::string title, format;
+    double sharpness = -1, detail = -1, aesthetic = -1;  // 品質（無ければ -1）
+    int effective = 0;
 };
 bool imageInfo(Db& db, int64_t id, ImageInfo& out);
 
