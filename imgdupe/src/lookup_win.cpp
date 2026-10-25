@@ -55,6 +55,7 @@ Settings load(const std::wstring& dataDir) {
     Settings s;
     s.idLookup = GetPrivateProfileIntW(L"imgdupe", L"lookupEnabled", 0, ini.c_str()) != 0;
     s.reverse = GetPrivateProfileIntW(L"imgdupe", L"sauceEnabled", 0, ini.c_str()) != 0;
+    s.linkCheck = GetPrivateProfileIntW(L"imgdupe", L"linkCheckEnabled", 0, ini.c_str()) != 0;
     wchar_t key[256] = L"";
     GetPrivateProfileStringW(L"imgdupe", L"sauceKey", L"", key, 256, ini.c_str());
     s.sauceKey = key;
@@ -67,6 +68,7 @@ void save(const std::wstring& dataDir, const Settings& s) {
     const std::wstring ini = iniPath(dataDir);
     WritePrivateProfileStringW(L"imgdupe", L"lookupEnabled", s.idLookup ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"imgdupe", L"sauceEnabled", s.reverse ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"imgdupe", L"linkCheckEnabled", s.linkCheck ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"imgdupe", L"sauceKey", s.sauceKey.c_str(), ini.c_str());
     WritePrivateProfileStringW(L"imgdupe", L"sauceDailyLimit", std::to_wstring(s.dailyLimit).c_str(), ini.c_str());
 }
@@ -76,12 +78,14 @@ LookupReport run(const std::wstring& dataDir, Db& db, const std::atomic<bool>& c
     LookupOptions opt;
     opt.idLookup = s.idLookup;
     opt.reverse = s.reverse;
+    opt.linkCheck = s.linkCheck;
     opt.sauceKey = narrow(s.sauceKey);
     opt.sauceDailyLimit = s.dailyLimit;
     opt.danbooruUrl = envOr(L"IMGDUPE_DANBOORU_URL", "https://danbooru.donmai.us");
     opt.pixivUrl = envOr(L"IMGDUPE_PIXIV_URL", "https://www.pixiv.net");
     opt.sauceUrl = envOr(L"IMGDUPE_SAUCENAO_URL", "https://saucenao.com");
-    if (!opt.idLookup && !(opt.reverse && !opt.sauceKey.empty())) return {};
+    opt.twitterUrl = envOr(L"IMGDUPE_TWITTER_URL", "https://publish.twitter.com");
+    if (!opt.idLookup && !opt.linkCheck && !(opt.reverse && !opt.sauceKey.empty())) return {};
 
     ThumbPack pack(narrow(dataDir));
     LookupNet net;

@@ -15,6 +15,7 @@ struct StatsSummary {
     int64_t similarGroups = 0, similarExtra = 0, similarExtraBytes = 0;
     int64_t tagged = 0;      // 検索用のタグ（どの出どころでも）が付いている画像
     int64_t withSource = 0;  // 出典（sources）が分かっている画像
+    int64_t deadLinks = 0;   // 出典の投稿が消えている画像
     struct Stage {
         std::string name;
         int64_t done = 0, failed = 0;

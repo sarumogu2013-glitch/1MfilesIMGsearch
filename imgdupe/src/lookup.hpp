@@ -62,6 +62,17 @@ std::vector<LookupTask> pendingIdLookups(Db& db, size_t limit);
 // 出典が何も分からない画像（サムネイルがあり、カメラで撮った写真ではないもの）
 std::vector<int64_t> pendingReverseLookups(Db& db, size_t limit);
 
+// 出典のリンクの確認（仕様「出典リンクの保存」: リンク切れかどうかを定期的に確かめる）。
+// pixiv・Danbooru・X の投稿（同じ投稿は 1 回）。まだ確かめていないもの、確かめてから days 日たったもの
+struct LinkTask {
+    std::string site, postId;
+};
+std::vector<LinkTask> pendingLinkChecks(Db& db, int64_t now, int days, size_t limit);
+// 応答から: 1 = ある、0 = 消えている、-1 = 分からない（見るのにログインが要るなど）
+int linkStatusFromResponse(const std::string& site, int httpStatus, const std::string& body);
+// 同じ投稿の行を全部書き換える（-1 なら確かめた時刻だけ）
+void storeLinkCheck(Db& db, const LinkTask& task, int status, int64_t now);
+
 // 照会の結果を書く（タグ・作者・URL。見つからなくても調べたことは残す）
 void storeIdLookup(Db& db, const LookupTask& task, const LookupPost& post, int64_t now);
 // 逆画像検索の結果を書く（posts: 見つかった投稿を照会した結果。sources に saucenao の行を残す）
@@ -76,7 +87,9 @@ struct HttpResult {
 };
 
 struct LookupOptions {
-    bool idLookup = false, reverse = false;
+    bool idLookup = false, reverse = false, linkCheck = false;
+    int linkCheckDays = 30;
+    size_t maxLinkPerRun = 300;
     std::string sauceKey;
     int sauceDailyLimit = kSauceNaoDefaultDailyLimit;
     size_t maxIdPerRun = 300;     // 1 回の解析で照会する数の上限（1 秒に 1 回なので、おおよそ 5 分）
@@ -84,6 +97,7 @@ struct LookupOptions {
     std::string danbooruUrl = "https://danbooru.donmai.us";
     std::string pixivUrl = "https://www.pixiv.net";
     std::string sauceUrl = "https://saucenao.com";
+    std::string twitterUrl = "https://publish.twitter.com";  // oEmbed（消えた・見られない投稿は 404）
 };
 
 struct LookupNet {
@@ -95,11 +109,11 @@ struct LookupNet {
 };
 
 struct LookupReport {
-    size_t looked = 0, found = 0, reverseSent = 0, reverseFound = 0;
+    size_t looked = 0, found = 0, reverseSent = 0, reverseFound = 0, linksChecked = 0, linksDead = 0;
     std::string error;  // 途中でやめた理由（次の回にまた試す）
 };
 
-// 間隔: 同じサイトへは 1 秒に 1 回、SauceNAO へは 8 秒に 1 回（30 秒に 4 回まで）
+// ID 照会 → 逆画像検索 → リンクの確認の順。間隔: 同じサイトへは 1 秒に 1 回、SauceNAO へは 8 秒に 1 回（30 秒に 4 回まで）
 LookupReport runLookups(Db& db, const LookupOptions& opt, const LookupNet& net, const std::atomic<bool>& cancel,
                         Progress* progress = nullptr);
 

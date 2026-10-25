@@ -52,6 +52,10 @@ StatsSummary statsSummary(Db& db) {
         if (st.step()) s.withSource = st.i64(0);
     }
     {
+        Stmt st(db.handle(), "SELECT count(DISTINCT image_id) FROM sources WHERE link_status=0");
+        if (st.step()) s.deadLinks = st.i64(0);
+    }
+    {
         Stmt st(db.handle(), "SELECT stage, sum(state=1), sum(state=2) FROM stages GROUP BY stage");
         while (st.step()) s.stages.push_back({st.text(0), st.i64(1), st.i64(2)});
     }

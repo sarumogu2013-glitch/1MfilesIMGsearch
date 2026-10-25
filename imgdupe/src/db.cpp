@@ -226,6 +226,11 @@ CREATE TABLE IF NOT EXISTS tag_relations(
 CREATE INDEX IF NOT EXISTS tag_relations_kind ON tag_relations(kind, tag);
 )SQL";
 
+// 版 7: 出典のリンクの確認（link_status: 1 = ある、0 = 消えている、NULL = 分からない。link_checked: 確かめた時刻）
+// （列を足す ALTER は、列が既にあると失敗するので、migrate で無い時だけ足す。ここは "表.列 型" の並び）
+const char* const kSchemaV7Columns[] = {"sources.link_status INTEGER", "sources.link_checked INTEGER"};
+const char* const kSchemaV7 = "CREATE INDEX IF NOT EXISTS sources_link ON sources(link_checked);";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -344,13 +349,29 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7};
     if (!exec("BEGIN IMMEDIATE")) return false;
-    for (int i = v; i < kSchemaVersion; ++i)
+    for (int i = v; i < kSchemaVersion; ++i) {
+        if (i == 6)
+            for (const char* c : kSchemaV7Columns) {
+                const std::string def = c;
+                const size_t dot = def.find('.'), sp = def.find(' ');
+                const std::string table = def.substr(0, dot), column = def.substr(dot + 1, sp - dot - 1);
+                bool has = false;
+                {
+                    Stmt st(db_, ("PRAGMA table_info(" + table + ")").c_str());
+                    while (st.step()) has = has || st.text(1) == column;
+                }
+                if (!has && !exec(("ALTER TABLE " + table + " ADD COLUMN " + def.substr(dot + 1)).c_str())) {
+                    exec("ROLLBACK");
+                    return false;
+                }
+            }
         if (!exec(steps[i])) {
             exec("ROLLBACK");
             return false;
         }
+    }
     if (!exec(("PRAGMA user_version=" + std::to_string(kSchemaVersion)).c_str()) || !exec("COMMIT")) {
         exec("ROLLBACK");
         return false;

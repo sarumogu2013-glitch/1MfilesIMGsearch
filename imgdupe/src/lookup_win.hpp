@@ -1,6 +1,6 @@
 // 外部照会（lookup.hpp）を WinHTTP で動かす（Windows 専用）。設定は imgdupe.ini の [imgdupe]:
-//   lookupEnabled（ID 照会。既定 0）、sauceEnabled（逆画像検索。既定 0）、sauceKey（SauceNAO の API キー）、sauceDailyLimit（既定 100）
-// 環境変数 IMGDUPE_DANBOORU_URL / IMGDUPE_PIXIV_URL / IMGDUPE_SAUCENAO_URL で行き先を変えられる（テスト用）。
+//   lookupEnabled（ID 照会。既定 0）、linkCheckEnabled（出典のリンク切れの確認。30 日ごと。既定 0）、sauceEnabled（逆画像検索。既定 0）、sauceKey（SauceNAO の API キー）、sauceDailyLimit（既定 100）
+// 環境変数 IMGDUPE_DANBOORU_URL / IMGDUPE_PIXIV_URL / IMGDUPE_SAUCENAO_URL / IMGDUPE_TWITTER_URL で行き先を変えられる（テスト用）。
 #pragma once
 
 #include <atomic>
@@ -12,7 +12,7 @@
 namespace lookup {
 
 struct Settings {
-    bool idLookup = false, reverse = false;
+    bool idLookup = false, reverse = false, linkCheck = false;
     std::wstring sauceKey;
     int dailyLimit = imgdupe::kSauceNaoDefaultDailyLimit;
 };

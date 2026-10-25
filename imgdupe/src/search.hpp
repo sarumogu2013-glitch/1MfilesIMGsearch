@@ -35,6 +35,7 @@ struct SearchQuery {
     bool unclassified = false;           // 未分類: 確度 minConfidence 以上のタグ（出どころで絞った合成）が 1 つも無い画像
     std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
+    bool deadLinks = false;              // 出典の投稿が消えている（リンク切れ）画像
     // 確認キュー: 1 つ目のタグをまだ手動で確定していない画像のうち、確度が kReviewMax 未満のものを、
     // 迷っている順（確度が 0.5 に近い順）に並べる（sort は使わない）
     bool review = false;
@@ -67,6 +68,15 @@ struct ImageInfo {
     std::string title, format;
 };
 bool imageInfo(Db& db, int64_t id, ImageInfo& out);
+
+// 画像の出典（投稿のページの URL が分かるもの。サイトの名前の順）
+struct SourceLink {
+    std::string site, postId, url;
+    int status = -1;  // 1 = ある、0 = 消えている（リンク切れ）、-1 = 確かめていない・分からない
+};
+std::vector<SourceLink> sourceLinks(Db& db, int64_t imageId);
+// 出典の投稿のページの URL（sources.url が無ければ ID から作る）。作れなければ空
+std::string sourcePageUrl(const std::string& site, const std::string& postId, const std::string& url);
 
 constexpr double kReviewMax = 0.9;
 

@@ -196,6 +196,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
         where += " AND instr(lower(f.zone_url), ?) > 0";
         params.emplace_back(lowerAscii(q.downloadContains));
     }
+    if (q.deadLinks) where += " AND EXISTS (SELECT 1 FROM sources s WHERE s.image_id=i.id AND s.link_status=0)";
 
     // 並べ替え（空欄は最後。同じなら パス順）
     std::string key;
@@ -257,6 +258,33 @@ bool imageInfo(Db& db, int64_t id, ImageInfo& out) {
     out.title = st.text(7);
     out.format = st.text(8);
     return true;
+}
+
+std::string sourcePageUrl(const std::string& site, const std::string& postId, const std::string& url) {
+    if (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0) return url;
+    if (postId.empty() || postId.find_first_not_of("0123456789") != std::string::npos) return {};
+    if (site == "pixiv") return "https://www.pixiv.net/artworks/" + postId;
+    if (site == "danbooru") return "https://danbooru.donmai.us/posts/" + postId;
+    if (site == "x" || site == "twitter") return "https://x.com/i/status/" + postId;
+    return {};
+}
+
+std::vector<SourceLink> sourceLinks(Db& db, int64_t imageId) {
+    std::vector<SourceLink> out;
+    Stmt st(db.handle(), "SELECT site, post_id, url, link_status FROM sources WHERE image_id=? ORDER BY site, post_id");
+    st.bind(1, imageId);
+    while (st.step()) {
+        SourceLink l;
+        l.site = st.text(0);
+        l.postId = st.text(1);
+        l.url = sourcePageUrl(l.site, l.postId, st.text(2));
+        l.status = st.isNull(3) ? -1 : static_cast<int>(st.i64(3));
+        if (l.url.empty()) continue;
+        bool dup = false;
+        for (const auto& o : out) dup = dup || o.url == l.url;
+        if (!dup) out.push_back(std::move(l));
+    }
+    return out;
 }
 
 void setManualTag(Db& db, int64_t imageId, const std::string& tag, bool correct) {
@@ -358,7 +386,7 @@ bool hasConditions(const SearchQuery& q) {
     return !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
            q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
            q.minSize > 0 || q.maxSize > 0 || !q.format.empty() || q.animatedOnly || q.unclassified || !q.pathContains.empty() ||
-           !q.downloadContains.empty();
+           !q.downloadContains.empty() || q.deadLinks;
 }
 
 namespace {
@@ -416,6 +444,7 @@ std::string queryToJson(const SearchQuery& q) {
     putBool(out, "unclassified", q.unclassified);
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
+    putBool(out, "deadLinks", q.deadLinks);
     putBool(out, "review", q.review);
     putText(out, "clipText", q.clipText);
     putInt(out, "similarTo", q.similarTo);
@@ -458,6 +487,7 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     num("maxSize", q.maxSize);
     q.format = j.getString("format");
     flag("animatedOnly", q.animatedOnly);
+    flag("deadLinks", q.deadLinks);
     flag("unclassified", q.unclassified);
     q.pathContains = j.getString("path");
     q.downloadContains = j.getString("download");

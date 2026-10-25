@@ -269,6 +269,42 @@ std::vector<int64_t> pendingReverseLookups(Db& db, size_t limit) {
     return out;
 }
 
+std::vector<LinkTask> pendingLinkChecks(Db& db, int64_t now, int days, size_t limit) {
+    std::vector<LinkTask> out;
+    if (!limit) return out;
+    Stmt st(db.handle(),
+            "SELECT site, post_id, max(coalesce(link_checked, 0)) AS c FROM sources "
+            "WHERE site IN ('pixiv','danbooru','x','twitter') AND post_id GLOB '[0-9]*' AND post_id NOT GLOB '*[^0-9]*' "
+            "GROUP BY site, post_id HAVING c < ? ORDER BY c LIMIT ?");
+    st.bind(1, now - static_cast<int64_t>(days) * 86400 + 1).bind(2, static_cast<int64_t>(limit));
+    while (st.step()) out.push_back({st.text(0), st.text(1)});
+    return out;
+}
+
+int linkStatusFromResponse(const std::string& site, int httpStatus, const std::string& body) {
+    if (httpStatus == 404 || httpStatus == 410) return 0;
+    if (httpStatus != 200) return -1;
+    Json j;
+    if (site == "pixiv") {
+        if (!parseJson(body, j) || j.type != Json::Object) return -1;
+        const Json* err = j.get("error");
+        return err && err->type == Json::Bool && err->str == "true" ? 0 : 1;
+    }
+    if (site == "danbooru") {
+        if (!parseJson(body, j) || j.type != Json::Object) return -1;
+        const Json* del = j.get("is_deleted");
+        return del && del->type == Json::Bool && del->str == "true" ? 0 : 1;
+    }
+    return 1;
+}
+
+void storeLinkCheck(Db& db, const LinkTask& task, int status, int64_t now) {
+    Stmt st(db.handle(),
+            "UPDATE sources SET link_checked=?, link_status=CASE WHEN ? >= 0 THEN ? ELSE link_status END WHERE site=? AND post_id=?");
+    st.bind(1, now).bind(2, static_cast<int64_t>(status)).bind(3, static_cast<int64_t>(status)).bind(4, task.site).bind(5, task.postId);
+    st.step();
+}
+
 void storeIdLookup(Db& db, const LookupTask& task, const LookupPost& post, int64_t now) {
     db.begin();
     try {
@@ -345,7 +381,8 @@ LookupReport runLookups(Db& db, const LookupOptions& opt, const LookupNet& net, 
     LookupReport rep;
     auto now = [&] { return net.now ? net.now() : int64_t(0); };
     Pacer pixivPace{1000}, danbooruPace{1000}, saucePace{8000};
-    bool pixivOff = false, danbooruOff = false;
+    bool pixivOff = false, danbooruOff = false, twitterOff = false;
+    Pacer twitterPace{1000};
     const std::vector<std::string> pixivHeaders = {"Referer: https://www.pixiv.net/", "Accept: application/json"};
     const std::vector<std::string> jsonHeaders = {"Accept: application/json"};
 
@@ -472,6 +509,37 @@ LookupReport runLookups(Db& db, const LookupOptions& opt, const LookupNet& net, 
         if (progress) ++progress->done;
         if (s.longRemaining == 0) break;
         if (s.shortRemaining == 0 && !pause(net, 30000, cancel)) break;
+    }
+
+    // 出典のリンクの確認
+    if (!cancel && opt.linkCheck && net.get) {
+        const std::vector<LinkTask> links = pendingLinkChecks(db, now(), opt.linkCheckDays, opt.maxLinkPerRun);
+        if (progress) progress->total += links.size();
+        for (const auto& t : links) {
+            if (cancel) break;
+            const bool pixiv = t.site == "pixiv", danbooru = t.site == "danbooru";
+            bool& off = pixiv ? pixivOff : danbooru ? danbooruOff : twitterOff;
+            Pacer& pace = pixiv ? pixivPace : danbooru ? danbooruPace : twitterPace;
+            if (off) {
+                if (progress) ++progress->done;
+                continue;
+            }
+            const std::string url = pixiv      ? opt.pixivUrl + "/ajax/illust/" + t.postId
+                                    : danbooru ? opt.danbooruUrl + "/posts/" + t.postId + ".json"
+                                               : opt.twitterUrl + "/oembed?url=https%3A%2F%2Ftwitter.com%2Fi%2Fstatus%2F" + t.postId;
+            if (!pace.wait(net, cancel)) break;
+            const HttpResult r = net.get(url, pixiv ? pixivHeaders : jsonHeaders);
+            if (!r.ok || r.status == 429 || r.status >= 500) {
+                stop(off, pixiv ? "pixiv" : danbooru ? "Danbooru" : "X", httpWhy(r));
+                if (progress) ++progress->done;
+                continue;
+            }
+            const int status = linkStatusFromResponse(t.site, r.status, r.body);
+            storeLinkCheck(db, t, status, now());
+            ++rep.linksChecked;
+            if (status == 0) ++rep.linksDead;
+            if (progress) ++progress->done;
+        }
     }
     return rep;
 }

@@ -2135,6 +2135,89 @@ static void testStats() {
     CHECK(s.stages.size() == 1 && s.stages[0].name == "hash" && s.stages[0].done == 1 && s.stages[0].failed == 1);
 }
 
+static void testLinkCheck() {
+    CHECK(linkStatusFromResponse("pixiv", 404, "") == 0 && linkStatusFromResponse("pixiv", 403, "") == -1 &&
+          linkStatusFromResponse("pixiv", 200, R"({"error":false,"body":{}})") == 1 &&
+          linkStatusFromResponse("pixiv", 200, R"({"error":true,"body":[]})") == 0 && linkStatusFromResponse("pixiv", 200, "<html>") == -1 &&
+          linkStatusFromResponse("danbooru", 200, R"({"id":1,"is_deleted":true})") == 0 &&
+          linkStatusFromResponse("danbooru", 200, R"({"id":1,"is_deleted":false})") == 1 && linkStatusFromResponse("x", 200, "{}") == 1 &&
+          linkStatusFromResponse("x", 503, "") == -1);
+    CHECK(sourcePageUrl("pixiv", "5", "") == "https://www.pixiv.net/artworks/5" && sourcePageUrl("x", "7", "") == "https://x.com/i/status/7" &&
+          sourcePageUrl("download", "https://cdn/a.jpg", "https://page") == "https://page" && sourcePageUrl("md5", "abc", "").empty());
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-link-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 4; ++i) files.push_back({"/img/" + std::to_string(i) + ".png", 1, i});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) { return ids["/img/" + std::to_string(n) + ".png"]; };
+    auto src = [&](int n, const char* site, const std::string& post, const std::string& url = "") {
+        Stmt st(db.handle(), "INSERT INTO sources(image_id,site,post_id,url) VALUES(?,?,?,?)");
+        st.bind(1, I(n)).bind(2, std::string(site)).bind(3, post).bind(4, url);
+        st.step();
+    };
+    src(1, "pixiv", "100");
+    src(2, "pixiv", "100");  // 同じ投稿は 1 回
+    src(2, "danbooru", "200");
+    src(3, "x", "300");
+    src(4, "md5", std::string(32, 'a'));  // 確かめない
+    src(4, "download", "https://cdn.example/a.jpg", "https://example/page");
+    const int64_t day = 86400;
+    int64_t clock = 1000 * day;
+    auto pending = pendingLinkChecks(db, clock, 30, 100);
+    CHECK(pending.size() == 3);
+
+    std::vector<std::string> gets;
+    LookupNet net;
+    net.get = [&](const std::string& url, const std::vector<std::string>&) {
+        gets.push_back(url);
+        HttpResult r;
+        r.ok = true;
+        r.status = 200;
+        if (url.find("/ajax/illust/100") != std::string::npos) r.status = 404;
+        else if (url.find("/posts/200.json") != std::string::npos) r.body = R"({"id":200,"is_deleted":false})";
+        else if (url.find("oembed") != std::string::npos) r.status = 403;  // 鍵のかかったアカウントなど
+        return r;
+    };
+    net.sleep = [](int) {};
+    net.now = [&] { return clock; };
+    LookupOptions opt;
+    opt.linkCheck = true;
+    std::atomic<bool> cancel{false};
+    LookupReport rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.linksChecked == 3 && rep.linksDead == 1 && gets.size() == 3);
+    CHECK(std::find(gets.begin(), gets.end(), "https://publish.twitter.com/oembed?url=https%3A%2F%2Ftwitter.com%2Fi%2Fstatus%2F300") !=
+          gets.end());
+    auto links = sourceLinks(db, I(2));
+    CHECK(links.size() == 2 && links[0].site == "danbooru" && links[0].status == 1 && links[1].site == "pixiv" && links[1].status == 0 &&
+          links[1].url == "https://www.pixiv.net/artworks/100");
+    CHECK(sourceLinks(db, I(3)).size() == 1 && sourceLinks(db, I(3))[0].status == -1);
+    CHECK(sourceLinks(db, I(4)).size() == 1 && sourceLinks(db, I(4))[0].url == "https://example/page");
+    // リンク切れで検索・統計
+    SearchQuery q;
+    q.deadLinks = true;
+    CHECK(search(db, q).ids == std::vector<int64_t>({I(1), I(2)}));
+    SearchQuery q2;
+    CHECK(queryFromJson(queryToJson(q), q2) && q2.deadLinks && hasConditions(q2));
+    CHECK(statsSummary(db).deadLinks == 2);
+    // 30 日たつまでは確かめない
+    clock += 29 * day;
+    CHECK(pendingLinkChecks(db, clock, 30, 100).empty());
+    clock += 2 * day;
+    CHECK(pendingLinkChecks(db, clock, 30, 100).size() == 3);
+    // 通信できなければ印を付けない
+    net.get = [&](const std::string&, const std::vector<std::string>&) {
+        HttpResult r;
+        r.error = "timeout";
+        return r;
+    };
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.linksChecked == 0 && !rep.error.empty() && pendingLinkChecks(db, clock, 30, 100).size() == 3);
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2159,6 +2242,7 @@ int main() {
     testTagRelations();
     testLookup();
     testStats();
+    testLinkCheck();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

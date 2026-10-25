@@ -124,6 +124,7 @@ enum : int {
     IDC_S_NO,
     IDC_S_BULK,
     IDC_S_UNCLASSIFIED,
+    IDC_S_DEADLINKS,
     IDC_S_CLIP,
 };  // メニュー・ツールバー・キーで呼ぶ機能の ID は commands.hpp の CMD_*
 
@@ -190,7 +191,7 @@ struct App {
 
     // 検索の画面
     struct SearchCtl {
-        HWND tags, conf, confValue, sources, text, clip, rating, format, from, to, noTaken, unclassified, minW, minKb, maxKb, path, download,
+        HWND tags, conf, confValue, sources, text, clip, rating, format, from, to, noTaken, unclassified, deadLinks, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
         std::vector<HWND> labels;  // 見出し（並べる順）
     } s{};
@@ -1122,7 +1123,15 @@ void relookupImages(int64_t clicked);
 
 // imageId があれば「似た画像を探す」も出す（検索の画面）
 void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
-    constexpr int kSimilar = 0x7f00, kRelookup = 0x7f01;
+    constexpr int kSimilar = 0x7f00, kRelookup = 0x7f01, kSourcePage = 0x7f10;  // 出典のページは kSourcePage + 番号
+    std::vector<SourceLink> links;
+    if (imageId)
+        if (Db* db = uiDb()) {
+            try {
+                links = sourceLinks(*db, imageId);
+            } catch (const std::exception&) {
+            }
+        }
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
     AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
@@ -1130,6 +1139,11 @@ void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
     if (imageId) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kSimilar, L"似た画像を探す(&S)");
+        for (size_t i = 0; i < links.size() && i < 8; ++i) {
+            std::wstring label = L"出典のページを開く: " + widen(links[i].url) + (links[i].status == 0 ? L"（リンク切れ）" : L"");
+            for (size_t k = 0; (k = label.find(L'&', k)) != std::wstring::npos; k += 2) label.insert(k, 1, L'&');
+            AppendMenuW(menu, MF_STRING, kSourcePage + static_cast<int>(i), label.c_str());
+        }
         AppendMenuW(menu, MF_STRING, kRelookup, L"出典を調べ直す(&L)");
     }
     POINT pt;
@@ -1144,6 +1158,8 @@ void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
         findSimilar(imageId, sep == std::wstring::npos ? path : path.substr(sep + 1));
     }
     if (cmd == kRelookup) relookupImages(imageId);
+    if (cmd >= kSourcePage && cmd < kSourcePage + static_cast<int>(links.size()))
+        ShellExecuteW(app.hwnd, L"open", widen(links[static_cast<size_t>(cmd - kSourcePage)].url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void exportResult() {
@@ -1295,6 +1311,7 @@ SearchQuery searchQueryFromUi() {
     if (auto t = pickerDate(app.s.to, true)) q.takenTo = *t;
     q.noTaken = Button_GetCheck(app.s.noTaken) == BST_CHECKED;
     q.unclassified = Button_GetCheck(app.s.unclassified) == BST_CHECKED;
+    q.deadLinks = Button_GetCheck(app.s.deadLinks) == BST_CHECKED;
     q.minWidth = _wtoi(editText(app.s.minW).c_str());
     q.minSize = static_cast<int64_t>(_wtoi(editText(app.s.minKb).c_str())) * 1024;
     q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
@@ -1504,7 +1521,15 @@ void showSearchInfo(int item) {
     }
     if (fileTags.empty()) fileTags = L"ファイルのタグ: なし";
     if (tags.empty()) tags = L"検索用タグ: なし";
-    setText(app.info, widen(info->path) + L"\r\n" + line + L"\r\n" + fileTags + L"\r\n" + tags);
+    std::wstring sources;
+    if (Db* db = uiDb()) {
+        try {
+            for (const auto& l : sourceLinks(*db, info->id))
+                sources += (sources.empty() ? L"　出典: " : L"　") + widen(l.url) + (l.status == 0 ? L"（リンク切れ）" : L"");
+        } catch (const std::exception&) {
+        }
+    }
+    setText(app.info, widen(info->path) + L"\r\n" + line + sources + L"\r\n" + fileTags + L"\r\n" + tags);
 }
 
 // 「似た画像を探す」: 内容の欄をその画像にして探す（ほかの条件はそのまま）
@@ -1527,6 +1552,7 @@ void clearSearchConditions() {
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
     Button_SetCheck(app.s.noTaken, BST_UNCHECKED);
     Button_SetCheck(app.s.unclassified, BST_UNCHECKED);
+    Button_SetCheck(app.s.deadLinks, BST_UNCHECKED);
     Button_SetCheck(app.s.review, BST_UNCHECKED);
     app.uncheckedSources.clear();
     refreshSources();
@@ -1693,6 +1719,7 @@ void applyQueryToUi(const SearchQuery& q) {
     setDate(app.s.to, q.takenTo);
     Button_SetCheck(app.s.noTaken, q.noTaken ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(app.s.unclassified, q.unclassified ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.deadLinks, q.deadLinks ? BST_CHECKED : BST_UNCHECKED);
     auto setNum = [](HWND h, int64_t n) { SetWindowTextW(h, n > 0 ? std::to_wstring(n).c_str() : L""); };
     setNum(app.s.minW, q.minWidth);
     setNum(app.s.minKb, q.minSize / 1024);
@@ -2129,7 +2156,8 @@ const std::vector<std::string> kStatKinds[] = {{"artist"}, {"character"}, {"copy
 
 std::wstring statsSummaryText(const StatsSummary& s) {
     std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
-                     L" 枚　出典あり " + withCommas(s.withSource) + L" 枚\r\n";
+                     L" 枚　出典あり " + withCommas(s.withSource) + L" 枚" +
+                     (s.deadLinks ? L"（リンク切れ " + withCommas(s.deadLinks) + L" 枚）" : L"") + L"\r\n";
     t += L"完全一致 " + withCommas(s.exactGroups) + L" グループ（重なっている分 " + withCommas(s.exactExtra) + L" 枚・" +
          sizeText(s.exactExtraBytes) + L"）　見た目一致 " + withCommas(s.similarGroups) + L" グループ（" + withCommas(s.similarExtra) +
          L" 枚・" + sizeText(s.similarExtraBytes) + L"）\r\n解析: ";
@@ -2424,12 +2452,12 @@ void undoTagEdit() {
 
 struct SettingsWindow {
     HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
-         variantSim = nullptr, idLookup = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
+         variantSim = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2459,13 +2487,14 @@ void applySettings() {
     lookup::Settings ls;
     ls.idLookup = Button_GetCheck(w.idLookup) == BST_CHECKED;
     ls.reverse = Button_GetCheck(w.sauce) == BST_CHECKED;
+    ls.linkCheck = Button_GetCheck(w.linkCheck) == BST_CHECKED;
     ls.sauceKey = editText(w.sauceKey);
     while (!ls.sauceKey.empty() && iswspace(ls.sauceKey.back())) ls.sauceKey.pop_back();
     while (!ls.sauceKey.empty() && iswspace(ls.sauceKey.front())) ls.sauceKey.erase(0, 1);
     ls.dailyLimit = std::clamp(_wtoi(editText(w.sauceLimit).c_str()), 0, 100000);
     const lookup::Settings old = lookup::load(app.dataDir);
     lookup::save(app.dataDir, ls);
-    const bool lookupOn = (ls.idLookup && !old.idLookup) || (ls.reverse && (!old.reverse || ls.sauceKey != old.sauceKey));
+    const bool lookupOn = (ls.idLookup && !old.idLookup) || (ls.linkCheck && !old.linkCheck) || (ls.reverse && (!old.reverse || ls.sauceKey != old.sauceKey));
     if (changed) restartIndexerAfterUpdate();  // 動いているバックグラウンドの解析に新しい設定を使わせる
     else if (lookupOn)
         if (Db* db = uiDb()) addCommand(*db, "rescan");  // すぐ照会を始める
@@ -2525,7 +2554,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(584), m = px(12);
+    const int cw = px(560), ch = px(608), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2568,13 +2597,15 @@ void showSettingsWindow() {
                   IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
     w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
     child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
-    gy = group(L"外部照会（インターネットで出典を調べる）", px(136));
+    gy = group(L"外部照会（インターネットで出典を調べる）", px(160));
     w.idLookup = child(WC_BUTTONW, L"ファイル名の pixiv・Danbooru（MD5）の ID で、投稿のタグと作者を調べる",
                        WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_LOOKUP, in, gy, iw, rowH);
+    w.linkCheck = child(WC_BUTTONW, L"出典の投稿が消えていないか確かめる（pixiv・Danbooru・X。30 日ごと）", WS_TABSTOP | BS_AUTOCHECKBOX,
+                        IDC_ST_LINKCHECK, in, gy + rowH + px(2), iw, rowH);
     w.sauce = child(WC_BUTTONW, L"出典の分からない画像を SauceNAO で探す（縮小したサムネイルを送ります）", WS_TABSTOP | BS_AUTOCHECKBOX,
-                    IDC_ST_SAUCE, in, gy + rowH + px(2), iw, rowH);
+                    IDC_ST_SAUCE, in, gy + 2 * (rowH + px(2)), iw, rowH);
     {
-        const int ry = gy + 2 * (rowH + px(2)) + px(2);
+        const int ry = gy + 3 * (rowH + px(2)) + px(2);
         child(WC_STATICW, L"API キー", SS_NOPREFIX, -1, in + px(18), ry + px(3), px(64), rowH);
         w.sauceKey = child(WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, IDC_ST_SAUCEKEY, in + px(84), ry,
                            iw - px(84) - px(140), rowH);
@@ -2606,6 +2637,7 @@ void showSettingsWindow() {
         const lookup::Settings ls = lookup::load(app.dataDir);
         Button_SetCheck(w.idLookup, ls.idLookup ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(w.sauce, ls.reverse ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(w.linkCheck, ls.linkCheck ? BST_CHECKED : BST_UNCHECKED);
         setText(w.sauceKey, ls.sauceKey);
         setText(w.sauceLimit, std::to_wstring(ls.dailyLimit));
         EnableWindow(w.sauceKey, ls.reverse);
@@ -3111,8 +3143,12 @@ void layoutSearch(int y, int W, int bottom) {
     label(cy + px(4), x + dw + px(4), px(16));
     MoveWindow(app.s.to, x + panelW - dw, cy, dw, rowH, TRUE);
     cy += rowH + px(2);
-    MoveWindow(app.s.noTaken, x, cy, half, rowH, TRUE);
-    MoveWindow(app.s.unclassified, x + half + gap, cy, half, rowH, TRUE);
+    {
+        const int third = (panelW - 2 * gap) / 3;
+        MoveWindow(app.s.noTaken, x, cy, third, rowH, TRUE);
+        MoveWindow(app.s.unclassified, x + third + gap, cy, third, rowH, TRUE);
+        MoveWindow(app.s.deadLinks, x + 2 * (third + gap), cy, third, rowH, TRUE);
+    }
     cy += rowH + gap;
     // 幅・ファイルサイズ
     label(cy, x, px(90));
@@ -3209,9 +3245,10 @@ void createSearchControls() {
     app.s.to = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHORTDATEFORMAT | DTS_SHOWNONE, IDC_S_TO);
     DateTime_SetSystemtime(app.s.from, GDT_NONE, nullptr);
     DateTime_SetSystemtime(app.s.to, GDT_NONE, nullptr);
-    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日なし（EXIF なし）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
-    app.s.unclassified = makeControl(WC_BUTTONW, L"未分類（タグなし）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_UNCLASSIFIED);
-    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken, app.s.unclassified});
+    app.s.noTaken = makeControl(WC_BUTTONW, L"撮影日なし", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_NOTAKEN);
+    app.s.unclassified = makeControl(WC_BUTTONW, L"未分類", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_UNCLASSIFIED);
+    app.s.deadLinks = makeControl(WC_BUTTONW, L"リンク切れ", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_S_DEADLINKS);
+    app.searchPage.insert(app.searchPage.end(), {app.s.from, app.s.to, app.s.noTaken, app.s.unclassified, app.s.deadLinks});
     label(L"幅（px）以上");
     label(L"ファイルサイズ（KB）");
     app.s.minW = edit(IDC_S_MINW, ES_NUMBER);
@@ -3332,7 +3369,7 @@ bool onSearchCommand(WPARAM wp) {
         case IDC_S_RATING: case IDC_S_FORMAT: case IDC_S_SORT:
             if (code == CBN_SELCHANGE) scheduleSearch(30);
             return true;
-        case IDC_S_NOTAKEN: case IDC_S_DESC: case IDC_S_UNCLASSIFIED:
+        case IDC_S_NOTAKEN: case IDC_S_DESC: case IDC_S_UNCLASSIFIED: case IDC_S_DEADLINKS:
             scheduleSearch(30);
             return true;
         case IDC_S_CLEAR:
