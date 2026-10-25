@@ -22,6 +22,7 @@
 #include "clip.hpp"
 #include "ann.hpp"
 #include "dict.hpp"
+#include "refs.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1741,6 +1742,66 @@ static void testDict() {
     fs::remove_all(dir);
 }
 
+static void testRefs() {
+    CHECK(std::abs(referenceProbability(0.80) - 0.5) < 1e-9 && referenceProbability(0.9) > 0.9 && referenceProbability(0.7) < 0.1);
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-refs-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    // 見本: miku は手動で 3 枚、rin は refs フォルダに 1 枚。len は手動 2 枚（足りない）
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 8; ++i) files.push_back({"/img/" + std::to_string(i) + ".png", 1, i});
+    files.push_back({"D:\\data\\refs\\rin\\r1.png", 1, 9});
+    files.push_back({"D:\\data\\refs\\top.png", 1, 10});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) { return ids["/img/" + std::to_string(n) + ".png"]; };
+    for (int n : {1, 2, 3}) setManualTag(db, I(n), "miku", true);
+    for (int n : {4, 5}) setManualTag(db, I(n), "len", true);
+    setManualTag(db, I(6), "miku", false);  // 「違う」は見本にしない
+    auto sets = collectRefSets(db, "D:\\data\\refs\\");
+    CHECK(sets.size() == 2 && sets[0].tag == "miku" && sets[0].ids.size() == 3 && sets[1].tag == "rin" &&
+          sets[1].ids == std::vector<int64_t>{ids["D:\\data\\refs\\rin\\r1.png"]} && sets[1].kind == "character");
+    CHECK(collectRefSets(db, "").size() == 1);
+    CHECK(refStateHash(sets, 5) != refStateHash(sets, 6));
+
+    // ベクトル: 1〜3 と 7 は似ている（miku）、8 と見本の rin が似ている
+    const std::string vpath = (dir / "v.bin").string();
+    {
+        VectorWriter w;
+        CHECK(w.open(vpath, 3, "m"));
+        auto put = [&](int64_t id, std::vector<float> v) {
+            normalizeVector(v);
+            w.append(id, v.data());
+        };
+        put(I(1), {1, 0.1f, 0});
+        put(I(2), {1, -0.1f, 0});
+        put(I(3), {1, 0, 0.1f});
+        put(I(7), {1, 0.05f, 0.05f});
+        put(I(6), {0.2f, 1, 0});
+        put(I(8), {0, 0.1f, 1});
+        put(ids["D:\\data\\refs\\rin\\r1.png"], {0, 0, 1});
+    }
+    VectorIndex vecs;
+    CHECK(vecs.load(vpath));
+    CHECK(applyReferences(db, vecs, sets) == 2);
+    auto conf = [&](int64_t img, const std::string& t) {
+        Stmt st(db.handle(), "SELECT confidence FROM tags WHERE image_id=? AND tag=? AND source='reference'");
+        st.bind(1, img).bind(2, t);
+        return st.step() ? st.f64(0) : -1.0;
+    };
+    CHECK(conf(I(7), "miku") > 0.9 && conf(I(6), "miku") < 0 && conf(I(8), "rin") > 0.9 && conf(I(8), "miku") < 0);
+    // 検索では、手動の「違う」が見本との類似より強い
+    SearchQuery q;
+    q.tags = {"miku"};
+    const auto found = search(db, q).ids;
+    CHECK(std::find(found.begin(), found.end(), I(7)) != found.end() && std::find(found.begin(), found.end(), I(6)) == found.end());
+    // 見本が無くなれば消える
+    CHECK(applyReferences(db, vecs, {}) == 0 && conf(I(7), "miku") < 0);
+    vecs.close();
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1782,6 +1843,7 @@ int main() {
     testClip();
     testAnn();
     testDict();
+    testRefs();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

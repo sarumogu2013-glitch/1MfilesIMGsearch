@@ -145,6 +145,9 @@ void watchLoop() {
 void runOnce(const std::vector<std::wstring>& roots) {
     IndexOptions opt;
     for (const auto& r : roots) opt.roots.push_back(narrow(r));
+    // 見本画像のフォルダも読む（CLIP のベクトルを作って、見本に使う）
+    if (GetFileAttributesW(clip::refsDir(g->dataDir).c_str()) != INVALID_FILE_ATTRIBUTES)
+        opt.roots.push_back(narrow(clip::refsDir(g->dataDir)));
     opt.dbFile = dbFileOf(g->dataDir);
     opt.packDir = narrow(g->dataDir);
     opt.threads = userIdle() ? 0 : 1;  // 操作中は 1 スレッドだけ
@@ -187,7 +190,10 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(g->dataDir, db, threads, cancel, p);
     };
-    cb.merge = [](Db& db) { clip::applyDictionary(g->dataDir, db, false); };
+    cb.merge = [](Db& db) {
+        clip::applyDictionary(g->dataDir, db, false);
+        clip::applyReferences(g->dataDir, db, false);
+    };
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
         error = narrow(r.error);

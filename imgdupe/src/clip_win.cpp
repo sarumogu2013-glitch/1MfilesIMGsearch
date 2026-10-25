@@ -7,6 +7,7 @@
 
 #include "ann.hpp"
 #include "dict.hpp"
+#include "refs.hpp"
 #include "image_win.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
@@ -267,6 +268,20 @@ std::wstring applyDictionary(const std::wstring& dataDir, imgdupe::Db& db, bool 
     imgdupe::replaceClipDictTags(db, entries, matches);
     db.setSetting("dict:state", state);
     return {};
+}
+
+std::wstring refsDir(const std::wstring& dataDir) { return dataDir + L"\\" + widen(imgdupe::kRefsDir); }
+
+size_t applyReferences(const std::wstring& dataDir, imgdupe::Db& db, bool force) {
+    const Files f = findFiles(dataDir);
+    imgdupe::VectorIndex vecs;
+    if (!f.ok || !enabled(dataDir) || !vecs.load(narrow(vectorPath(dataDir))) || vecs.version() != f.version) return 0;
+    const auto sets = imgdupe::collectRefSets(db, narrow(refsDir(dataDir) + L"\\"));
+    const std::string state = imgdupe::refStateHash(sets, vecs.records());
+    if (!force && db.setting("refs:state") == state) return 0;
+    const size_t n = imgdupe::applyReferences(db, vecs, sets);
+    db.setSetting("refs:state", state);
+    return n;
 }
 
 LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::function<void()> threadInit, std::function<void()> threadExit) {

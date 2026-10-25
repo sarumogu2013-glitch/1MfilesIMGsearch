@@ -31,6 +31,11 @@ double variantSimilarity(const std::wstring& dataDir);
 std::wstring applyDictionary(const std::wstring& dataDir, imgdupe::Db& db, bool force, size_t* entries = nullptr);
 std::wstring dictionaryPath(const std::wstring& dataDir);
 
+// 見本画像（手動で確定したタグと <dataDir>\refs\<名前>\）を当てる。見本と CLIP のベクトルが変わっていなければ何もしない。
+// 代表を作れた名前の数を返す
+size_t applyReferences(const std::wstring& dataDir, imgdupe::Db& db, bool force);
+std::wstring refsDir(const std::wstring& dataDir);  // <dataDir>\refs
+
 struct LoadResult {
     std::shared_ptr<imgdupe::Analyzer> analyzer;
     std::wstring device;

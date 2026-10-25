@@ -3236,7 +3236,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_REFS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -3531,6 +3531,27 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case CMD_SETTINGS: showSettingsWindow(); break;
                 case CMD_DICTIONARY: showDictionaryWindow(); break;
+                case CMD_REFS: {
+                    // 無ければ作り、使い方を書いたファイルを置いて開く
+                    const std::wstring dir = clip::refsDir(app.dataDir);
+                    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                        CreateDirectoryW(dir.c_str(), nullptr);
+                        if (FILE* f = _wfopen((dir + L"\\使い方.txt").c_str(), L"wb")) {
+                            const std::string t =
+                                "見本画像のフォルダ\r\n\r\n"
+                                "ここに「キャラ名」や「作者名」のフォルダを作り、その人の画像を 10〜30 枚入れてください。\r\n"
+                                "バックグラウンドの解析が見本の CLIP のベクトルを作り、それに近い画像に、フォルダの名前のタグを付けます\r\n"
+                                "（出どころ「見本画像との類似」）。新しいキャラも、見本を足すだけで探せるようになります。\r\n"
+                                "確認キューで「正しい」と確定した画像（同じタグに 3 枚以上）も、自動で見本になります。\r\n";
+                            fwrite(t.data(), 1, t.size(), f);
+                            fclose(f);
+                        }
+                        saveSettings();  // バックグラウンドの解析に新しいフォルダを読ませる
+                        if (indexer::isRunning()) indexer::requestRescan(app.dataDir);
+                    }
+                    ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
+                }
                 case CMD_HELP: showHelp(); break;
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_ABOUT:
@@ -3787,7 +3808,10 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(app.dataDir, db, threads, cancel, p);
     };
-    cb.merge = [](Db& db) { clip::applyDictionary(app.dataDir, db, false); };
+    cb.merge = [](Db& db) {
+        clip::applyDictionary(app.dataDir, db, false);
+        clip::applyReferences(app.dataDir, db, false);
+    };
     return cb;
 }
 
@@ -3861,6 +3885,9 @@ int runIndexCli(int argc, wchar_t** argv) {
         else if (a == L"--db" && i + 1 < argc) opt.dbFile = narrow(argv[++i]);
         else opt.roots.push_back(narrow(stripTrailingSlash(a)));
     }
+    if (!opt.roots.empty() && GetFileAttributesW(clip::refsDir(app.dataDir).c_str()) != INVALID_FILE_ATTRIBUTES &&
+        std::find(opt.roots.begin(), opt.roots.end(), narrow(clip::refsDir(app.dataDir))) == opt.roots.end())
+        opt.roots.push_back(narrow(clip::refsDir(app.dataDir)));  // 見本画像のフォルダも読む
     if (opt.roots.empty()) {
         con.print(L"使い方: imgdupe.exe --index <フォルダ>... [--no-thumbs] [-j スレッド数] [--db ファイル]");
         return 2;
