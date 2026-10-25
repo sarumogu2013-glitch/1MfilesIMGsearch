@@ -340,6 +340,26 @@ FetchResult request(const std::wstring& url, const std::vector<std::wstring>& he
     return r;
 }
 
+std::string fileSha256(const std::wstring& path, const std::function<bool(uint64_t)>& progress) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    Sha256 h;
+    std::vector<char> buf(1 << 20);
+    uint64_t done = 0;
+    DWORD n = 0;
+    bool ok = true;
+    while (ReadFile(f, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n > 0) {
+        h.add(buf.data(), n);
+        done += n;
+        if (progress && !progress(done)) {
+            ok = false;
+            break;
+        }
+    }
+    CloseHandle(f);
+    return ok ? h.hex() : std::string();
+}
+
 DownloadResult downloadFile(const std::wstring& url, const std::wstring& path, const std::string& sha256, uint64_t size,
                             const std::function<bool(uint64_t)>& progress) {
     DownloadResult result;

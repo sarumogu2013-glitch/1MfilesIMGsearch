@@ -95,6 +95,16 @@ std::wstring install(const std::wstring& dataDir, const std::vector<const imgdup
         for (const auto& f : c->files) {
             const std::wstring path = join(dir, f.path);
             makeParentDirs(path);
+            // 前に落とし終えた同じファイルがあれば使う（途中で失敗した時に、大きなモデルを落とし直さない）
+            {
+                WIN32_FILE_ATTRIBUTE_DATA a{};
+                if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a) &&
+                    ((static_cast<uint64_t>(a.nFileSizeHigh) << 32) | a.nFileSizeLow) == f.size && !f.sha256.empty() &&
+                    upd::fileSha256(path, [&](uint64_t got) { return !progress || progress(name, before + got, total); }) == f.sha256) {
+                    before += f.size;
+                    continue;
+                }
+            }
             upd::DownloadResult r = upd::downloadFile(widen(f.url), path, f.sha256, f.size, [&](uint64_t got) {
                 return !progress || progress(name, before + got, total);
             });

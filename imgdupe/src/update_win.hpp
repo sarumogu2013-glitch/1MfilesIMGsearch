@@ -50,6 +50,9 @@ FetchResult request(const std::wstring& url, const std::vector<std::wstring>& he
 DownloadResult downloadFile(const std::wstring& url, const std::wstring& path, const std::string& sha256, uint64_t size,
                             const std::function<bool(uint64_t)>& progress);
 
+// ファイルの SHA-256（16 進の小文字。読めなければ空）。progress(読んだバイト数) が false を返したら中止して空
+std::string fileSha256(const std::wstring& path, const std::function<bool(uint64_t)>& progress = {});
+
 // 前回の差し替えで残った <exe>.old を消す（起動時に呼ぶ）。
 void cleanupOldExe();
 
