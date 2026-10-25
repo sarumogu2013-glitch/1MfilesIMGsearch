@@ -10,6 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 確認（一時）Hugging Face のリダイレクト
+        run: |
+          for u in https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx \
+                   https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model.onnx; do
+            echo "== $u"; curl -sI "$u" | grep -i -E "^HTTP|^location" || true
+          done
+          echo "== models.json"; curl -sL https://github.com/sarumogu2013-glitch/1MfilesIMGsearch/releases/latest/download/models.json | head -c 1500 || true
       - name: MinGW-w64 を入れる
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
       - name: テスト

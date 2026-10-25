@@ -2346,6 +2346,18 @@ static void testQuality() {
     CHECK(search(db, s).ids[0] == ids["/q/native.png"]);
 }
 
+static void testResolveRedirect() {
+    const std::string b = "https://huggingface.co/a/b/resolve/123/model.onnx?x=1";
+    CHECK(resolveRedirect(b, "https://cdn.example/x") == "https://cdn.example/x");
+    CHECK(resolveRedirect(b, "/api/resolve-cache/models/a/b/123/model.onnx?etag=%22e%22") ==
+          "https://huggingface.co/api/resolve-cache/models/a/b/123/model.onnx?etag=%22e%22");
+    CHECK(resolveRedirect(b, "//cas.example/p") == "https://cas.example/p");
+    CHECK(resolveRedirect(b, "other.onnx") == "https://huggingface.co/a/b/resolve/123/other.onnx");
+    CHECK(resolveRedirect(b, "?y=2") == "https://huggingface.co/a/b/resolve/123/model.onnx?y=2");
+    CHECK(resolveRedirect("http://127.0.0.1:8765", "/m.json") == "http://127.0.0.1:8765/m.json");
+    CHECK(resolveRedirect(b, "/go?to=https://x") == "https://huggingface.co/go?to=https://x");
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2372,6 +2384,7 @@ int main() {
     testStats();
     testLinkCheck();
     testQuality();
+    testResolveRedirect();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

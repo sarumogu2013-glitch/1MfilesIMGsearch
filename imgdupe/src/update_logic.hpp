@@ -33,4 +33,7 @@ bool parseLatestRelease(const std::string& json, const std::string& assetName, R
 // HTTP 状態ごとのエラー文（UTF-8）。200 の時は空文字。
 std::string httpErrorMessage(int status);
 
+// リダイレクトの Location を、今の URL に対する絶対の URL にする（"/path"・"//host/path"・"path" の相対の形にも対応）
+std::string resolveRedirect(const std::string& base, const std::string& location);
+
 }  // namespace imgdupe

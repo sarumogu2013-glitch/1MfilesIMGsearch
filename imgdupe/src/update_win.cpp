@@ -168,7 +168,7 @@ Response get(std::wstring url, const std::vector<std::wstring>& headers, size_t 
     for (int i = 0; i <= kMaxRedirects; ++i) {
         Response res = requestOnce(url, headers, maxBytes, sink);
         if (res.err || res.status < 300 || res.status >= 400 || res.location.empty()) return res;
-        url = res.location;
+        url = widen(imgdupe::resolveRedirect(narrow(url), narrow(res.location)));  // Hugging Face は相対の Location を返す
     }
     return failText(L"リダイレクトが多すぎます");
 }

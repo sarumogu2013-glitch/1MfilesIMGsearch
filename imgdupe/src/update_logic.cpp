@@ -63,4 +63,27 @@ std::string httpErrorMessage(int status) {
     return "GitHub の応答が異常です (HTTP " + std::to_string(status) + ")";
 }
 
+std::string resolveRedirect(const std::string& base, const std::string& location) {
+    if (location.find("://") != std::string::npos) {
+        // スキームの前に / や ? があるものは相対（"/a?u=http://..." など）
+        const size_t colon = location.find("://"), slash = location.find_first_of("/?#");
+        if (slash == std::string::npos || slash > colon) return location;
+    }
+    const size_t schemeEnd = base.find("://");
+    if (schemeEnd == std::string::npos) return location;
+    if (location.compare(0, 2, "//") == 0) return base.substr(0, schemeEnd + 1) + location;
+    const size_t hostEnd = base.find_first_of("/?#", schemeEnd + 3);
+    const std::string origin = base.substr(0, hostEnd);
+    if (!location.empty() && location[0] == '/') return origin + location;
+    // 今のパスのフォルダからの相対
+    std::string path = hostEnd == std::string::npos ? "/" : base.substr(hostEnd);
+    path = path.substr(0, path.find_first_of("?#"));
+    path = path.substr(0, path.rfind('/') + 1);
+    if (!location.empty() && location[0] == '?') {
+        const std::string full = hostEnd == std::string::npos ? "/" : base.substr(hostEnd);
+        return origin + full.substr(0, full.find_first_of("?#")) + location;
+    }
+    return origin + path + location;
+}
+
 }  // namespace imgdupe
