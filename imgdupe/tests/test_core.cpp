@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <random>
+#include <set>
 
 #include "analyzer.hpp"
 #include "commands.hpp"
@@ -24,6 +25,7 @@
 #include "dict.hpp"
 #include "refs.hpp"
 #include "tagrel.hpp"
+#include "lookup.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1880,6 +1882,191 @@ static void testMisc() {
     fs::remove(bad);
 }
 
+static void testLookup() {
+    // 応答の解析
+    LookupPost post;
+    CHECK(parseDanbooruPost(R"([{"id":123,"tag_string_artist":"foo_artist","tag_string_character":"hatsune_miku",
+        "tag_string_copyright":"vocaloid","tag_string_general":"1girl long_hair 1girl","tag_string_meta":"highres"}])", post));
+    CHECK(post.found && post.site == "danbooru" && post.postId == "123" && post.url == "https://danbooru.donmai.us/posts/123" &&
+          post.tags.size() == 5 && post.tags[0].tag == "foo_artist" && post.tags[0].kind == "artist" && post.tags[1].kind == "character");
+    CHECK(parseDanbooruPost("[]", post) && !post.found);
+    CHECK(parseDanbooruPost(R"({"id":7,"tag_string_general":"a"})", post) && post.found && post.postId == "7" && post.tags.size() == 1);
+    CHECK(!parseDanbooruPost("<html>", post));
+    CHECK(parsePixivIllust(R"({"error":false,"message":"","body":{"illustId":"555","illustTitle":"t","userId":"9","userName":"作者",
+        "tags":{"tags":[{"tag":"オリジナル","translation":{"en":"original"}},{"tag":"女の子"}]}}})", post));
+    CHECK(post.found && post.postId == "555" && post.authorId == "9" && post.title == "t" && post.tags.size() == 4 &&
+          post.tags[0].tag == "作者" && post.tags[0].kind == "artist" && post.tags[2].tag == "original");
+    CHECK(parsePixivIllust(R"({"error":true,"message":"消された","body":[]})", post) && !post.found);
+    SauceResult sr;
+    CHECK(parseSauceNao(R"({"header":{"status":0,"short_remaining":3,"long_remaining":99},"results":[
+        {"header":{"similarity":"95.1"},"data":{"ext_urls":["https://x"],"member_name":"m"}},
+        {"header":{"similarity":"88.0"},"data":{"pixiv_id":555,"member_name":"作者","ext_urls":["https://www.pixiv.net/artworks/555"]}},
+        {"header":{"similarity":"40"},"data":{"danbooru_id":1}}]})", sr));
+    CHECK(sr.status == 0 && sr.shortRemaining == 3 && sr.longRemaining == 99 && sr.found && sr.best.pixivId == "555" &&
+          sr.best.similarity == 88.0 && sr.best.author == "作者");
+    CHECK(parseSauceNao(R"({"header":{"status":-1,"message":"bad key"}})", sr) && sr.status == -1 && !sr.found && sr.message == "bad key");
+    std::string ct;
+    const std::string mp = buildMultipart("file", "a.jpg", "image/jpeg", "DATA", ct);
+    CHECK(ct.find("multipart/form-data; boundary=") == 0 && mp.find("filename=\"a.jpg\"") != std::string::npos &&
+          mp.find("\r\n\r\nDATA\r\n--") != std::string::npos);
+
+    // DB と流れ（偽の通信）
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-lookup-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 7; ++i) files.push_back({"/img/" + std::to_string(i) + ".png", 1, i});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) { return ids["/img/" + std::to_string(n) + ".png"]; };
+    auto src = [&](int n, const char* site, const std::string& post) {
+        Stmt st(db.handle(), "INSERT INTO sources(image_id,site,post_id) VALUES(?,?,?)");
+        st.bind(1, I(n)).bind(2, std::string(site)).bind(3, post);
+        st.step();
+    };
+    const std::string md5a(32, 'a'), md5b(32, 'b');
+    src(1, "pixiv", "555");
+    src(2, "pixiv", "555");  // 同じ投稿の別のページ（照会は 1 回）
+    src(3, "md5", md5a);
+    src(4, "md5", md5b);     // Danbooru に無い → 後で逆画像検索の対象
+    src(5, "pixiv", "777");
+    replaceTags(db, I(5), kSourceMeta, {TagRow{"known", "general", kSourceMeta, 0.95, false}});  // json で分かっている
+    // 6: 出典なし（逆画像検索）、7: 写真（送らない）
+    {
+        ThumbPack pack(dir.string());
+        db.begin();
+        for (int n : {4, 6, 7}) {
+            ThumbData t;
+            t.width = t.height = 1;
+            t.bytes = {0xFF, 0xD8, static_cast<uint8_t>(n)};
+            CHECK(pack.put(db, I(n), t));
+        }
+        Stmt st(db.handle(), "INSERT INTO file_meta(image_id, camera) VALUES(?, 'Canon')");
+        st.bind(1, I(7));
+        st.step();
+        db.commit();
+    }
+    auto pending = pendingIdLookups(db, 100);
+    CHECK(pending.size() == 4);  // 5 は除く
+
+    std::vector<std::string> gets;
+    std::vector<std::string> posts;
+    int sleptMs = 0;
+    LookupNet net;
+    net.get = [&](const std::string& url, const std::vector<std::string>&) {
+        gets.push_back(url);
+        HttpResult r;
+        r.ok = true;
+        r.status = 200;
+        if (url == "https://www.pixiv.net/ajax/illust/555")
+            r.body = R"({"error":false,"body":{"illustId":"555","userId":"9","userName":"作者","tags":{"tags":[{"tag":"女の子"}]}}})";
+        else if (url == "https://danbooru.donmai.us/posts.json?tags=md5%3A" + md5a + "&limit=1")
+            r.body = R"([{"id":42,"tag_string_artist":"art","tag_string_general":"1girl"}])";
+        else if (url == "https://danbooru.donmai.us/posts.json?tags=md5%3A" + md5b + "&limit=1")
+            r.body = "[]";
+        else
+            r.status = 404;
+        return r;
+    };
+    net.post = [&](const std::string& url, const std::vector<std::string>& headers, const std::string& body) {
+        posts.push_back(url);
+        HttpResult r;
+        r.ok = true;
+        r.status = 200;
+        CHECK(headers.size() == 1 && headers[0].find("multipart/form-data") != std::string::npos && body.find("\xFF\xD8") != std::string::npos);
+        if (body.find(std::string("\xFF\xD8") + static_cast<char>(6)) != std::string::npos)
+            r.body = R"({"header":{"status":0,"short_remaining":3,"long_remaining":50},"results":[
+                {"header":{"similarity":"91"},"data":{"pixiv_id":"555","member_name":"作者"}}]})";
+        else
+            r.body = R"({"header":{"status":0,"short_remaining":3,"long_remaining":50},"results":[]})";
+        return r;
+    };
+    net.thumbnail = [&](int64_t id, std::string& jpeg) {
+        ThumbPack pack(dir.string());
+        ThumbData t;
+        if (!pack.get(db, id, t)) return false;
+        jpeg.assign(t.bytes.begin(), t.bytes.end());
+        return true;
+    };
+    net.sleep = [&](int ms) { sleptMs += ms; };
+    int64_t clock = 86400 * 100 + 5;
+    net.now = [&] { return clock; };
+
+    LookupOptions opt;
+    opt.idLookup = true;
+    std::atomic<bool> cancel{false};
+    LookupReport rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.looked == 4 && rep.found == 3 && rep.reverseSent == 0 && rep.error.empty());
+    CHECK(gets.size() == 3);  // 555 は 1 回
+    CHECK(sleptMs >= 1000);   // pixiv 1 回・Danbooru 2 回 → Danbooru の間で 1 秒待つ
+    auto tagSet = [&](int n, const char* source) {
+        std::set<std::string> out;
+        for (const auto& t : tagsOf(db, I(n)))
+            if (t.source == source) out.insert(t.tag);
+        return out;
+    };
+    CHECK(tagSet(1, kSourceIdLookup) == std::set<std::string>({"作者", "女の子"}) && tagSet(2, kSourceIdLookup).size() == 2);
+    CHECK(tagSet(3, kSourceIdLookup) == std::set<std::string>({"art", "1girl"}) && tagSet(4, kSourceIdLookup).empty());
+    {
+        Stmt st(db.handle(), "SELECT author_id, url, checked FROM sources WHERE image_id=? AND site='pixiv'");
+        st.bind(1, I(1));
+        CHECK(st.step() && st.text(0) == "9" && st.text(1) == "https://www.pixiv.net/artworks/555" && st.i64(2) == clock);
+        Stmt d(db.handle(), "SELECT post_id FROM sources WHERE image_id=? AND site='danbooru'");
+        d.bind(1, I(3));
+        CHECK(d.step() && d.text(0) == "42");
+    }
+    CHECK(pendingIdLookups(db, 100).empty());
+    // 逆画像検索の対象: 4（Danbooru に無かった MD5）と 6。7 は写真、1〜3 は出典あり、5 は json あり
+    auto rev = pendingReverseLookups(db, 100);
+    CHECK(rev.size() == 2 && rev[0] == I(6) && rev[1] == I(4));
+
+    // SauceNAO（1 日 1 回まで → 6 だけ送る）
+    gets.clear();
+    opt.reverse = true;
+    opt.sauceKey = "k ey";
+    opt.sauceDailyLimit = 1;
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.reverseSent == 1 && rep.reverseFound == 1 && posts.size() == 1 &&
+          posts[0] == "https://saucenao.com/search.php?output_type=2&numres=5&db=999&api_key=k%20ey");
+    CHECK(gets.size() == 1 && gets[0] == "https://www.pixiv.net/ajax/illust/555");
+    CHECK(tagSet(6, kSourceReverse) == std::set<std::string>({"作者", "女の子"}));
+    CHECK(sauceSentToday(db, clock) == 1 && sauceSentToday(db, clock + 86400) == 0);
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.reverseSent == 0 && posts.size() == 1);  // 今日の分は使い切った
+    clock += 86400;
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.reverseSent == 1 && rep.reverseFound == 0 && posts.size() == 2);  // 4 を送った（見つからない）
+    CHECK(pendingReverseLookups(db, 100).empty());
+
+    // API キーの誤り
+    net.post = [&](const std::string&, const std::vector<std::string>&, const std::string&) {
+        HttpResult r;
+        r.ok = true;
+        r.status = 200;
+        r.body = R"({"header":{"status":-2,"message":"Invalid key"}})";
+        return r;
+    };
+    resetLookups(db, {I(6)});
+    CHECK(tagSet(6, kSourceReverse).empty() && pendingReverseLookups(db, 100).size() == 0);  // 6 には pixiv の出典が残る
+    CHECK(pendingIdLookups(db, 100).size() == 1);  // その pixiv をもう一度照会する
+    resetLookups(db, {I(4)});
+    clock += 86400;
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.error.find("API キー") != std::string::npos && rep.reverseSent == 0);
+
+    // 通信できない時は印を付けない
+    net.get = [&](const std::string&, const std::vector<std::string>&) {
+        HttpResult r;
+        r.error = "timeout";
+        return r;
+    };
+    opt.reverse = false;
+    resetLookups(db, {I(1), I(3)});
+    rep = runLookups(db, opt, net, cancel);
+    CHECK(rep.looked == 0 && !rep.error.empty() && pendingIdLookups(db, 100).size() == 2);
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -1902,6 +2089,7 @@ int main() {
     testDict();
     testRefs();
     testTagRelations();
+    testLookup();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

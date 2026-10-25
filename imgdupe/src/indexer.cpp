@@ -169,6 +169,11 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             rep.cancelled = cancel.load();
         }
     }
+    if (!rep.cancelled && cb.lookup) {
+        progress.phase = static_cast<int>(IndexPhase::Lookup);
+        cb.lookup(db, cancel, &progress.prog);
+        rep.cancelled = cancel.load();
+    }
     if (!rep.cancelled && cb.merge) {
         progress.phase = static_cast<int>(IndexPhase::Merge);
         cb.merge(db);

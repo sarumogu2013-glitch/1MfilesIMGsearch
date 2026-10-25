@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "update_logic.hpp"
 
@@ -39,6 +40,10 @@ struct FetchResult {
     std::wstring error;
 };
 FetchResult fetchText(const std::wstring& url, size_t maxBytes = 4 * 1024 * 1024);
+
+// GET（body が nullptr）か POST。fetchText と違い、HTTP の応答があれば 200 以外でも ok = true（status を見る）
+FetchResult request(const std::wstring& url, const std::vector<std::wstring>& headers, const std::string* body = nullptr,
+                    size_t maxBytes = 4 * 1024 * 1024);
 
 // 大きなファイルを path にダウンロードする（path.part に書いて、大きさと SHA-256 を確かめてから置き換える）。
 // progress(受け取ったバイト数) が false を返したら中止する

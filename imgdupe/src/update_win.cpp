@@ -78,9 +78,9 @@ std::wstring userAgent() { return L"imgdupe/" + widen(IMGDUPE_VERSION); }
 // 受け取ったデータを渡す先（false を返したら中止）。無ければ body にためる
 using Sink = std::function<bool(const char*, size_t)>;
 
-// リダイレクトを追わずに 1 回だけ GET する。
+// リダイレクトを追わずに 1 回だけ送る（body が無ければ GET、あれば POST）。
 Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& headers, size_t maxBytes,
-                     const Sink* sink = nullptr) {
+                     const Sink* sink = nullptr, const std::string* body = nullptr) {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = static_cast<DWORD>(-1);
@@ -106,7 +106,7 @@ Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& h
 
     Handle connect(WinHttpConnect(session.h, host.c_str(), uc.nPort, 0));
     if (!connect.h) return fail(GetLastError());
-    Handle request(WinHttpOpenRequest(connect.h, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+    Handle request(WinHttpOpenRequest(connect.h, body ? L"POST" : L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
                                       uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0));
     if (!request.h) return fail(GetLastError());
@@ -116,7 +116,9 @@ Response requestOnce(const std::wstring& url, const std::vector<std::wstring>& h
     std::wstring headerText;
     for (const auto& h : headers) headerText += h + L"\r\n";
     const BOOL sent = WinHttpSendRequest(request.h, headerText.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headerText.c_str(),
-                                         static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+                                         static_cast<DWORD>(-1L),
+                                         body ? const_cast<char*>(body->data()) : WINHTTP_NO_REQUEST_DATA,
+                                         body ? static_cast<DWORD>(body->size()) : 0, body ? static_cast<DWORD>(body->size()) : 0, 0);
     if (!sent || !WinHttpReceiveResponse(request.h, nullptr)) return fail(GetLastError());
 
     Response res;
@@ -320,6 +322,20 @@ FetchResult fetchText(const std::wstring& url, size_t maxBytes) {
         return r;
     }
     r.ok = true;
+    r.body = std::move(res.body);
+    return r;
+}
+
+FetchResult request(const std::wstring& url, const std::vector<std::wstring>& headers, const std::string* body, size_t maxBytes) {
+    FetchResult r;
+    // POST はリダイレクトを追わない（送り直すことになるので）
+    Response res = body ? requestOnce(url, headers, maxBytes, nullptr, body) : get(url, headers, maxBytes);
+    if (res.err) {
+        r.error = L"接続できませんでした: " + res.errText;
+        return r;
+    }
+    r.ok = true;
+    r.status = res.status;
     r.body = std::move(res.body);
     return r;
 }

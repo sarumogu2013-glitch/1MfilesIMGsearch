@@ -19,6 +19,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <iterator>
 #include <memory>
@@ -40,6 +41,7 @@
 #include "keymap_win.hpp"
 #include "ann.hpp"
 #include "clip_win.hpp"
+#include "lookup_win.hpp"
 #include "tagger_win.hpp"
 #include "models_win.hpp"
 #include "resource.h"
@@ -1115,10 +1117,11 @@ std::wstring selectedPath() {
 
 // 画像の右クリックのメニュー
 void findSimilar(int64_t imageId, const std::wstring& name);
+void relookupImages(int64_t clicked);
 
 // imageId があれば「似た画像を探す」も出す（検索の画面）
 void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
-    constexpr int kSimilar = 0x7f00;
+    constexpr int kSimilar = 0x7f00, kRelookup = 0x7f01;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, CMD_OPEN, L"開く(&O)");
     AppendMenuW(menu, MF_STRING, CMD_EXPLORER, L"エクスプローラーで表示(&E)");
@@ -1126,6 +1129,7 @@ void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
     if (imageId) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kSimilar, L"似た画像を探す(&S)");
+        AppendMenuW(menu, MF_STRING, kRelookup, L"出典を調べ直す(&L)");
     }
     POINT pt;
     GetCursorPos(&pt);
@@ -1138,6 +1142,7 @@ void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
         const size_t sep = path.find_last_of(L"\\/");
         findSimilar(imageId, sep == std::wstring::npos ? path : path.substr(sep + 1));
     }
+    if (cmd == kRelookup) relookupImages(imageId);
 }
 
 void exportResult() {
@@ -2097,6 +2102,33 @@ void markSelected(bool correct) {
     });
 }
 
+// 「出典を調べ直す」: 外部照会の結果を消し、次のバックグラウンドの解析でもう一度調べる（選んだ画像。右クリックした画像が選ばれていなければその 1 枚）
+void relookupImages(int64_t clicked) {
+    std::vector<int64_t> ids;
+    for (int i : selectedResults()) ids.push_back(app.searchIds[i]);
+    if (std::find(ids.begin(), ids.end(), clicked) == ids.end()) ids.assign(1, clicked);
+    const lookup::Settings ls = lookup::load(app.dataDir);
+    if (!ls.idLookup && !(ls.reverse && !ls.sauceKey.empty())) {
+        MessageBoxW(app.hwnd, L"外部照会が切ってあります。「設定」の「外部照会」で、調べ方を選んでください。", L"imgdupe",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    Db* db = uiDb();
+    if (!db) return;
+    try {
+        resetLookups(*db, ids);
+        addCommand(*db, "rescan");
+    } catch (const std::exception& e) {
+        MessageBoxW(app.hwnd, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    if (!indexer::isRunning()) indexer::start();
+    MessageBoxW(app.hwnd,
+                (withCommas(ids.size()) + L" 枚を、バックグラウンドの解析でもう一度調べます（1 秒に 1 件ずつ。SauceNAO は 1 日の上限まで）。")
+                    .c_str(),
+                L"imgdupe", MB_ICONINFORMATION);
+}
+
 void bulkTagUi() {
     const std::vector<int> items = selectedResults();
     if (items.empty()) {
@@ -2154,12 +2186,12 @@ void undoTagEdit() {
 
 struct SettingsWindow {
     HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
-         variantSim = nullptr;
+         variantSim = nullptr, idLookup = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2185,7 +2217,20 @@ void applySettings() {
     wchar_t v[16];
     swprintf(v, 16, L"%.2f", sim >= 0.8 && sim <= 0.99 ? sim : kDefaultVariantSimilarity);
     iniSet(L"variantSimilarity", v);
+    // 外部照会（バックグラウンドの解析が毎回 ini を読むので、作り直さなくてよい）
+    lookup::Settings ls;
+    ls.idLookup = Button_GetCheck(w.idLookup) == BST_CHECKED;
+    ls.reverse = Button_GetCheck(w.sauce) == BST_CHECKED;
+    ls.sauceKey = editText(w.sauceKey);
+    while (!ls.sauceKey.empty() && iswspace(ls.sauceKey.back())) ls.sauceKey.pop_back();
+    while (!ls.sauceKey.empty() && iswspace(ls.sauceKey.front())) ls.sauceKey.erase(0, 1);
+    ls.dailyLimit = std::clamp(_wtoi(editText(w.sauceLimit).c_str()), 0, 100000);
+    const lookup::Settings old = lookup::load(app.dataDir);
+    lookup::save(app.dataDir, ls);
+    const bool lookupOn = (ls.idLookup && !old.idLookup) || (ls.reverse && (!old.reverse || ls.sauceKey != old.sauceKey));
     if (changed) restartIndexerAfterUpdate();  // 動いているバックグラウンドの解析に新しい設定を使わせる
+    else if (lookupOn)
+        if (Db* db = uiDb()) addCommand(*db, "rescan");  // すぐ照会を始める
 }
 
 void settingsCommand(int id, int code) {
@@ -2196,6 +2241,12 @@ void settingsCommand(int id, int code) {
             w.done = true;
             break;
         case IDCANCEL: w.done = true; break;
+        case IDC_ST_SAUCE:
+            if (code == BN_CLICKED) {
+                EnableWindow(w.sauceKey, Button_GetCheck(w.sauce) == BST_CHECKED);
+                EnableWindow(w.sauceLimit, Button_GetCheck(w.sauce) == BST_CHECKED);
+            }
+            break;
         case IDC_ST_TAGGER:
         case IDC_ST_CLIP:
             if (code == BN_CLICKED)
@@ -2236,7 +2287,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(440), m = px(12);
+    const int cw = px(560), ch = px(584), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2279,6 +2330,21 @@ void showSettingsWindow() {
                   IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
     w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
     child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
+    gy = group(L"外部照会（インターネットで出典を調べる）", px(136));
+    w.idLookup = child(WC_BUTTONW, L"ファイル名の pixiv・Danbooru（MD5）の ID で、投稿のタグと作者を調べる",
+                       WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_LOOKUP, in, gy, iw, rowH);
+    w.sauce = child(WC_BUTTONW, L"出典の分からない画像を SauceNAO で探す（縮小したサムネイルを送ります）", WS_TABSTOP | BS_AUTOCHECKBOX,
+                    IDC_ST_SAUCE, in, gy + rowH + px(2), iw, rowH);
+    {
+        const int ry = gy + 2 * (rowH + px(2)) + px(2);
+        child(WC_STATICW, L"API キー", SS_NOPREFIX, -1, in + px(18), ry + px(3), px(64), rowH);
+        w.sauceKey = child(WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, IDC_ST_SAUCEKEY, in + px(84), ry,
+                           iw - px(84) - px(140), rowH);
+        child(WC_STATICW, L"1 日に", SS_NOPREFIX, -1, in + iw - px(128), ry + px(3), px(48), rowH);
+        w.sauceLimit = child(WC_EDITW, L"", WS_TABSTOP | WS_BORDER | ES_NUMBER, IDC_ST_SAUCELIMIT, in + iw - px(76), ry, px(48), rowH);
+        child(WC_STATICW, L"回", SS_NOPREFIX, -1, in + iw - px(24), ry + px(3), px(24), rowH);
+        w.sauceStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in + px(18), ry + rowH + px(6), iw - px(18), px(34));
+    }
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
@@ -2298,6 +2364,19 @@ void showSettingsWindow() {
         return std::wstring(v);
     }());
     Button_SetCheck(w.gpu, iniInt(L"taggerCpu", 0) ? BST_UNCHECKED : BST_CHECKED);
+    {
+        const lookup::Settings ls = lookup::load(app.dataDir);
+        Button_SetCheck(w.idLookup, ls.idLookup ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(w.sauce, ls.reverse ? BST_CHECKED : BST_UNCHECKED);
+        setText(w.sauceKey, ls.sauceKey);
+        setText(w.sauceLimit, std::to_wstring(ls.dailyLimit));
+        EnableWindow(w.sauceKey, ls.reverse);
+        EnableWindow(w.sauceLimit, ls.reverse);
+        int today = 0;
+        if (Db* db = uiDb()) today = imgdupe::sauceSentToday(*db, static_cast<int64_t>(std::time(nullptr)));
+        setText(w.sauceStatus, L"API キーは saucenao.com で無料で登録するともらえます（無料は 1 日 100 回まで）。\r\n今日は " +
+                                   std::to_wstring(today) + L" 回送りました");
+    }
     EnableWindow(w.gpu, Button_GetCheck(w.tagger) == BST_CHECKED || Button_GetCheck(w.clip) == BST_CHECKED);
     {
         const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
@@ -4028,6 +4107,7 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(app.dataDir, db, threads, cancel, p);
     };
+    cb.lookup = [](Db& db, const std::atomic<bool>& cancel, Progress* p) { lookup::run(app.dataDir, db, cancel, p); };
     cb.merge = [](Db& db) {
         clip::applyDictionary(app.dataDir, db, false);
         clip::applyReferences(app.dataDir, db, false);

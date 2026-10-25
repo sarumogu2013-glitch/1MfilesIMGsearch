@@ -43,11 +43,13 @@ struct IndexCallbacks {
     std::function<std::shared_ptr<Analyzer>(std::string& error)> makeClip;
     // CLIP の後（差分グループ）
     std::function<void(Db&, unsigned threads, const std::atomic<bool>& cancel, Progress*)> afterClip;
+    // 8. 外部照会（投稿サイトのタグ。通信するので、設定で有効にした時だけ）
+    std::function<void(Db&, const std::atomic<bool>& cancel, Progress*)> lookup;
     // 9. 統合（行動・アイテム辞書を当てる。変わっていなければ何もしない）
     std::function<void(Db&)> merge;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Merge, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Lookup, Merge, Done };
 
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};

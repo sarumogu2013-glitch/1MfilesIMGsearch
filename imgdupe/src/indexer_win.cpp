@@ -23,6 +23,7 @@
 #include "indexer.hpp"
 #include "links.hpp"
 #include "clip_win.hpp"
+#include "lookup_win.hpp"
 #include "tagger_win.hpp"
 #include "resource.h"
 #include "win_util.hpp"
@@ -190,6 +191,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.afterClip = [](Db& db, unsigned threads, const std::atomic<bool>& cancel, Progress* p) {
         clip::updateVariants(g->dataDir, db, threads, cancel, p);
     };
+    cb.lookup = [](Db& db, const std::atomic<bool>& cancel, Progress* p) { lookup::run(g->dataDir, db, cancel, p); };
     cb.merge = [](Db& db) {
         clip::applyDictionary(g->dataDir, db, false);
         clip::applyReferences(g->dataDir, db, false);
@@ -327,6 +329,9 @@ std::wstring statusText() {
             case IndexPhase::Clip:
                 swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
                          static_cast<unsigned long long>(total));
+                break;
+            case IndexPhase::Lookup:
+                swprintf(t, 128, L"出典の照会 %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
                 break;
             case IndexPhase::Merge: swprintf(t, 128, L"辞書を当てています"); break;
             case IndexPhase::Variants:
