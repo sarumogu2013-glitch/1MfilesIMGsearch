@@ -214,6 +214,18 @@ int64_t packColor(const Features& f) { return (int64_t(f.r) << 16) | (int64_t(f.
 
 }  // namespace
 
+// 版 6: タグの関係（別名 alias: tag は other の別名 / 親子 parent: tag が付けば other も）。tag_dict の別名はここから作る
+const char* const kSchemaV6 = R"SQL(
+CREATE TABLE IF NOT EXISTS tag_relations(
+    tag TEXT NOT NULL COLLATE NOCASE,
+    other TEXT NOT NULL COLLATE NOCASE,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY(tag, other, kind, source)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS tag_relations_kind ON tag_relations(kind, tag);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -332,7 +344,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i)
         if (!exec(steps[i])) {

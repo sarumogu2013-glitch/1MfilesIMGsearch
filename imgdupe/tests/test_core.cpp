@@ -23,6 +23,7 @@
 #include "ann.hpp"
 #include "dict.hpp"
 #include "refs.hpp"
+#include "tagrel.hpp"
 #include "platform.hpp"
 #include "pack.hpp"
 #include "core.hpp"
@@ -1802,6 +1803,62 @@ static void testRefs() {
     fs::remove_all(dir);
 }
 
+static void testTagRelations() {
+    std::vector<TagRelation> rels;
+    std::string err;
+    CHECK(parseTagRelations("# c\n初音ミク = hatsune_miku\n hatsune_miku > vocaloid \n\nvocaloid>music\n", rels, err));
+    CHECK(rels.size() == 3 && rels[0].kind == "alias" && rels[0].tag == "初音ミク" && rels[1].kind == "parent" &&
+          rels[1].other == "vocaloid");
+    CHECK(!parseTagRelations("a\n", rels, err) && err.find("1 行目") == 0);
+    CHECK(!parseTagRelations("a = b = c\n", rels, err));
+    std::vector<TagRelation> back;
+    parseTagRelations("初音ミク = hatsune_miku\nhatsune_miku > vocaloid\n", rels, err);
+    CHECK(parseTagRelations(formatTagRelations(rels), back, err) && back.size() == 2 && back[1].other == "vocaloid");
+    std::vector<std::pair<std::string, std::string>> pairs;
+    CHECK(parseDanbooruPairs(R"([{"antecedent_name":"miku","consequent_name":"hatsune_miku","status":"active"},
+                                 {"antecedent_name":"x","consequent_name":"y","status":"deleted"}])", pairs));
+    CHECK(pairs.size() == 1 && pairs[0].first == "miku");
+    CHECK(!parseDanbooruPairs("{}", pairs));
+
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-tagrel-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    auto id = upsertScanned(db, {{"/a.png", 1, 1}, {"/b.png", 1, 2}, {"/c.png", 1, 3}});
+    auto tag = [&](int64_t img, const std::string& t, double conf, const char* source = "tagger") {
+        Stmt st(db.handle(), "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,'character',?,?,0)");
+        st.bind(1, img).bind(2, t).bind(3, conf).bind(4, std::string(source));
+        st.step();
+    };
+    tag(id["/a.png"], "hatsune_miku", 0.9);
+    tag(id["/b.png"], "初音ミク", 0.6, "folder");  // 別名で付いている
+    tag(id["/c.png"], "hatsune_miku", 0.1);         // 確度が低すぎる
+    replaceRelations(db, "user", rels);
+    replaceRelations(db, "danbooru", {{"miku", "hatsune_miku", "alias"}, {"vocaloid", "music", "parent"}});
+    const RelationCounts rc = relationCounts(db);
+    CHECK(rc.userAlias == 1 && rc.userParent == 1 && rc.danbooruAlias == 1 && rc.danbooruParent == 1);
+    CHECK(loadRelations(db, "user").size() == 2);
+    // 検索の別名にも入る（自分で書いたものと Danbooru のもの）
+    SearchQuery q;
+    q.tags = {"miku"};
+    q.minConfidence = 0.5;
+    CHECK(search(db, q).ids.size() == 2);
+    // 親子: a（0.9）と b（別名で 0.6）に vocaloid と、その親の music。c は付かない
+    CHECK(applyParents(db) == 4);
+    auto conf = [&](int64_t img, const std::string& t) {
+        Stmt st(db.handle(), "SELECT confidence FROM tags WHERE image_id=? AND tag=? AND source='parent'");
+        st.bind(1, img).bind(2, t);
+        return st.step() ? st.f64(0) : -1.0;
+    };
+    CHECK(std::abs(conf(id["/a.png"], "vocaloid") - 0.9) < 1e-9 && std::abs(conf(id["/b.png"], "music") - 0.6) < 1e-9);
+    CHECK(conf(id["/c.png"], "vocaloid") < 0);
+    // 関係を消せば、付けたタグも消える
+    replaceRelations(db, "user", {});
+    CHECK(applyParents(db) == 0 && conf(id["/a.png"], "vocaloid") < 0);
+    fs::remove_all(dir);
+}
+
 static void testMisc() {
     CHECK(isImageExt("C:\\a\\B.JPG"));
     CHECK(isImageExt("x.heic"));
@@ -1844,6 +1901,7 @@ int main() {
     testAnn();
     testDict();
     testRefs();
+    testTagRelations();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

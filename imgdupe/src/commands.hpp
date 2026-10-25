@@ -26,6 +26,7 @@ enum Cmd : int {
     CMD_KEY_SETTINGS,
     CMD_SETTINGS,
     CMD_DICTIONARY,
+    CMD_TAGDICT,
     CMD_REFS,
     CMD_TAB_DUPES,
     CMD_TAB_SEARCH,

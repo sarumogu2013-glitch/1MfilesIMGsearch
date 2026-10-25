@@ -32,6 +32,7 @@
 #include "core.hpp"
 #include "db.hpp"
 #include "dict.hpp"
+#include "tagrel.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "indexer_win.hpp"
@@ -1218,7 +1219,7 @@ std::wstring sourceLabel(const std::string& s) {
     static const std::pair<const char*, const wchar_t*> names[] = {
         {"manual", L"手動で確認"}, {"embedded", L"ファイル埋め込み"}, {"meta", L"メタデータ"}, {"id_lookup", L"ID 照会"},
         {"reverse", L"逆画像検索"}, {"folder", L"フォルダ名"}, {"same_folder", L"同じフォルダからの推定"},
-        {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"dict", L"辞書"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
+        {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"dict", L"辞書"}, {"parent", L"親子関係"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
     for (const auto& [k, v] : names)
         if (s == k) return v;
     return widen(s);
@@ -2498,6 +2499,224 @@ void showDictionaryWindow() {
     SetActiveWindow(app.hwnd);
 }
 
+// ---------------------------------------------------------------- タグ辞書の画面（別名・親子関係、Danbooru からの取り込み）
+
+struct TagDictWindow {
+    HWND wnd = nullptr, edit = nullptr, status = nullptr, counts = nullptr, save = nullptr, import = nullptr;
+    bool done = false, busy = false;
+    std::atomic<bool> cancel{false};
+} tagDictWin;
+
+constexpr UINT WM_TAGDICT_STATUS = WM_APP + 51;  // lParam: std::wstring*（途中の様子）
+constexpr UINT WM_TAGDICT_DONE = WM_APP + 52;    // lParam: std::wstring*（結果）
+
+void tagDictRefreshCounts() {
+    Db* db = uiDb();
+    if (!db) return;
+    try {
+        const RelationCounts c = relationCounts(*db);
+        setText(tagDictWin.counts, L"自分で書いた分: 別名 " + withCommas(c.userAlias) + L"・親子 " + withCommas(c.userParent) +
+                                       L"　Danbooru から取り込んだ分: 別名 " + withCommas(c.danbooruAlias) + L"・親子 " +
+                                       withCommas(c.danbooruParent));
+    } catch (const std::exception&) {
+    }
+}
+
+void tagDictBusy(bool on) {
+    TagDictWindow& w = tagDictWin;
+    w.busy = on;
+    EnableWindow(w.save, !on);
+    SetWindowTextW(w.import, on ? L"中止" : L"Danbooru から取り込む");
+}
+
+// 別のスレッドで DB を開いて fn を実行し、結果の文を画面に返す
+void tagDictRun(std::function<std::wstring(Db&)> fn) {
+    tagDictBusy(true);
+    tagDictWin.cancel = false;
+    HWND wnd = tagDictWin.wnd;
+    const std::wstring db = dbPath();
+    std::thread([wnd, db, fn] {
+        std::wstring msg;
+        try {
+            Db d;
+            if (!d.open(narrow(db))) throw std::runtime_error(d.error());
+            msg = fn(d);
+        } catch (const std::exception& e) {
+            msg = L"できませんでした: " + widen(e.what());
+        }
+        auto* p = new std::wstring(msg);
+        if (!PostMessageW(wnd, WM_TAGDICT_DONE, 0, reinterpret_cast<LPARAM>(p))) delete p;
+    }).detach();
+}
+
+void tagDictSave() {
+    TagDictWindow& w = tagDictWin;
+    if (w.busy) return;
+    std::string text = narrow(editText(w.edit));
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    std::vector<TagRelation> rels;
+    std::string error;
+    if (!parseTagRelations(text, rels, error)) {
+        setText(w.status, L"保存できません: " + widen(error));
+        return;
+    }
+    setText(w.status, L"保存して、親子関係を当てています…");
+    tagDictRun([rels](Db& d) {
+        replaceRelations(d, "user", rels);
+        const size_t n = clip::applyTagParents(d, true);
+        return L"保存しました（" + withCommas(rels.size()) + L" 件）。親子関係で付いたタグ: " + withCommas(n);
+    });
+}
+
+void tagDictImport() {
+    TagDictWindow& w = tagDictWin;
+    if (w.busy) {
+        w.cancel = true;
+        setText(w.status, L"中止しています…");
+        return;
+    }
+    if (MessageBoxW(w.wnd,
+                    L"Danbooru（danbooru.donmai.us）から、使われている別名と親子関係の一覧を取り込みます。\r\n"
+                    L"相手の負担にならないよう 1 秒に 1 回ずつ取るので、数分かかります。取り込んだ分は前の分と入れ替えます。",
+                    L"タグ辞書", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+        return;
+    HWND wnd = w.wnd;
+    setText(w.status, L"Danbooru に問い合わせています…");
+    tagDictRun([wnd](Db& d) -> std::wstring {
+        std::vector<TagRelation> rels;
+        for (const char* kind : {"alias", "parent"}) {
+            const std::wstring endpoint = std::string(kind) == "alias" ? L"tag_aliases" : L"tag_implications";
+            for (int page = 1; page <= 200; ++page) {
+                if (tagDictWin.cancel) return L"中止しました（取り込んだ分は使っていません）";
+                wchar_t base[256] = L"https://danbooru.donmai.us";  // 環境変数 IMGDUPE_DANBOORU_URL で変えられる（テスト用）
+                GetEnvironmentVariableW(L"IMGDUPE_DANBOORU_URL", base, 256);
+                const std::wstring url = std::wstring(base) + L"/" + endpoint +
+                                         L".json?search%5Bstatus%5D=active&limit=1000&page=" + std::to_wstring(page) +
+                                         L"&only=antecedent_name,consequent_name";
+                upd::FetchResult r = upd::fetchText(url, 16 * 1024 * 1024);
+                if (!r.ok) return L"Danbooru から取れませんでした: " + r.error;
+                std::vector<std::pair<std::string, std::string>> pairs;
+                if (!parseDanbooruPairs(r.body, pairs)) return L"Danbooru の応答を読めませんでした";
+                if (pairs.empty()) break;  // 最後のページ
+                for (auto& [a, c] : pairs) rels.push_back({a, c, kind});
+                auto* p = new std::wstring(std::wstring(std::string(kind) == "alias" ? L"別名" : L"親子関係") + L"を取り込んでいます… " +
+                                           withCommas(rels.size()) + L" 件");
+                if (!PostMessageW(wnd, WM_TAGDICT_STATUS, 0, reinterpret_cast<LPARAM>(p))) delete p;
+                Sleep(1000);  // 1 秒に 1 回
+            }
+        }
+        replaceRelations(d, "danbooru", rels);
+        const size_t n = clip::applyTagParents(d, true);
+        return L"取り込みました（" + withCommas(rels.size()) + L" 件）。親子関係で付いたタグ: " + withCommas(n);
+    });
+}
+
+void showTagDictWindow() {
+    TagDictWindow& w = tagDictWin;
+    if (w.wnd) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            switch (msg) {
+                case WM_COMMAND:
+                    if (LOWORD(wp) == IDOK) tagDictSave();
+                    else if (LOWORD(wp) == IDRETRY) tagDictImport();
+                    else if (LOWORD(wp) == IDCANCEL && !tagDictWin.busy) tagDictWin.done = true;
+                    return 0;
+                case WM_CLOSE:
+                    if (!tagDictWin.busy) tagDictWin.done = true;
+                    return 0;
+                case WM_TAGDICT_STATUS: {
+                    std::unique_ptr<std::wstring> m(reinterpret_cast<std::wstring*>(lp));
+                    if (!tagDictWin.cancel) setText(tagDictWin.status, *m);
+                    return 0;
+                }
+                case WM_TAGDICT_DONE: {
+                    std::unique_ptr<std::wstring> m(reinterpret_cast<std::wstring*>(lp));
+                    tagDictBusy(false);
+                    setText(tagDictWin.status, *m);
+                    tagDictRefreshCounts();
+                    if (app.tab == 1) {
+                        refreshSources();
+                        scheduleSearch(10);
+                    }
+                    return 0;
+                }
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeTagDict";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int cw = px(640), ch = px(480), m = px(10), bh = px(28);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, cw, ch};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeTagDict", L"タグ辞書（別名・親子関係）", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                            app.inst, nullptr);
+    w.done = w.busy = false;
+    if (!w.wnd) return;
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    child(WC_STATICW,
+          L"別名は検索でまとめて扱い、親子関係は子のタグが付いた画像に親のタグも付けます（出どころ「親子関係」）。"
+          L"ここに書くのは自分の分です。Danbooru の一覧は下のボタンで取り込めます。",
+          SS_NOPREFIX, -1, m, m, cw - 2 * m, px(36));
+    w.edit = child(WC_EDITW, L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                   -1, m, m + px(40), cw - 2 * m, ch - 3 * m - px(40) - bh - px(48), WS_EX_CLIENTEDGE);
+    SendMessageW(w.edit, EM_SETLIMITTEXT, 0, 0);
+    w.counts = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, ch - m - bh - px(46), cw - 2 * m, px(20));
+    w.status = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, ch - m - bh - px(24), cw - 2 * m, px(20));
+    w.import = child(WC_BUTTONW, L"Danbooru から取り込む", WS_TABSTOP, IDRETRY, m, ch - m - bh, px(190), bh);
+    w.save = child(WC_BUTTONW, L"保存して当てる", WS_TABSTOP, IDOK, cw - m - px(260), ch - m - bh, px(150), bh);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, cw - m - px(100), ch - m - bh, px(100), bh);
+    std::vector<TagRelation> rels;
+    if (Db* db = uiDb()) {
+        try {
+            rels = loadRelations(*db, "user");
+        } catch (const std::exception&) {
+        }
+    }
+    std::wstring text;
+    for (wchar_t c : widen(formatTagRelations(rels))) {
+        if (c == L'\n') text += L'\r';
+        text += c;
+    }
+    SetWindowTextW(w.edit, text.c_str());
+    tagDictRefreshCounts();
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(w.wnd, SW_SHOW);
+    SetFocus(w.edit);
+    MSG msg;
+    while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE && !w.busy) {
+            w.done = true;
+            continue;
+        }
+        if (IsDialogMessageW(w.wnd, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(w.wnd);
+    w.wnd = nullptr;
+    SetActiveWindow(app.hwnd);
+}
+
 void layout();
 
 void switchTab(int t) {
@@ -3236,7 +3455,7 @@ void appendMainMenus(HMENU root) {
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_PREV_GROUP, CMD_NEXT_GROUP, 0, CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_REFS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
 
@@ -3531,6 +3750,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case CMD_SETTINGS: showSettingsWindow(); break;
                 case CMD_DICTIONARY: showDictionaryWindow(); break;
+                case CMD_TAGDICT: showTagDictWindow(); break;
                 case CMD_REFS: {
                     // 無ければ作り、使い方を書いたファイルを置いて開く
                     const std::wstring dir = clip::refsDir(app.dataDir);
@@ -3811,6 +4031,7 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.merge = [](Db& db) {
         clip::applyDictionary(app.dataDir, db, false);
         clip::applyReferences(app.dataDir, db, false);
+        clip::applyTagParents(db, false);  // 辞書や見本で付いたタグの親も
     };
     return cb;
 }

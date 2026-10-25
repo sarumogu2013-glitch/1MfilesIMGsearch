@@ -36,6 +36,9 @@ std::wstring dictionaryPath(const std::wstring& dataDir);
 size_t applyReferences(const std::wstring& dataDir, imgdupe::Db& db, bool force);
 std::wstring refsDir(const std::wstring& dataDir);  // <dataDir>\refs
 
+// タグ辞書の親子関係を当てる（タグや関係が前回から変わっていなければ何もしない。CLIP が無くても使う）
+size_t applyTagParents(imgdupe::Db& db, bool force);
+
 struct LoadResult {
     std::shared_ptr<imgdupe::Analyzer> analyzer;
     std::wstring device;

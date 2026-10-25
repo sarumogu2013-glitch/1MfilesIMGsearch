@@ -193,6 +193,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.merge = [](Db& db) {
         clip::applyDictionary(g->dataDir, db, false);
         clip::applyReferences(g->dataDir, db, false);
+        clip::applyTagParents(db, false);  // 辞書や見本で付いたタグの親も
     };
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);

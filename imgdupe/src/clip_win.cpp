@@ -8,6 +8,7 @@
 #include "ann.hpp"
 #include "dict.hpp"
 #include "refs.hpp"
+#include "tagrel.hpp"
 #include "image_win.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
@@ -281,6 +282,21 @@ size_t applyReferences(const std::wstring& dataDir, imgdupe::Db& db, bool force)
     if (!force && db.setting("refs:state") == state) return 0;
     const size_t n = imgdupe::applyReferences(db, vecs, sets);
     db.setSetting("refs:state", state);
+    return n;
+}
+
+size_t applyTagParents(imgdupe::Db& db, bool force) {
+    const imgdupe::RelationCounts rc = imgdupe::relationCounts(db);
+    int64_t rows = 0;
+    {
+        imgdupe::Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE source<>'parent'");
+        if (st.step()) rows = st.i64(0);
+    }
+    const std::string state = std::to_string(rows) + "|" + std::to_string(rc.userAlias) + "|" + std::to_string(rc.userParent) + "|" +
+                              std::to_string(rc.danbooruAlias) + "|" + std::to_string(rc.danbooruParent);
+    if (!force && db.setting("parents:state") == state) return 0;
+    const size_t n = imgdupe::applyParents(db);
+    db.setSetting("parents:state", state);
     return n;
 }
 
