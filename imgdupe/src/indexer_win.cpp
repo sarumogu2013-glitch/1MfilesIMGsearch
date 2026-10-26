@@ -46,7 +46,7 @@ constexpr ULONGLONG kChangeQuietMs = 10 * 1000;       // フォルダが変わ�
 constexpr ULONGLONG kRescanMs = 30 * 60 * 1000;       // 変化が無くても、これだけたったら調べ直す
 constexpr DWORD kIdleMs = 60 * 1000;                  // これだけ操作が無ければ全力で処理する
 
-enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT };
+enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT, ID_LOAD0 = 100 };  // ID_LOAD0 + 負荷
 
 std::wstring exePath() {
     std::wstring buf(MAX_PATH, L'\0');
@@ -81,12 +81,15 @@ struct Resident {
     std::wstring lastResult;                   // 最後の結果（m で守る）
     std::wstring waitReason;                   // 止めている理由（m で守る）
     std::wstring taggerDevice;                 // タガーを動かしている所（GPU / CPU。m で守る）
+    std::atomic<int> load{kLoadLight};         // 負荷（imgdupe.ini の indexerLoad。回のはじめに読む）
 };
 
 Resident* g = nullptr;
 
-// 今は処理を控えるべきか（バッテリー駆動・全画面のアプリ・プレゼンテーション中）。理由を返す
+// 今は処理を控えるべきか（バッテリー駆動・全画面のアプリ・プレゼンテーション中）。理由を返す。
+// 「しっかり」はゲームと同じように扱い、控えない
 std::wstring busyReason() {
+    if (g->load >= kLoadHeavy) return L"";
     SYSTEM_POWER_STATUS ps;
     if (GetSystemPowerStatus(&ps) && ps.ACLineStatus == 0) return L"バッテリー駆動中";
     QUERY_USER_NOTIFICATION_STATE st;
@@ -99,6 +102,25 @@ std::wstring busyReason() {
 bool userIdle() {
     LASTINPUTINFO li{sizeof(li)};
     return GetLastInputInfo(&li) && GetTickCount() - li.dwTime > kIdleMs;
+}
+
+// 処理に使うスレッドの数（0 = 全部のコア）。控えめ: 操作中は 1、そこそこ: 操作中はコアの半分、しっかり: いつも全部
+unsigned threadsForLoad() {
+    if (g->load >= kLoadHeavy || userIdle()) return 0;
+    if (g->load == kLoadMedium) return std::max(1u, std::thread::hardware_concurrency() / 2);
+    return 1;
+}
+
+// プロセスの優先度。控えめ: CPU・ディスク・メモリの優先度をまとめて下げる（バックグラウンドモード）、
+// そこそこ: 「通常以下」、しっかり: 「通常」（ゲームなどと同じ）
+void applyProcessPriority(int load) {
+    HANDLE self = GetCurrentProcess();
+    if (load <= kLoadLight) {
+        SetPriorityClass(self, PROCESS_MODE_BACKGROUND_BEGIN);
+        return;
+    }
+    SetPriorityClass(self, PROCESS_MODE_BACKGROUND_END);
+    SetPriorityClass(self, load == kLoadMedium ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
 }
 
 void setStatus(std::wstring* field, const std::wstring& v) {
@@ -151,7 +173,9 @@ void runOnce(const std::vector<std::wstring>& roots) {
         opt.roots.push_back(narrow(clip::refsDir(g->dataDir)));
     opt.dbFile = dbFileOf(g->dataDir);
     opt.packDir = narrow(g->dataDir);
-    opt.threads = userIdle() ? 0 : 1;  // 操作中は 1 スレッドだけ
+    g->load = loadLevel(g->dataDir);
+    applyProcessPriority(g->load);
+    opt.threads = threadsForLoad();
     try {
         Db db;
         if (db.open(opt.dbFile)) imgwin::setScanExcludes(customVfolderRoots(db));
@@ -169,16 +193,17 @@ void runOnce(const std::vector<std::wstring>& roots) {
     cb.readMeta = [](const std::string& path, FileMeta& m) { return imgwin::readFileMeta(widen(path), m); };
     cb.threadInit = [] {
         imgwin::threadBegin();
-        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        if (g->load <= kLoadLight) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        else if (g->load == kLoadMedium) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     };
     cb.threadExit = [] {
-        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        if (g->load <= kLoadLight) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         imgwin::threadEnd();
     };
     cb.taggerVersion = [] { return tagger::stageVersion(g->dataDir); };
     cb.makeTagger = [&cb](std::string& error) {
         // 操作中は推論も 1 スレッドだけ（操作していなければ全部のコア）
-        tagger::LoadResult r = tagger::load(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
+        tagger::LoadResult r = tagger::load(g->dataDir, threadsForLoad(), cb.threadInit, cb.threadExit);
         error = narrow(r.error);
         if (r.analyzer) {
             std::lock_guard<std::mutex> lock(g->m);
@@ -203,7 +228,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
         return imgwin::decodeBgra(widen(path), maxSide, bgra, w, h, &ow, &oh);
     };
     cb.makeClip = [&cb](std::string& error) {
-        clip::LoadResult r = clip::loadAnalyzer(g->dataDir, userIdle() ? 0 : 1, cb.threadInit, cb.threadExit);
+        clip::LoadResult r = clip::loadAnalyzer(g->dataDir, threadsForLoad(), cb.threadInit, cb.threadExit);
         error = narrow(r.error);
         if (r.analyzer) {
             std::lock_guard<std::mutex> lock(g->m);
@@ -221,7 +246,8 @@ void runOnce(const std::vector<std::wstring>& roots) {
         }
     });
     g->running = true;
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);  // CPU とディスクの優先度を下げる
+    const bool background = g->load <= kLoadLight;
+    if (background) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);  // CPU とディスクの優先度を下げる
     try {
         const IndexReport r = indexOnce(opt, cb, g->prog, g->cancelRun);
         if (r.cancelled) {
@@ -237,7 +263,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
     } catch (const std::exception& e) {
         setStatus(&g->lastResult, L"エラー: " + widen(e.what()));
     }
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    if (background) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     g->running = false;
     g->changeTick = 0;  // 処理中のパック・DB の書き込みによる変化は無視する
     done = true;
@@ -283,6 +309,7 @@ void workLoop() {
         }
         if (lastRun && now - lastRun > kRescanMs) g->dirty = true;
 
+        g->load = loadLevel(g->dataDir);
         std::wstring reason = g->paused ? L"一時停止中" : rootsUtf8.empty() ? L"調べるフォルダがありません" : busyReason();
         setStatus(&g->waitReason, reason);
         if (g->dirty && reason.empty()) {
@@ -397,6 +424,12 @@ void showMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g->paused ? MF_CHECKED : 0), ID_PAUSE, L"一時停止(&P)");
     AppendMenuW(menu, MF_STRING, ID_RESCAN, L"今すぐ調べ直す(&R)");
+    {
+        HMENU sub = CreatePopupMenu();
+        for (int i = kLoadLight; i <= kLoadHeavy; ++i)
+            AppendMenuW(sub, MF_STRING | (loadLevel(g->dataDir) == i ? MF_CHECKED : 0), ID_LOAD0 + i, loadLevelName(i));
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"処理の負荷(&L)");
+    }
     AppendMenuW(menu, MF_STRING, ID_OPEN_GUI, L"imgdupe を開く(&O)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_QUIT, L"バックグラウンドの解析を終了(&X)");
@@ -410,6 +443,13 @@ void showMenu() {
         case ID_RESCAN: g->dirty = true; break;
         case ID_OPEN_GUI: openGui(); break;
         case ID_QUIT: g->quit = true; break;
+        default:
+            if (cmd >= ID_LOAD0 + kLoadLight && cmd <= ID_LOAD0 + kLoadHeavy && static_cast<int>(cmd - ID_LOAD0) != g->load) {
+                setLoadLevel(g->dataDir, static_cast<int>(cmd - ID_LOAD0));
+                // 今の回を止めて、新しい負荷でやり直す
+                g->cancelRun = true;
+                g->dirty = true;
+            }
     }
     g->cv.notify_all();
     updateTip();
@@ -455,8 +495,8 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
         if (waitForOld) Sleep(1000);
     }
     if (!mutex) return 0;  // もう動いている
-    // プロセスごと CPU とディスクの優先度を下げる（ONNX Runtime が作るスレッドも含めて）
-    SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
+    // プロセスごと優先度を決める（ONNX Runtime が作るスレッドも含めて。控えめなら CPU とディスクの優先度を下げる）
+    applyProcessPriority(loadLevel(dataDir));
     Resident r;
     g = &r;
     r.inst = inst;
@@ -552,6 +592,24 @@ void setAutoStart(bool on) {
         RegDeleteValueW(key, kRunValue);
     }
     RegCloseKey(key);
+}
+
+int loadLevel(const std::wstring& dataDir) {
+    const int v = static_cast<int>(GetPrivateProfileIntW(L"imgdupe", L"indexerLoad", kLoadLight, (dataDir + L"\\imgdupe.ini").c_str()));
+    return std::clamp(v, static_cast<int>(kLoadLight), static_cast<int>(kLoadHeavy));
+}
+
+void setLoadLevel(const std::wstring& dataDir, int level) {
+    level = std::clamp(level, static_cast<int>(kLoadLight), static_cast<int>(kLoadHeavy));
+    WritePrivateProfileStringW(L"imgdupe", L"indexerLoad", std::to_wstring(level).c_str(), (dataDir + L"\\imgdupe.ini").c_str());
+}
+
+const wchar_t* loadLevelName(int level) {
+    switch (level) {
+        case kLoadMedium: return L"そこそこ（操作中もコアの半分を使う）";
+        case kLoadHeavy: return L"しっかり（ゲーム並み。いつも全部のコア。全画面・バッテリーでも止めない）";
+        default: return L"控えめ（操作中は 1 スレッドだけ）";
+    }
 }
 
 }  // namespace indexer

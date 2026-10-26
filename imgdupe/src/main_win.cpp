@@ -2664,12 +2664,12 @@ void undoTagEdit() {
 
 struct SettingsWindow {
     HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, quality = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
-         variantSim = nullptr, tagJapanese = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
+         variantSim = nullptr, tagJapanese = nullptr, load = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA, IDC_ST_LOAD };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -2685,6 +2685,11 @@ void applySettings() {
         }
     }
     iniSet(L"qualityEnabled", Button_GetCheck(w.quality) == BST_CHECKED ? L"1" : L"0");
+    const int load = std::max(0, ComboBox_GetCurSel(w.load));
+    if (load != indexer::loadLevel(app.dataDir)) {
+        indexer::setLoadLevel(app.dataDir, load);
+        restartIndexerAfterUpdate();  // 動いていれば、新しい負荷でやり直させる（スレッドの数は回のはじめに決まる）
+    }
     const int tagger = Button_GetCheck(w.tagger) == BST_CHECKED ? 1 : 0;
     const int clipOn = Button_GetCheck(w.clip) == BST_CHECKED ? 1 : 0;
     const int cpu = Button_GetCheck(w.gpu) == BST_CHECKED ? 0 : 1;
@@ -2768,7 +2773,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(694), m = px(12);
+    const int cw = px(560), ch = px(744), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2796,10 +2801,19 @@ void showSettingsWindow() {
     int gy = group(L"アップデート", px(52));
     w.autoUpdate = child(WC_BUTTONW, L"終了する時に新しい版を確かめる（1 日 1 回）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOUPDATE,
                          in, gy, iw, rowH);
-    gy = group(L"バックグラウンドの解析", px(76));
+    gy = group(L"バックグラウンドの解析", px(126));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
     w.quality = child(WC_BUTTONW, L"画像の品質（ぼやけ・拡大された画像）を調べる（1 枚ずつ読み直すので時間がかかります）",
                       WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_QUALITY, in, gy + rowH + px(2), iw, rowH);
+    {
+        const int ly = gy + 2 * (rowH + px(2)) + px(2);
+        child(WC_STATICW, L"処理の負荷", SS_NOPREFIX, -1, in, ly + px(3), px(80), rowH);
+        w.load = child(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_ST_LOAD, in + px(84), ly, iw - px(84), px(200));
+        for (int i = indexer::kLoadLight; i <= indexer::kLoadHeavy; ++i) ComboBox_AddString(w.load, indexer::loadLevelName(i));
+        child(WC_STATICW,
+              L"上げるほど速く進みますが、そのぶんほかのアプリが重くなります。",
+              SS_NOPREFIX, -1, in, ly + rowH + px(6), iw, rowH);
+    }
     gy = group(L"AI 解析", px(174));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
@@ -2845,6 +2859,7 @@ void showSettingsWindow() {
     Button_SetCheck(w.autoUpdate, iniInt(L"autoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagJapanese, app.tagJapanese ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    ComboBox_SetCurSel(w.load, indexer::loadLevel(app.dataDir));
     Button_SetCheck(w.quality, clip::qualityEnabled(app.dataDir) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.clip, iniInt(L"clipEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);

@@ -25,6 +25,16 @@ void requestRescan(const std::wstring& dataDir);
 // GUI から: 調べるフォルダを DB に書く（indexer はこれを見る）
 void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& roots);
 
+// 処理の負荷（imgdupe.ini の indexerLoad）。GUI の設定の画面とタスクトレイのメニューで変える
+enum LoadLevel : int {
+    kLoadLight = 0,   // 控えめ（既定）: 操作中は 1 スレッド、バックグラウンドの優先度、全画面のアプリ中・バッテリーでは止める
+    kLoadMedium = 1,  // そこそこ: 操作中もコアの半分、優先度は「通常以下」。全画面のアプリ中・バッテリーでは止める
+    kLoadHeavy = 2,   // しっかり: いつも全部のコア、優先度は「通常」（ゲームと同じくらい）。全画面のアプリ中・バッテリーでも止めない
+};
+int loadLevel(const std::wstring& dataDir);
+void setLoadLevel(const std::wstring& dataDir, int level);
+const wchar_t* loadLevelName(int level);
+
 // Windows と一緒に起動する（HKCU の Run キー。管理者権限は要らない）
 bool autoStartEnabled();
 void setAutoStart(bool on);
