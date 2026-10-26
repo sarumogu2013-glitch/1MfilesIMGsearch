@@ -3895,6 +3895,8 @@ void loadSearchSettings() {
 
 // 上にリボン（見出しと、その下に選んだリボンの中身）、検索のリボンなら詳細検索、残りはエクスプローラー
 void layout() {
+    // WM_CREATE の中の SetMenu でも WM_SIZE が来る（まだ部品を作っていない）
+    if (!ex.view) return;
     RECT rc;
     GetClientRect(app.hwnd, &rc);
     const int W = rc.right, H = rc.bottom;
@@ -4522,7 +4524,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_TAB_DUPES: switchTab(0); break;
                 case CMD_TAB_EXPLORER: switchTab(2); break;
                 case CMD_FIND_SAME: {
-                    const std::wstring p = ex.view->Selected();
+                    const std::wstring p = selectedPath();
                     if (!p.empty() && imgdupe::isImageExt(narrow(p))) ex.ExplorerFindSameFile(p);
                     break;
                 }
