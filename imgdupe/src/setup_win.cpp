@@ -125,7 +125,11 @@ bool writePayload(const std::wstring& exe, std::wstring& error) {
         return false;
     }
     // 実行中でも入れ替えられるように、新しいファイルを書いてから名前を付け替える（古い方は次の起動で消える）
-    const std::wstring newPath = exe + L".new", oldPath = exe + L".old";
+    const std::wstring newPath = exe + L".new";
+    // 前の .old をまだ使っているもの（古い版のバックグラウンドの解析など）があると消せないので、その時は別の名前にする
+    std::wstring oldPath = exe + L".old";
+    for (int i = 1; i <= 50 && !DeleteFileW(oldPath.c_str()) && GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
+        oldPath = exe + L".old" + std::to_wstring(i);
     HANDLE f = CreateFileW(newPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         error = L"インストール先に書き込めません: " + exe;
@@ -140,7 +144,6 @@ bool writePayload(const std::wstring& exe, std::wstring& error) {
         return false;
     }
     if (GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        DeleteFileW(oldPath.c_str());
         if (!MoveFileExW(exe.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             DeleteFileW(newPath.c_str());
             error = L"今の imgdupe.exe を置き換えられませんでした。imgdupe を終了してから、もう一度お試しください";

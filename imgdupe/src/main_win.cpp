@@ -5124,7 +5124,7 @@ int runUninstall() {
     // 動いている exe は自分では消せないので、終わってから cmd に消してもらう（消えるまで 1 秒ごとに最大 20 回。フォルダは空の時だけ消える）
     const std::wstring exe = upd::exePath(), dir = exeDir();
     std::wstring cmd = L"cmd.exe /c for /l %i in (1,1,20) do (if exist \"" + exe + L"\" (ping -n 2 127.0.0.1 >nul & del /f /q \"" +
-                       exe + L"\" \"" + exe + L".old\" 2>nul)) & rmdir \"" + dir + L"\" 2>nul";
+                       exe + L"\" \"" + exe + L".old*\" 2>nul)) & rmdir \"" + dir + L"\" 2>nul";
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;

@@ -276,7 +276,10 @@ DownloadResult downloadAndReplace(const imgdupe::ReleaseInfo& info) {
 
     const std::wstring exe = exePath();
     const std::wstring newPath = exe + L".new";
-    const std::wstring oldPath = exe + L".old";
+    // 前の更新の .old をまだ使っているもの（古い版のバックグラウンドの解析など）があると消せないので、その時は別の名前にする
+    std::wstring oldPath = exe + L".old";
+    for (int i = 1; i <= 50 && !DeleteFileW(oldPath.c_str()) && GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES; ++i)
+        oldPath = exe + L".old" + std::to_wstring(i);
 
     HANDLE f = CreateFileW(newPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
@@ -293,7 +296,6 @@ DownloadResult downloadAndReplace(const imgdupe::ReleaseInfo& info) {
         return result;
     }
 
-    DeleteFileW(oldPath.c_str());
     if (!MoveFileExW(exe.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(newPath.c_str());
         result.error = L"今の exe を改名できませんでした";
@@ -400,7 +402,19 @@ DownloadResult downloadFile(const std::wstring& url, const std::wstring& path, c
     return result;
 }
 
-void cleanupOldExe() { DeleteFileW((exePath() + L".old").c_str()); }
+// 前の更新で残した古い exe（imgdupe.exe.old、imgdupe.exe.old1 など）を消す（まだ使われていれば次の機会に）
+void cleanupOldExe() {
+    const std::wstring exe = exePath();
+    const size_t sep = exe.find_last_of(L"\\/");
+    const std::wstring dir = sep == std::wstring::npos ? L"" : exe.substr(0, sep + 1);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((exe + L".old*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        DeleteFileW((dir + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
 
 std::wstring exePath() {
     std::wstring buf(MAX_PATH, L'\0');

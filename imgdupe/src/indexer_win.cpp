@@ -239,8 +239,23 @@ void runOnce(const std::vector<std::wstring>& roots) {
 
     // 見張り: 一時停止・終了・控えるべき状態になったら、すぐ止める（続きは次の回）
     std::atomic<bool> done{false};
+    // 処理中も GUI からの指示（終了・一時停止など）を見る。見ないと、更新の後に古い版が長い処理を終えるまで残り、
+    // その exe（imgdupe.exe.old）を使い続けて次の更新ができなかった
     std::thread guard([&] {
-        while (!done) {
+        Db cmdDb;
+        const bool cmdOk = cmdDb.open(opt.dbFile);
+        for (unsigned tick = 0; !done; ++tick) {
+            if (cmdOk && tick % 3 == 0) {
+                try {
+                    for (const auto& c : takeCommands(cmdDb)) {
+                        if (c == "quit") g->quit = true;
+                        else if (c == "rescan") g->dirty = true;
+                        else if (c == "pause") g->paused = true;
+                        else if (c == "resume") g->paused = false;
+                    }
+                } catch (const std::exception&) {
+                }
+            }
             if (g->paused || g->quit || !busyReason().empty()) g->cancelRun = true;
             Sleep(1000);
         }
