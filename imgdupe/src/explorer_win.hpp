@@ -75,6 +75,8 @@ class ExplorerHost {
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
   virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
   virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
+  virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
+  virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
 };
 
 class ExplorerImpl;
@@ -90,7 +92,9 @@ class Explorer {
   void Move(const RECT& r);
   HWND Window() const;
   std::wstring Dir() const;
-  std::wstring Selected() const;
+  std::wstring Selected() const;                    // 今の項目（プレビューに出しているもの）
+  std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）
+  bool ShowingList() const;                         // 検索の結果を出している
   void RefreshStates();  // インデックスの状態を読み直す
   void RefreshTags();    // タグの表示名が変わった
   // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ

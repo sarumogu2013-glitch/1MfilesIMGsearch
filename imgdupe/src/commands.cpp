@@ -52,6 +52,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_TAB_DUPES, "TabDuplicates", L"重複を探す(&D)", "Ctrl+1"},
     {CMD_TAB_SEARCH, "TabSearch", L"検索(&S)", "Ctrl+2"},
     {CMD_SAVE_SMART, "SaveSmartFolder", L"条件をスマートフォルダに保存(&M)...", "Ctrl+Shift+S"},
+    {CMD_SAVE_SELECTION, "SaveSelectionSmartFolder", L"選んだ画像をスマートフォルダに保存(&P)...", "Ctrl+Shift+M"},
     {CMD_DELETE_SMART, "DeleteSmartFolder", L"スマートフォルダを削除(&L)", ""},
     {CMD_EXPAND_LINKS, "ExpandLinks", L"検索結果をフォルダに展開(&X)...", "Ctrl+Shift+E"},
     {CMD_LINKS, "Links", L"展開したフォルダ(&F)...", ""},

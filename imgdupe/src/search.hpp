@@ -59,6 +59,8 @@ struct SearchQuery {
     // SQL では扱わない（rankByVector で、ほかの条件に合う画像を似ている順にする）
     std::string clipText;
     int64_t similarTo = 0;
+    // 選んだ画像（空でなければ、この画像のうちほかの条件にも合うものだけ。「選んだ画像をスマートフォルダに保存」）
+    std::vector<int64_t> ids;
     // 並べ替え
     SortKey sort = SortKey::Relevance;  // 関連度（フリーワードが無ければパス順）
     bool descending = false;

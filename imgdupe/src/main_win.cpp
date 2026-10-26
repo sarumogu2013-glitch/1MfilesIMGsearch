@@ -225,6 +225,7 @@ struct App {
     std::set<std::string> uncheckedSources;  // 外した出どころ
     std::unordered_map<std::string, std::string> tagNames;  // タグ（小文字）→ 日本語の表示名
     bool tagJapanese = true;                                // タグを日本語で出す（imgdupe.ini の tagJapanese）
+    std::vector<int64_t> idsFilter;  // 検索の条件の「選んだ画像」（選んだ画像を保存したスマートフォルダを開いた時）
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
@@ -288,6 +289,8 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerRelookup(const std::wstring& path) override;
     std::wstring ExplorerTagLabel(const std::wstring& tag) override;
     void ExplorerRenameTag(const std::wstring& tag) override;
+    void ExplorerSaveSelection() override;
+    void ExplorerTagSelection() override;
 } ex;
 
 int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
@@ -1272,6 +1275,7 @@ void onExpanded(ExpandDone* p);
 void saveSmartFolderUi();
 void deleteSmartFolderUi();
 void refreshSmartFolders(const std::wstring& select);
+std::vector<int64_t> selectedImageIds(size_t* missing = nullptr);
 
 struct SearchDone {
     unsigned gen;
@@ -1405,6 +1409,7 @@ SearchQuery searchQueryFromUi() {
     q.dateField = static_cast<DateField>(std::clamp(ComboBox_GetCurSel(app.s.dateField), 0, 2));
     if (app.similarTo) q.similarTo = app.similarTo;
     else q.clipText = narrow(editText(app.s.clip));
+    q.ids = app.idsFilter;
     const int rating = ComboBox_GetCurSel(app.s.rating);  // 0: 指定なし、1〜5: ★n 以上、6: 星なし
     if (rating >= 1 && rating <= 5) q.minRating = rating;
     if (rating == 6) q.noRating = true;
@@ -1533,9 +1538,12 @@ void onSearched(SearchDone* p) {
                 (app.searchTotal > app.searchIds.size() ? L"（先頭の " + withCommas(app.searchIds.size()) + L" 件を出しています）"
                  : review                               ? L"（迷っている順）"
                                                         : L"");
-    setText(app.s.count, count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
+    const std::wstring from =
+        app.idsFilter.empty() ? L"" : L"保存した " + withCommas(app.idsFilter.size()) + L" 枚（「条件をクリア」で外します）のうち ";
+    setText(app.s.count, from + count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
     app.searchNotice.clear();
     std::wstring what = editText(app.s.free);
+    if (what.empty() && !app.idsFilter.empty()) what = L"保存した画像";
     if (what.empty()) what = done->clip ? (app.similarTo ? app.similarLabel : editText(app.s.clip)) : L"条件";
     std::vector<std::wstring> paths;
     for (const auto& pth : app.searchPaths)
@@ -1659,6 +1667,7 @@ void findSimilar(int64_t imageId, const std::wstring& name) {
 
 void clearSearchConditions() {
     app.similarTo = 0;
+    app.idsFilter.clear();
     for (HWND h : {app.s.free, app.s.tags, app.s.text, app.s.clip, app.s.minW, app.s.minKb, app.s.maxKb, app.s.path, app.s.download})
         SetWindowTextW(h, L"");
     ComboBox_SetCurSel(app.s.scope, 0);
@@ -1788,6 +1797,7 @@ void refreshSmartFolders(const std::wstring& select) {
 
 // 保存した条件を画面に戻す（画面に無い項目は使わない）
 void applyQueryToUi(const SearchQuery& q) {
+    app.idsFilter = q.ids;
     // フリーワードの欄に戻す（タグの条件は「タグに限る」、前の版の「文字」はフリーワード）
     std::wstring tags;
     for (const auto& t : q.tags) tags += (tags.empty() ? L"" : L" ") + widen(t);
@@ -1861,30 +1871,58 @@ void applyQueryToUi(const SearchQuery& q) {
     runSearch();
 }
 
-void saveSmartFolderUi() {
+// 名前を聞いて、q をスマートフォルダに保存する（同じ名前があれば置き換えてよいか聞く）
+bool saveSmartFolderAs(const SearchQuery& q, const std::wstring& message, const std::wstring& initial) {
     Db* db = uiDb();
-    if (!db) return;
-    const int i = ComboBox_GetCurSel(app.s.smart) - 1;
-    const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"";
-    auto name = promptText(L"スマートフォルダに保存", L"名前（今の検索条件を保存します）", initial);
-    if (!name) return;
+    if (!db) return false;
+    auto name = promptText(L"スマートフォルダに保存", message, initial);
+    if (!name) return false;
     while (!name->empty() && iswspace(name->back())) name->pop_back();
     while (!name->empty() && iswspace(name->front())) name->erase(name->begin());
-    if (name->empty()) return;
-    const std::string n = narrow(*name);
+    if (name->empty()) return false;
     for (const auto& f : app.smartList) {
         if (_wcsicmp(widen(f.name).c_str(), name->c_str()) == 0 &&
-            MessageBoxW(app.hwnd, (L"「" + *name + L"」の条件を今の条件で置き換えますか？").c_str(), L"imgdupe",
-                        MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
-            return;
+            MessageBoxW(app.hwnd, (L"「" + *name + L"」を置き換えますか？").c_str(), L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+            return false;
     }
     try {
-        saveSmartFolder(*db, n, searchQueryFromUi());
+        saveSmartFolder(*db, narrow(*name), q);
     } catch (const std::exception& e) {
         MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
-        return;
+        return false;
     }
     refreshSmartFolders(*name);
+    return true;
+}
+
+// 選んだ画像をスマートフォルダに保存する（中身は画像の ID の一覧。開くとその画像を検索の結果として出す）
+void saveSelectionSmartUi() {
+    size_t missing = 0;
+    const std::vector<int64_t> ids = selectedImageIds(&missing);
+    if (ids.empty()) {
+        MessageBoxW(app.hwnd,
+                    missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像だけ保存できます）。"
+                            : L"保存する画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
+                    L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    SearchQuery q;
+    q.ids = ids;
+    q.sort = SortKey::FileName;
+    std::wstring message = L"名前（選んだ " + withCommas(ids.size()) + L" 枚を保存します";
+    if (missing) message += L"。インデックスに無い " + withCommas(missing) + L" 枚は入りません";
+    message += L"）";
+    if (saveSmartFolderAs(q, message, L"選んだ画像") && ex.view) {
+        const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+        const std::wstring name = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"";
+        ex.view->SetSameStatus(withCommas(ids.size()) + L" 枚をスマートフォルダ「" + name + L"」に保存しました（検索の「保存した条件」から開けます）");
+    }
+}
+
+void saveSmartFolderUi() {
+    const int i = ComboBox_GetCurSel(app.s.smart) - 1;
+    const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"";
+    saveSmartFolderAs(searchQueryFromUi(), L"名前（今の検索条件を保存します）", initial);
 }
 
 void deleteSmartFolderUi() {
@@ -2206,28 +2244,62 @@ void showLinksWindow() {
 // ---------------------------------------------------------------- タグの確定（確認キュー・一括のタグ付け）
 
 // エクスプローラーで選んでいる検索の結果（searchIds の番号）
-std::vector<int> selectedResults() {
-    std::vector<int> out;
+// 今の項目が検索の結果の何番目か（-1 = 結果に無い）
+int selectedResult() {
     const std::wstring sel = ex.view ? ex.view->Selected() : L"";
-    if (sel.empty()) return out;
+    if (sel.empty()) return -1;
     for (size_t i = 0; i < app.searchPaths.size() && i < app.searchIds.size(); ++i)
-        if (lstrcmpiW(app.searchPaths[i].c_str(), sel.c_str()) == 0) {
-            out.push_back(static_cast<int>(i));
-            break;
+        if (lstrcmpiW(app.searchPaths[i].c_str(), sel.c_str()) == 0) return static_cast<int>(i);
+    return -1;
+}
+
+// エクスプローラーで選んでいる画像の ID（インデックスに無いものは数だけ missing に）
+std::vector<int64_t> selectedImageIds(size_t* missing) {
+    std::vector<int64_t> out;
+    if (missing) *missing = 0;
+    if (!ex.view) return out;
+    const auto paths = ex.view->SelectedPaths();
+    std::unordered_map<std::wstring, int64_t> results;  // 検索の結果なら ID が分かっている
+    for (size_t i = 0; i < app.searchPaths.size() && i < app.searchIds.size(); ++i) {
+        std::wstring k = app.searchPaths[i];
+        CharLowerBuffW(k.data(), static_cast<DWORD>(k.size()));
+        results.emplace(std::move(k), app.searchIds[i]);
+    }
+    Db* db = uiDb();
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    std::set<int64_t> seen;
+    for (const auto& p : paths) {
+        if (!imgdupe::isImageExt(narrow(p))) continue;
+        std::wstring k = p;
+        CharLowerBuffW(k.data(), static_cast<DWORD>(k.size()));
+        int64_t id = 0;
+        if (auto it = results.find(k); it != results.end()) id = it->second;
+        else if (db) {
+            try {
+                id = findImageId(*db, narrow(p), roots);
+            } catch (const std::exception&) {
+            }
         }
+        if (!id) {
+            if (missing) ++*missing;
+            continue;
+        }
+        if (seen.insert(id).second) out.push_back(id);
+    }
     return out;
 }
 
-// 選んだ画像のタグを書き換えて、検索し直す（同じ位置の画像を選び直す）
+// 選んだ画像のタグを書き換える。検索の結果を出していれば検索し直す（同じ位置の画像を選び直す）
 // edit(db, 画像 ID, history) は、タグを変える前に history.touch(画像 ID, タグ) を呼ぶ（取り消せるように）
 template <typename F>
-void editSelectedTags(const std::vector<int>& items, const std::string& description, F&& edit) {
+void editSelectedTags(const std::vector<int64_t>& ids, const std::string& description, F&& edit) {
     Db* db = uiDb();
-    if (!db || items.empty()) return;
+    if (!db || ids.empty()) return;
     try {
         db->begin();
         TagHistory history(*db);
-        for (int i : items) edit(*db, app.searchIds[i], history);
+        for (int64_t id : ids) edit(*db, id, history);
         history.save(description);
         db->commit();
     } catch (const std::exception& e) {
@@ -2238,9 +2310,13 @@ void editSelectedTags(const std::vector<int>& items, const std::string& descript
         MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
-    app.reselect = items.front();
     refreshSources();
-    scheduleSearch(10);
+    if (ex.view && ex.view->ShowingList()) {
+        app.reselect = std::max(0, selectedResult());
+        scheduleSearch(10);
+    } else if (ex.view) {
+        ex.view->RefreshTags();
+    }
 }
 
 void markSelected(bool correct) {
@@ -2251,7 +2327,7 @@ void markSelected(bool correct) {
                     MB_ICONINFORMATION);
         return;
     }
-    const std::vector<int> items = selectedResults();
+    const std::vector<int64_t> items = selectedImageIds();
     if (items.empty()) return;
     const std::string tag = tags[0];
     const std::string desc = std::to_string(items.size()) + " 枚の " + tag + " を「" + (correct ? "正しい" : "違う") + "」に";
@@ -2503,8 +2579,7 @@ void showStatsWindow() {
 
 // 「出典を調べ直す」: 外部照会の結果を消し、次のバックグラウンドの解析でもう一度調べる（選んだ画像。右クリックした画像が選ばれていなければその 1 枚）
 void relookupImages(int64_t clicked) {
-    std::vector<int64_t> ids;
-    for (int i : selectedResults()) ids.push_back(app.searchIds[i]);
+    std::vector<int64_t> ids = selectedImageIds();
     if (std::find(ids.begin(), ids.end(), clicked) == ids.end()) ids.assign(1, clicked);
     const lookup::Settings ls = lookup::load(app.dataDir);
     if (!ls.idLookup && !(ls.reverse && !ls.sauceKey.empty())) {
@@ -2529,9 +2604,12 @@ void relookupImages(int64_t clicked) {
 }
 
 void bulkTagUi() {
-    const std::vector<int> items = selectedResults();
+    size_t missing = 0;
+    const std::vector<int64_t> items = selectedImageIds(&missing);
     if (items.empty()) {
-        MessageBoxW(app.hwnd, L"タグを付ける画像を選んでください（Ctrl や Shift を押しながらクリックすると、いくつも選べます）。",
+        MessageBoxW(app.hwnd,
+                    missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像にだけタグを付けられます）。"
+                            : L"タグを付ける画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
                     L"imgdupe", MB_ICONINFORMATION);
         return;
     }
@@ -2576,11 +2654,9 @@ void undoTagEdit() {
         return;
     }
     app.searchNotice = L"元に戻しました: " + widen(desc);
-    {
-        const auto sel = selectedResults();
-        app.reselect = sel.empty() ? 0 : sel.front();
-    }
+    app.reselect = std::max(0, selectedResult());
     refreshSources();
+    if (ex.view && !ex.view->ShowingList()) ex.view->RefreshTags();
     scheduleSearch(10);
 }
 
@@ -3401,6 +3477,10 @@ void refreshTagLabels() {
     if (statsWin.wnd) fillStatsList();
     syncMenuChecks();
 }
+
+void ExplorerApp::ExplorerSaveSelection() { saveSelectionSmartUi(); }
+
+void ExplorerApp::ExplorerTagSelection() { bulkTagUi(); }
 
 void ExplorerApp::ExplorerRelookup(const std::wstring& path) {
     Db* db = uiDb();
@@ -4357,7 +4437,7 @@ void appendMainMenus(HMENU root) {
     popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
     popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
-    popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME});
+    popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
     popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
@@ -4625,6 +4705,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case CMD_TAB_SEARCH: switchTab(1); break;
                 case CMD_TAG_JAPANESE: setTagJapanese(!app.tagJapanese); break;
+                case CMD_SAVE_SELECTION: saveSelectionSmartUi(); break;
                 case CMD_SAVE_SMART:
                     if (app.tab != 1) switchTab(1);
                     saveSmartFolderUi();

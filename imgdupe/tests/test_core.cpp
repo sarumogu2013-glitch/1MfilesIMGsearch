@@ -2493,6 +2493,15 @@ static void testFreeSearch() {
     CHECK(search(db, d).ids.size() == 5);
     d.takenTo = -11644473601LL;
     CHECK(search(db, d).ids.empty());
+    // 選んだ画像だけ（スマートフォルダに保存した選択）。ほかの条件とも組み合わせる
+    SearchQuery s;
+    s.ids = {I("C:\\p\\b.jpg"), I("C:\\p\\d.jpg"), I("C:\\p\\a.jpg")};
+    s.sort = SortKey::FileName;
+    CHECK(hasConditions(s) && search(db, s).ids == std::vector<int64_t>({I("C:\\p\\a.jpg"), I("C:\\p\\b.jpg"), I("C:\\p\\d.jpg")}));
+    s.freeText = "miku";
+    CHECK(search(db, s).ids.size() == 2);
+    SearchQuery s2;
+    CHECK(queryFromJson(queryToJson(s), s2) && s2.ids == s.ids);
 }
 
 static void testTagNames() {

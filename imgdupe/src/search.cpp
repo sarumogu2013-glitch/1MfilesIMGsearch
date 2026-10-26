@@ -325,6 +325,13 @@ SearchResult search(Db& db, const SearchQuery& q) {
                  "ELSE 1 - exp(sum(ln(1 - min(u.confidence, 0.999999)))) END >= ?)";
         params.emplace_back(q.minConfidence);
     }
+    if (!q.ids.empty()) {
+        // 数が多くても 1 つの値で渡せるよう、JSON の配列にする
+        std::string arr = "[";
+        for (size_t k = 0; k < q.ids.size(); ++k) arr += (k ? "," : "") + std::to_string(q.ids[k]);
+        where += " AND i.id IN (SELECT value FROM json_each(?))";
+        params.emplace_back(arr + "]");
+    }
     if (!q.pathContains.empty()) {
         where += " AND instr(lower(i.path), ?) > 0";
         params.emplace_back(lowerAscii(q.pathContains));
@@ -547,7 +554,7 @@ bool hasConditions(const SearchQuery& q) {
     return !q.freeText.empty() || !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
            q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
            q.minSize > 0 || q.maxSize > 0 || !q.format.empty() || q.animatedOnly || q.unclassified || !q.pathContains.empty() ||
-           !q.downloadContains.empty() || q.deadLinks || q.quality != QualityFilter::Any;
+           !q.downloadContains.empty() || q.deadLinks || q.quality != QualityFilter::Any || !q.ids.empty();
 }
 
 namespace {
@@ -617,6 +624,11 @@ std::string queryToJson(const SearchQuery& q) {
     putBool(out, "review", q.review);
     putText(out, "clipText", q.clipText);
     putInt(out, "similarTo", q.similarTo);
+    if (!q.ids.empty()) {
+        out += ",\"ids\":[";
+        for (size_t i = 0; i < q.ids.size(); ++i) out += (i ? "," : "") + std::to_string(q.ids[i]);
+        out += "]";
+    }
     out += ",\"sort\":\"" + std::string(kSortNames[static_cast<int>(q.sort)]) + "\"";
     putBool(out, "descending", q.descending);
     out += "}";
@@ -677,6 +689,9 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     flag("review", q.review);
     q.clipText = j.getString("clipText");
     if (const Json* n = j.get("similarTo"); n && n->type == Json::Number) q.similarTo = std::strtoll(n->str.c_str(), nullptr, 10);
+    if (const Json* a = j.get("ids"); a && a->type == Json::Array)
+        for (const Json& e : a->arr)
+            if (e.type == Json::Number) q.ids.push_back(std::strtoll(e.str.c_str(), nullptr, 10));
     out = std::move(q);
     return true;
 }

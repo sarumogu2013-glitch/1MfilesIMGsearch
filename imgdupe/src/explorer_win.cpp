@@ -52,7 +52,7 @@ enum {
   ID_BACK, ID_FORWARD, ID_TREE_BTN, ID_PREVIEW_BTN, ID_TREE, ID_SAME_TEXT, ID_SAME_VIEW, ID_SAME_LIST,
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
-enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SIMILAR_AI,
+enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
        MENU_RELOOKUP };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
@@ -72,6 +72,7 @@ struct Item {
   int state = kStateNoBadge;  // インデックスの状態
   uint64_t mtime = 0, size = 0;  // 更新日時 (FILETIME)・大きさ
   size_t order = 0;              // 読んだ順 (検索の結果は関連度などの順)
+  bool picked = false;           // 複数選んでいる時に選ばれている (並べ替えても付いていく)
   bool Thumbable() const { return dir || image; }
 };
 
@@ -320,7 +321,13 @@ class ExplorerImpl {
   int dpi = 96;
   std::wstring dir;
   std::vector<Item> items;
-  int sel = -1, hover = -1;
+  int sel = -1, hover = -1;  // sel: 今の項目 (プレビューに出す・キーで動かす)
+  bool multi = false;        // 複数選んでいる (Item::picked を使う)。false なら sel の 1 つだけ
+  int anchor = -1;           // Shift で範囲を選ぶ時の起点
+  // 枠で囲んで選ぶ (空いている所からドラッグ)。位置は中身の座標 (スクロールを足したもの)
+  bool banding = false, bandMoved = false;
+  POINT bandFrom = {}, bandTo = {};
+  std::vector<char> bandBase;  // 囲み始めた時の選び方 (Ctrl を押していれば足す)
   int scrollY = 0;
   bool tracking = false;
 
@@ -499,6 +506,9 @@ class ExplorerImpl {
     dir.clear();
     items.clear();
     sel = hover = -1;
+    multi = false;
+    anchor = -1;
+    banding = false;
     scrollY = 0;
     gen++;
     {
@@ -558,6 +568,9 @@ class ExplorerImpl {
     dir = d;
     items.clear();
     sel = hover = -1;
+    multi = false;
+    anchor = -1;
+    banding = false;
     scrollY = 0;
     gen++;
     {
@@ -617,6 +630,120 @@ class ExplorerImpl {
   }
 
   std::wstring SelectedPath() const { return sel >= 0 && sel < int(items.size()) ? items[size_t(sel)].path : std::wstring(); }
+
+  bool IsPicked(int i) const { return i >= 0 && i < int(items.size()) && (multi ? items[size_t(i)].picked : i == sel); }
+
+  // 選んでいるものの番号 (並んでいる順)
+  std::vector<int> PickedIndices() const {
+    std::vector<int> out;
+    for (int i = 0; i < int(items.size()); i++)
+      if (IsPicked(i)) out.push_back(i);
+    return out;
+  }
+
+  std::vector<std::wstring> SelectedPaths() const {
+    std::vector<std::wstring> out;
+    for (int i : PickedIndices()) out.push_back(items[size_t(i)].path);
+    return out;
+  }
+
+  // 1 つだけ選んでいる形から、複数の形へ (今の項目を選んだまま)
+  void BeginMulti() {
+    if (multi) return;
+    for (auto& it : items) it.picked = false;
+    if (sel >= 0 && sel < int(items.size())) items[size_t(sel)].picked = true;
+    multi = true;
+  }
+
+  // Ctrl: 1 つずつ足す・外す。Shift: 起点から i までを選ぶ (Ctrl も押していれば今の選択に足す)
+  void SelectWith(int i, bool ctrl, bool shift) {
+    if (items.empty()) return;
+    if (!ctrl && !shift) {
+      Select(i);
+      return;
+    }
+    i = std::max(0, std::min(i, int(items.size()) - 1));
+    int old = sel;
+    BeginMulti();
+    if (shift) {
+      if (anchor < 0 || anchor >= int(items.size())) anchor = sel >= 0 ? sel : i;
+      if (!ctrl)
+        for (auto& it : items) it.picked = false;
+      for (int k = std::min(anchor, i); k <= std::max(anchor, i); k++) items[size_t(k)].picked = true;
+    } else {
+      items[size_t(i)].picked = !items[size_t(i)].picked;
+      anchor = i;
+    }
+    sel = i;
+    EnsureVisible(sel);
+    InvalidateRect(grid, nullptr, FALSE);
+    UpdatePreview();
+    if (preview) InvalidateRect(preview, nullptr, FALSE);  // 選んでいる数
+    if (sel != old) NotifySelected();
+  }
+
+  void SelectAll() {
+    if (items.empty()) return;
+    multi = true;
+    for (auto& it : items) it.picked = true;
+    if (sel < 0) sel = 0;
+    InvalidateRect(grid, nullptr, FALSE);
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
+  }
+
+  // 枠で囲んで選ぶ
+  RECT BandRect() const {
+    RECT r = {std::min(bandFrom.x, bandTo.x), std::min(bandFrom.y, bandTo.y) - scrollY, std::max(bandFrom.x, bandTo.x),
+              std::max(bandFrom.y, bandTo.y) - scrollY};
+    return r;
+  }
+
+  void UpdateBand(POINT client) {
+    RECT rc;
+    GetClientRect(grid, &rc);
+    // 上下の端の外へ出たら少しずつ送る
+    if (client.y < HeaderH()) ScrollTo(scrollY - Px(24));
+    else if (client.y > rc.bottom) ScrollTo(scrollY + Px(24));
+    bandTo = {client.x, client.y + scrollY};
+    if (abs(bandTo.x - bandFrom.x) > Px(4) || abs(bandTo.y - bandFrom.y) > Px(4)) bandMoved = true;
+    if (!bandMoved) return;
+    multi = true;  // 囲んでいる間も選んだものを見せる
+    RECT band = BandRect(), tmp;
+    int first = -1;
+    for (int i = 0; i < int(items.size()); i++) {
+      RECT cell = CellRect(i);
+      bool in = IntersectRect(&tmp, &band, &cell) != 0;
+      items[size_t(i)].picked = (i < int(bandBase.size()) && bandBase[size_t(i)]) || in;
+      if (in && first < 0) first = i;
+    }
+    if (first >= 0 && !IsPicked(sel)) {
+      sel = first;
+      anchor = first;
+    }
+    InvalidateRect(grid, nullptr, FALSE);
+  }
+
+  void PaintBand(HDC dc) {
+    if (!banding || !bandMoved) return;
+    RECT r = BandRect();
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    // 半透明の青
+    HDC src = CreateCompatibleDC(dc);
+    BITMAPINFO bi = {};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), 1, 1, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HBITMAP one = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (one && bits) {
+      *static_cast<uint32_t*>(bits) = 0xFF0078D7;  // 0xAARRGGBB: RGB(0, 120, 215)
+      HGDIOBJ old = SelectObject(src, one);
+      BLENDFUNCTION bf = {AC_SRC_OVER, 0, 48, 0};
+      AlphaBlend(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, src, 0, 0, 1, 1, bf);
+      SelectObject(src, old);
+    }
+    if (one) DeleteObject(one);
+    DeleteDC(src);
+    Frame(dc, r, RGB(0, 120, 215));
+  }
 
   void NotifySelected() {
     const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
@@ -928,9 +1055,43 @@ class ExplorerImpl {
     Navigate(parent, from);
   }
 
+  // いくつも選んでいる時の右クリックのメニュー
+  void MultiMenu(const std::vector<int>& picked, POINT screen) {
+    size_t images = 0;
+    for (int k : picked) images += items[size_t(k)].image;
+    const std::wstring n = std::to_wstring(picked.size()), ni = std::to_wstring(images);
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, MENU_COPY, (L"パスをコピー（" + n + L" 個）(&C)").c_str());
+    AppendMenuW(menu, MF_STRING, MENU_SHOW, L"エクスプローラーで表示(&E)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    UINT on = images ? MF_STRING : MF_STRING | MF_GRAYED;
+    AppendMenuW(menu, on, MENU_SAVE_SMART, (L"選んだ画像（" + ni + L" 枚）をスマートフォルダに保存(&M)...").c_str());
+    AppendMenuW(menu, on, MENU_BULK_TAG, (L"選んだ画像（" + ni + L" 枚）にタグを付ける・外す(&T)...").c_str());
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+    switch (cmd) {
+      case MENU_COPY: {
+        std::wstring text;
+        for (int k : picked) text += (text.empty() ? L"" : L"\r\n") + items[size_t(k)].path;
+        CopyText(text);
+        break;
+      }
+      case MENU_SHOW: ShowInShell(SelectedPath()); break;
+      case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
+      case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
+    }
+  }
+
   // 右クリックのメニュー
   void ContextMenu(int i, POINT screen) {
     if (i < 0 || i >= int(items.size())) return;
+    {
+      auto picked = PickedIndices();
+      if (picked.size() > 1 && IsPicked(i)) {
+        MultiMenu(picked, screen);
+        return;
+      }
+    }
     const Item& it = items[size_t(i)];
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_OPEN, L"開く(&O)");
@@ -941,6 +1102,9 @@ class ExplorerImpl {
       AppendMenuW(menu, MF_STRING, MENU_SAME, L"同じ画像を探す(&S)");
       AppendMenuW(menu, MF_STRING, MENU_SIMILAR_AI, L"似た画像を探す（AI）(&A)");
       AppendMenuW(menu, MF_STRING, MENU_RELOOKUP, L"出典を調べ直す(&L)");
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, MENU_SAVE_SMART, L"スマートフォルダに保存(&M)...");
+      AppendMenuW(menu, MF_STRING, MENU_BULK_TAG, L"タグを付ける・外す(&T)...");
     }
     if (it.dir && it.state != kStateIndexed) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -956,6 +1120,8 @@ class ExplorerImpl {
       case MENU_SAME: host->ExplorerFindSameFile(path); break;
       case MENU_SIMILAR_AI: host->ExplorerFindSimilarAi(path); break;
       case MENU_RELOOKUP: host->ExplorerRelookup(path); break;
+      case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
+      case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
       case MENU_ADD_ROOT:
         host->ExplorerAddRoot(path);
         RefreshStates();
@@ -1020,6 +1186,11 @@ class ExplorerImpl {
     if (items.empty()) return;
     int old = sel;
     sel = std::max(0, std::min(i, int(items.size()) - 1));
+    anchor = sel;
+    if (multi) {
+      multi = false;
+      if (preview) InvalidateRect(preview, nullptr, FALSE);
+    }
     EnsureVisible(sel);
     InvalidateRect(grid, nullptr, FALSE);
     UpdatePreview();
@@ -1517,9 +1688,9 @@ class ExplorerImpl {
       if (row.bottom < HeaderH()) continue;
       if (row.top > rc.bottom) break;
       const Item& it = items[size_t(i)];
-      if (i == sel || i == hover) {
-        Fill(dc, row, i == sel ? RGB(204, 232, 255) : RGB(229, 243, 255));
-        if (i == sel) Frame(dc, row, RGB(153, 209, 255));
+      if (IsPicked(i) || i == hover) {
+        Fill(dc, row, IsPicked(i) ? RGB(204, 232, 255) : RGB(229, 243, 255));
+        if (IsPicked(i)) Frame(dc, row, i == sel ? RGB(0, 120, 215) : RGB(153, 209, 255));
       }
       // 名前: 小さいアイコンと名前
       HICON icon = IconFor(it);
@@ -1586,9 +1757,9 @@ class ExplorerImpl {
       if (cell.top > rc.bottom) break;
       const Item& it = items[size_t(i)];
       RECT inner = {cell.left + Px(2), cell.top + Px(2), cell.right - Px(2), cell.bottom - Px(2)};
-      if (i == sel || i == hover) {
-        Fill(dc, inner, i == sel ? RGB(204, 232, 255) : RGB(229, 243, 255));
-        if (i == sel) Frame(dc, inner, RGB(153, 209, 255));
+      if (IsPicked(i) || i == hover) {
+        Fill(dc, inner, IsPicked(i) ? RGB(204, 232, 255) : RGB(229, 243, 255));
+        if (IsPicked(i)) Frame(dc, inner, i == sel && multi ? RGB(0, 120, 215) : RGB(153, 209, 255));
       }
       RECT box = {cell.left + Pad(), cell.top + Pad(), cell.left + Pad() + ts, cell.top + Pad() + ts};
       const Thumb* t = CachedThumb(it);
@@ -1731,6 +1902,10 @@ class ExplorerImpl {
       if (!info.empty()) info += L"\n";
       info += s;
     };
+    if (multi) {
+      const size_t n = PickedIndices().size();
+      if (n > 1) line(std::to_wstring(n) + L" 個を選んでいます");
+    }
     if (it->dir) {
       line(L"フォルダ");
     } else {
@@ -2619,6 +2794,7 @@ class ExplorerImpl {
         HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
         HGDIOBJ old = SelectObject(buf, bmp);
         Paint(buf, rc);
+        PaintBand(buf);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
         SelectObject(buf, old);
         DeleteObject(bmp);
@@ -2667,6 +2843,10 @@ class ExplorerImpl {
         return 0;
       }
       case WM_MOUSEMOVE: {
+        if (banding) {
+          UpdateBand(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+          return 0;
+        }
         if (!tracking) {
           TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, grid, 0};
           TrackMouseEvent(&tme);
@@ -2695,9 +2875,54 @@ class ExplorerImpl {
           return 0;
         }
         int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (h >= 0) Select(h);
+        bool ctrl = (wp & MK_CONTROL) != 0, shift = (wp & MK_SHIFT) != 0;
+        if (h >= 0) {
+          // 右クリックは、選んでいるものの上なら選び方を変えない (選んだものに対するメニュー)
+          if (msg == WM_RBUTTONDOWN && IsPicked(h)) {
+            if (h != sel) {
+              sel = h;
+              InvalidateRect(grid, nullptr, FALSE);
+              UpdatePreview();
+              NotifySelected();
+            }
+          } else {
+            SelectWith(h, msg == WM_LBUTTONDOWN && ctrl, msg == WM_LBUTTONDOWN && shift);
+          }
+        } else if (msg == WM_LBUTTONDOWN && !items.empty()) {
+          // 空いている所から: 枠で囲んで選ぶ
+          banding = true;
+          bandMoved = false;
+          bandFrom = bandTo = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp) + scrollY};
+          bandBase.assign(items.size(), 0);
+          if (ctrl)
+            for (int i = 0; i < int(items.size()); i++) bandBase[size_t(i)] = IsPicked(i);
+          SetCapture(grid);
+        }
         return 0;
       }
+      case WM_LBUTTONUP:
+        if (banding) {
+          banding = false;
+          ReleaseCapture();
+          if (bandMoved) {
+            multi = true;
+            if (!IsPicked(sel)) {
+              auto picked = PickedIndices();
+              sel = picked.empty() ? sel : picked.front();
+            }
+            InvalidateRect(grid, nullptr, FALSE);
+            UpdatePreview();
+            if (preview) InvalidateRect(preview, nullptr, FALSE);
+            NotifySelected();
+          }
+        }
+        return 0;
+      case WM_CAPTURECHANGED:
+        if (banding) {
+          banding = false;
+          InvalidateRect(grid, nullptr, FALSE);
+        }
+        return 0;
       case WM_RBUTTONUP: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int h = HitTest(pt);
@@ -2717,26 +2942,45 @@ class ExplorerImpl {
         if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) Back();
         else Forward();
         return TRUE;
-      case WM_GETDLGCODE:
+      case WM_GETDLGCODE: {
+        // いくつも選んでいる時の Esc (選ぶのをやめる) は、ダイアログの「キャンセル」にしない
+        const MSG* m = reinterpret_cast<const MSG*>(lp);
+        if (m && m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE && multi)
+          return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB | DLGC_WANTMESSAGE;
         return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB;
+      }
       case WM_KEYDOWN: {
         bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0;
         int cols = Cols();
         RECT rc;
         GetClientRect(grid, &rc);
         int page = std::max(1, int(rc.bottom / CellH())) * cols;
+        bool shift = GetKeyState(VK_SHIFT) < 0;
+        auto go = [&](int i) { SelectWith(i, false, shift); };  // Shift を押していれば範囲を選ぶ
         switch (wp) {
-          case VK_LEFT: Select(sel - 1); return 0;
-          case VK_RIGHT: Select(sel + 1); return 0;
+          case VK_LEFT: go(sel - 1); return 0;
+          case VK_RIGHT: go(sel + 1); return 0;
           case VK_UP:
             if (alt) Up();
-            else Select(sel - cols);
+            else go(sel - cols);
             return 0;
-          case VK_DOWN: Select(sel + cols); return 0;
-          case VK_PRIOR: Select(sel - page); return 0;
-          case VK_NEXT: Select(sel + page); return 0;
-          case VK_HOME: Select(0); return 0;
-          case VK_END: Select(int(items.size()) - 1); return 0;
+          case VK_DOWN: go(sel + cols); return 0;
+          case VK_PRIOR: go(sel - page); return 0;
+          case VK_NEXT: go(sel + page); return 0;
+          case VK_HOME: go(0); return 0;
+          case VK_END: go(int(items.size()) - 1); return 0;
+          case 'A':
+            if (ctrl) {
+              SelectAll();
+              return 0;
+            }
+            break;
+          case VK_ESCAPE:
+            if (multi) {
+              Select(sel);
+              return 0;
+            }
+            break;
           case VK_RETURN: Open(sel); return 0;
           case VK_BACK: Up(); return 0;
           case VK_F5: Load(dir, SelectedPath()); return 0;
@@ -2962,6 +3206,10 @@ HWND Explorer::Window() const { return impl_->hwnd; }
 std::wstring Explorer::Dir() const { return impl_->dir; }
 
 std::wstring Explorer::Selected() const { return impl_->SelectedPath(); }
+
+std::vector<std::wstring> Explorer::SelectedPaths() const { return impl_->SelectedPaths(); }
+
+bool Explorer::ShowingList() const { return impl_->listMode; }
 
 void Explorer::RefreshStates() { impl_->RefreshStates(); }
 
