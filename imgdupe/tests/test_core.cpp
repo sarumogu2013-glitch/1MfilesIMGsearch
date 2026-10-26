@@ -2559,6 +2559,49 @@ static void testTagNames() {
     CHECK(builtin.size() > 10000 && tags.size() == builtin.size() && jas.size() == builtin.size());
 }
 
+static void testClusterResults() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-cluster-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files;
+    for (int i = 0; i < 6; ++i) files.push_back({"C:\\p\\" + std::to_string(i) + ".jpg", 100 + i, 1});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int i) { return ids["C:\\p\\" + std::to_string(i) + ".jpg"]; };
+    auto group = [&](const char* kind, std::vector<int> members) {
+        Stmt g(db.handle(), "INSERT INTO groups(kind, created) VALUES(?, 0)");
+        g.bind(1, std::string(kind));
+        g.step();
+        Stmt last(db.handle(), "SELECT last_insert_rowid()");
+        last.step();
+        const int64_t gid = last.i64(0);
+        for (int m : members) {
+            Stmt st(db.handle(), "INSERT INTO group_members(group_id, image_id) VALUES(?, ?)");
+            st.bind(1, gid).bind(2, I(m));
+            st.step();
+        }
+    };
+    group("exact", {1, 3});
+    group("variant", {3, 5});  // 1・3・5 は 1 つの束に
+    group("query", {0, 2});     // 1 枚で検索のまとまりは使わない
+    const std::vector<int64_t> res = {I(0), I(5), I(1), I(2), I(3), I(4)};
+    const auto c = clusterResults(db, res);
+    CHECK(c.size() == 4 && c[0] == std::vector<size_t>({0}) && c[1] == std::vector<size_t>({1, 2, 4}) && c[2] == std::vector<size_t>({3}) &&
+          c[3] == std::vector<size_t>({5}));
+    CHECK(imageCount(db) == 6);
+    setStage(db, I(0), stage::kHash, StageState::Done, kHashVersion);
+    setStage(db, I(1), stage::kHash, StageState::Failed, kHashVersion);
+    setStage(db, I(2), stage::kHash, StageState::Done, kHashVersion + 1);  // 別の版は数えない
+    const StageCount sc = stageCount(db, stage::kHash, kHashVersion);
+    CHECK(sc.done == 1 && sc.failed == 1);
+    const auto props = imageProperties(db, I(2));
+    CHECK(!props.empty() && props[0].first == "パス" && props[0].second == "C:\\p\\2.jpg");
+    bool exact = false;
+    for (const auto& [k, v] : imageProperties(db, I(1))) exact = exact || (k == "完全一致" && v == "1 枚");
+    CHECK(exact);
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2589,6 +2632,7 @@ int main() {
     testSameImage();
     testFreeSearch();
     testTagNames();
+    testClusterResults();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

@@ -225,6 +225,7 @@ struct App {
     std::set<std::string> uncheckedSources;  // 外した出どころ
     std::unordered_map<std::string, std::string> tagNames;  // タグ（小文字）→ 日本語の表示名
     bool tagJapanese = true;                                // タグを日本語で出す（imgdupe.ini の tagJapanese）
+    std::wstring reselectPath;       // 次の検索の結果で選ぶ画像（タグをクリックして探した時に選んでいた画像）
     std::vector<int64_t> idsFilter;  // 検索の条件の「選んだ画像」（選んだ画像を保存したスマートフォルダを開いた時）
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
@@ -280,7 +281,7 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerSelected(const std::wstring& path, bool image) override;
     void ExplorerFindSameFile(const std::wstring& path) override;
     void ExplorerFindSameUrl(const std::wstring& url) override;
-    void ExplorerAddRoot(const std::wstring& dir) override;
+    void ExplorerAddRoots(const std::vector<std::wstring>& dirs) override;
     void ExplorerSettingsChanged(const ExplorerSettings& s) override;
     std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
     std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) override;
@@ -289,6 +290,7 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerRelookup(const std::wstring& path) override;
     std::wstring ExplorerTagLabel(const std::wstring& tag) override;
     void ExplorerRenameTag(const std::wstring& tag) override;
+    std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) override;
     void ExplorerSaveSelection() override;
     void ExplorerTagSelection() override;
 } ex;
@@ -1285,6 +1287,7 @@ struct SearchDone {
     bool clip = false;  // 内容（CLIP）で似ている順に上位だけ
     std::vector<float> scores;
     std::vector<std::wstring> paths;  // ids と同じ並び
+    std::vector<std::vector<size_t>> clusters;  // 重複・差分のまとまり（ids の添字の束）
 };
 
 constexpr size_t kFirstResults = 2000;  // 内容（CLIP）で似ている順に出す数
@@ -1504,6 +1507,8 @@ void runSearch() {
                 done->paths.push_back(st.step() ? widen(st.text(0)) : std::wstring());
                 st.reset();
             }
+            // 重複・差分はまとめて出す（確認キューは 1 枚ずつ確かめるのでまとめない）
+            if (!q.review) done->clusters = clusterResults(d, done->result.ids);
         } catch (const std::exception& e) {
             done->error = widen(e.what());
         }
@@ -1545,11 +1550,30 @@ void onSearched(SearchDone* p) {
     std::wstring what = editText(app.s.free);
     if (what.empty() && !app.idsFilter.empty()) what = L"保存した画像";
     if (what.empty()) what = done->clip ? (app.similarTo ? app.similarLabel : editText(app.s.clip)) : L"条件";
-    std::vector<std::wstring> paths;
-    for (const auto& pth : app.searchPaths)
-        if (!pth.empty()) paths.push_back(pth);
-    ex.view->ShowList(L"検索: " + what + L"（" + count + L"）", std::move(paths), app.reselect);
+    // 選び直す画像: タグをクリックして探した時はその時に選んでいた画像、タグを変えた後は同じ位置の画像
+    int reselect = app.reselect;
+    if (!app.reselectPath.empty()) {
+        reselect = -1;
+        for (size_t i = 0; i < app.searchPaths.size(); ++i)
+            if (lstrcmpiW(app.searchPaths[i].c_str(), app.reselectPath.c_str()) == 0) reselect = static_cast<int>(i);
+    }
+    std::vector<std::vector<size_t>> clusters = std::move(done->clusters);
+    if (clusters.empty())
+        for (size_t i = 0; i < app.searchPaths.size(); ++i) clusters.push_back({i});
+    std::vector<std::vector<std::wstring>> entries;
+    int select = -1;
+    for (const auto& c : clusters) {
+        std::vector<std::wstring> members;
+        for (size_t i : c) {
+            if (i >= app.searchPaths.size() || app.searchPaths[i].empty()) continue;
+            if (static_cast<int>(i) == reselect) select = static_cast<int>(entries.size());
+            members.push_back(app.searchPaths[i]);
+        }
+        if (!members.empty()) entries.push_back(std::move(members));
+    }
+    ex.view->ShowList(L"検索: " + what + L"（" + count + L"）", std::move(entries), select);
     app.reselect = -1;
+    app.reselectPath.clear();
 }
 
 const ImageInfo* resultInfo(int item) {
@@ -3441,6 +3465,7 @@ void ExplorerApp::ExplorerSearchTags(const std::vector<std::wstring>& tags) {
         }
         text += (text.empty() ? L"" : L" ") + word;
     }
+    app.reselectPath = ex.view ? ex.view->Selected() : L"";  // 結果ではこの画像を選ぶ（あれば）
     if (app.tab != 1) switchTab(1);
     SetWindowTextW(app.s.free, text.c_str());
     ComboBox_SetCurSel(app.s.scope, 1);  // タグに限る（名前どおり）
@@ -3494,6 +3519,22 @@ void refreshTagLabels() {
 }
 
 void ExplorerApp::ExplorerSaveSelection() { saveSelectionSmartUi(); }
+
+std::vector<std::pair<std::wstring, std::wstring>> ExplorerApp::ExplorerProperties(const std::wstring& path) {
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    Db* db = uiDb();
+    if (!db) return out;
+    try {
+        std::vector<std::string> roots;
+        for (const auto& f : folderList()) roots.push_back(narrow(f));
+        const int64_t id = findImageId(*db, narrow(path), roots);
+        if (!id) return out;
+        for (auto& [k, v] : imageProperties(*db, id, [](int64_t t) { return narrow(localTimeText(t)); }))
+            out.emplace_back(widen(k), widen(v));
+    } catch (const std::exception&) {
+    }
+    return out;
+}
 
 void ExplorerApp::ExplorerTagSelection() { bulkTagUi(); }
 
@@ -3550,8 +3591,8 @@ void ExplorerApp::ExplorerFindSameUrl(const std::wstring& url) {
     }).detach();
 }
 
-void ExplorerApp::ExplorerAddRoot(const std::wstring& dir) {
-    addFolder(dir);
+void ExplorerApp::ExplorerAddRoots(const std::vector<std::wstring>& dirs) {
+    for (const auto& d : dirs) addFolder(d);
     saveSettings();  // バックグラウンドの解析の roots にもなる
     if (!indexer::isRunning()) indexer::start();
     else if (Db* db = uiDb()) addCommand(*db, "rescan");
@@ -3572,6 +3613,7 @@ void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
     put(L"viewMode", s.viewMode);
     put(L"sortKey", s.sortKey);
     put(L"sortDesc", s.sortDesc ? 1 : 0);
+    put(L"previewMode", s.previewMode);
     // 取り置いたタグ（タブで区切る）。ini はシステムの文字コードなので、どの文字でも残せる DB に持つ
     std::string tray;
     for (const auto& t : s.tray) tray += (tray.empty() ? "" : "\t") + narrow(t);
@@ -3599,6 +3641,7 @@ ExplorerSettings loadExplorerSettings() {
     s.viewMode = get(L"viewMode", s.viewMode);
     s.sortKey = get(L"sortKey", s.sortKey);
     s.sortDesc = get(L"sortDesc", 0) != 0;
+    s.previewMode = std::clamp(get(L"previewMode", s.previewMode), 0, 2);
     std::string tray;
     if (Db* db = uiDb()) {
         try {

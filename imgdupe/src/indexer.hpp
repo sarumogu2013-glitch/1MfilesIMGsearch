@@ -55,6 +55,14 @@ struct IndexCallbacks {
 
 enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Quality, Lookup, Merge, Done };
 
+// 「総合」の進み具合（タスクトレイの状況の窓）: DB の画像の数と、段階ごとにその版で済んだ数
+struct StageCount {
+    int64_t done = 0;    // 済んだ
+    int64_t failed = 0;  // 読めなかった・失敗（もう一度はしない）
+};
+int64_t imageCount(Db& db);
+StageCount stageCount(Db& db, const std::string& stage, int version);
+
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
     Progress prog;

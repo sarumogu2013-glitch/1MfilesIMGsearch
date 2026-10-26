@@ -18,9 +18,13 @@
 #include <mutex>
 #include <thread>
 
+#include "clip.hpp"
 #include "db.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
+#include "meta.hpp"
+#include "names.hpp"
+#include "quality.hpp"
 #include "links.hpp"
 #include "clip_win.hpp"
 #include "lookup_win.hpp"
@@ -38,6 +42,8 @@ namespace {
 
 constexpr wchar_t kMutexName[] = L"Local\\imgdupe-indexer";
 constexpr wchar_t kClass[] = L"ImgdupeIndexer";
+constexpr wchar_t kPopupClass[] = L"ImgdupeIndexerStatus";
+constexpr UINT_PTR kPopupTimer = 2;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"imgdupe-indexer";
 constexpr UINT WM_TRAY = WM_APP + 1;
@@ -82,6 +88,19 @@ struct Resident {
     std::wstring waitReason;                   // 止めている理由（m で守る）
     std::wstring taggerDevice;                 // タガーを動かしている所（GPU / CPU。m で守る）
     std::atomic<int> load{kLoadLight};         // 負荷（imgdupe.ini の indexerLoad。回のはじめに読む）
+
+    // タスクトレイのアイコンをクリックした時の状況の窓
+    HWND popup = nullptr;
+    int popupView = 0;                          // 0 = 新規作成中、1 = 総合
+    std::vector<std::pair<RECT, int>> popupTabs;
+    struct OverallRow {
+        std::wstring name;
+        StageCount count;
+    };
+    std::vector<OverallRow> overall;            // 総合（m で守る）
+    int64_t overallImages = -1;                 // DB の画像の数（-1 = まだ数えていない。m で守る）
+    ULONGLONG overallAt = 0;                    // 最後に数えた時刻
+    std::atomic<bool> counting{false};
 };
 
 Resident* g = nullptr;
@@ -403,6 +422,326 @@ std::wstring statusText() {
     return last.empty() ? L"待機中" : last;
 }
 
+// ---------------------------------------------------------------- 状況の窓
+
+int popupPx(int v) {
+    static const int dpi = [] {
+        HDC dc = GetDC(nullptr);
+        const int d = GetDeviceCaps(dc, LOGPIXELSX);
+        ReleaseDC(nullptr, dc);
+        return d;
+    }();
+    return MulDiv(v, dpi, 96);
+}
+
+const wchar_t* phaseName(IndexPhase p) {
+    switch (p) {
+        case IndexPhase::Scan: return L"フォルダを調べる";
+        case IndexPhase::Hash: return L"ハッシュ";
+        case IndexPhase::Thumb: return L"サムネイル";
+        case IndexPhase::Meta: return L"メタデータ";
+        case IndexPhase::Names: return L"json・フォルダ名";
+        case IndexPhase::Tagger: return L"タグ付け（WD14）";
+        case IndexPhase::Clip: return L"CLIP";
+        case IndexPhase::Variants: return L"差分のまとまり";
+        case IndexPhase::Quality: return L"品質";
+        case IndexPhase::Lookup: return L"出典の照会";
+        case IndexPhase::Merge: return L"仕上げ（辞書・親子関係）";
+        default: return L"";
+    }
+}
+
+// 総合の数を別のスレッドで数える（数秒ごと）
+void countOverall() {
+    if (g->counting.exchange(true)) return;
+    std::thread([] {
+        std::vector<Resident::OverallRow> rows;
+        int64_t images = -1;
+        try {
+            Db db;
+            if (db.open(dbFileOf(g->dataDir))) {
+                images = imageCount(db);
+                rows.push_back({L"ハッシュ", stageCount(db, stage::kHash, kHashVersion)});
+                rows.push_back({L"サムネイル", stageCount(db, stage::kThumb, kThumbVersion)});
+                rows.push_back({L"メタデータ", stageCount(db, stage::kMeta, kMetaVersion)});
+                rows.push_back({L"json・フォルダ名", stageCount(db, kStageNames, kNamesVersion)});
+                if (const int tv = tagger::stageVersion(g->dataDir)) rows.push_back({L"タグ付け（WD14）", stageCount(db, stage::kTagger, tv)});
+                if (const int cv = clip::stageVersion(g->dataDir)) rows.push_back({L"CLIP", stageCount(db, kStageClip, cv)});
+                if (clip::qualityEnabled(g->dataDir)) rows.push_back({L"品質", stageCount(db, kStageQuality, kQualityVersion)});
+            }
+        } catch (const std::exception&) {
+        }
+        {
+            std::lock_guard<std::mutex> lock(g->m);
+            g->overall = std::move(rows);
+            g->overallImages = images;
+            g->overallAt = GetTickCount64();
+        }
+        g->counting = false;
+        if (g->popup) InvalidateRect(g->popup, nullptr, FALSE);
+    }).detach();
+}
+
+void fillRect(HDC dc, RECT r, COLORREF c) {
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+
+// 進み具合の棒
+void drawBar(HDC dc, RECT r, double ratio, COLORREF color) {
+    fillRect(dc, r, RGB(226, 230, 236));
+    RECT f = r;
+    f.right = r.left + static_cast<LONG>((r.right - r.left) * std::clamp(ratio, 0.0, 1.0));
+    if (f.right > f.left) fillRect(dc, f, color);
+}
+
+void paintPopup(HDC dc, const RECT& rc) {
+    fillRect(dc, rc, RGB(250, 251, 253));
+    SetBkMode(dc, TRANSPARENT);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
+    LOGFONTW bl = ncm.lfMessageFont;
+    bl.lfWeight = FW_BOLD;
+    HFONT bold = CreateFontIndirectW(&bl);
+    HGDIOBJ oldFont = SelectObject(dc, bold);
+    const int m = popupPx(12);
+    int y = m;
+    RECT tr = {m, y, rc.right - m, y + popupPx(20)};
+    SetTextColor(dc, RGB(30, 30, 30));
+    DrawTextW(dc, L"インデックスの作成状況", -1, &tr, DT_LEFT | DT_SINGLELINE);
+    y += popupPx(26);
+    // 切り替え
+    SelectObject(dc, font);
+    g->popupTabs.clear();
+    {
+        int x = m;
+        const wchar_t* names[] = {L"新規作成中", L"総合"};
+        for (int k = 0; k < 2; ++k) {
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, names[k], static_cast<int>(wcslen(names[k])), &sz);
+            RECT r = {x, y, x + sz.cx + popupPx(20), y + popupPx(24)};
+            const bool on = g->popupView == k;
+            HBRUSH b = CreateSolidBrush(on ? RGB(0, 100, 220) : RGB(255, 255, 255));
+            HPEN pen = CreatePen(PS_SOLID, 1, on ? RGB(0, 100, 220) : RGB(180, 180, 180));
+            HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, pen);
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, popupPx(12), popupPx(12));
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(b);
+            DeleteObject(pen);
+            SetTextColor(dc, on ? RGB(255, 255, 255) : RGB(60, 60, 60));
+            DrawTextW(dc, names[k], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            g->popupTabs.push_back({r, k});
+            x = r.right + popupPx(6);
+        }
+    }
+    y += popupPx(34);
+    std::wstring wait, last, device;
+    {
+        std::lock_guard<std::mutex> lock(g->m);
+        wait = g->waitReason;
+        last = g->lastResult;
+        device = g->taggerDevice;
+    }
+    auto text = [&](const std::wstring& s, COLORREF c, UINT flags = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX) {
+        RECT r = {m, y, rc.right - m, rc.bottom - m};
+        RECT calc = r;
+        DrawTextW(dc, s.c_str(), -1, &calc, flags | DT_CALCRECT);
+        SetTextColor(dc, c);
+        DrawTextW(dc, s.c_str(), -1, &r, flags);
+        y += static_cast<int>(calc.bottom - calc.top) + popupPx(4);
+    };
+    if (g->popupView == 0) {
+        const bool running = g->running;
+        const std::wstring state = g->paused ? L"一時停止中" : running ? L"処理中" : !wait.empty() ? L"待機中（" + wait + L"）" : L"待機中（フォルダが変われば調べます）";
+        text(L"状態: " + state, RGB(30, 30, 30));
+        text(L"負荷: " + std::wstring(loadLevelName(loadLevel(g->dataDir))), RGB(90, 90, 90));
+        y += popupPx(4);
+        if (running) {
+            const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
+            const uint64_t done = g->prog.prog.done, total = g->prog.prog.total;
+            SelectObject(dc, bold);
+            std::wstring now = phaseName(phase);
+            if ((phase == IndexPhase::Tagger || phase == IndexPhase::Clip) && !device.empty()) now += L"（" + device + L"）";
+            text(now, RGB(30, 30, 30));
+            SelectObject(dc, font);
+            if (phase != IndexPhase::Scan && total) {
+                drawBar(dc, {m, y, rc.right - m, y + popupPx(10)}, double(done) / double(total), RGB(0, 120, 215));
+                y += popupPx(14);
+                wchar_t t[96];
+                swprintf(t, 96, L"%llu / %llu 枚（%.0f%%）", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total),
+                         100.0 * double(done) / double(total));
+                text(t, RGB(60, 60, 60));
+            } else if (phase == IndexPhase::Scan) {
+                text(std::to_wstring(total) + L" 枚見つけました", RGB(60, 60, 60));
+            }
+            // 段階の並び（済んだもの・今・まだ）
+            y += popupPx(4);
+            const IndexPhase order[] = {IndexPhase::Scan, IndexPhase::Hash, IndexPhase::Thumb, IndexPhase::Meta, IndexPhase::Names,
+                                        IndexPhase::Tagger, IndexPhase::Clip, IndexPhase::Variants, IndexPhase::Quality,
+                                        IndexPhase::Lookup, IndexPhase::Merge};
+            for (IndexPhase p : order) {
+                const bool cur = p == phase, past = static_cast<int>(p) < static_cast<int>(phase);
+                RECT r = {m, y, rc.right - m, y + popupPx(18)};
+                SetTextColor(dc, cur ? RGB(0, 100, 220) : past ? RGB(40, 140, 60) : RGB(150, 150, 150));
+                const std::wstring line = std::wstring(cur ? L"▶ " : past ? L"✓ " : L"・ ") + phaseName(p);
+                DrawTextW(dc, line.c_str(), -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+                y += popupPx(18);
+            }
+        } else {
+            text(last.empty() ? L"まだ新しく作るものはありません" : L"前回: " + last, RGB(60, 60, 60));
+        }
+    } else {
+        int64_t images;
+        std::vector<Resident::OverallRow> rows;
+        {
+            std::lock_guard<std::mutex> lock(g->m);
+            images = g->overallImages;
+            rows = g->overall;
+        }
+        if (images < 0) {
+            text(L"数えています…", RGB(90, 90, 90));
+        } else {
+            SelectObject(dc, bold);
+            text(L"画像 " + std::to_wstring(images) + L" 枚", RGB(30, 30, 30));
+            SelectObject(dc, font);
+            const int nameW = popupPx(120);
+            for (const auto& row : rows) {
+                const int64_t finished = row.count.done + row.count.failed;
+                const double ratio = images > 0 ? double(finished) / double(images) : 0.0;
+                RECT nr = {m, y, m + nameW, y + popupPx(18)};
+                SetTextColor(dc, RGB(50, 50, 50));
+                DrawTextW(dc, row.name.c_str(), -1, &nr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+                drawBar(dc, {m + nameW, y + popupPx(5), rc.right - m - popupPx(56), y + popupPx(13)}, ratio,
+                        finished >= images ? RGB(40, 150, 70) : RGB(0, 120, 215));
+                wchar_t pct[16];
+                swprintf(pct, 16, L"%.0f%%", 100.0 * ratio);
+                RECT pr = {rc.right - m - popupPx(50), y, rc.right - m, y + popupPx(18)};
+                DrawTextW(dc, pct, -1, &pr, DT_RIGHT | DT_SINGLELINE);
+                y += popupPx(18);
+                wchar_t detail[96];
+                if (row.count.failed)
+                    swprintf(detail, 96, L"%lld / %lld 枚（読めなかったもの %lld）", static_cast<long long>(row.count.done),
+                             static_cast<long long>(images), static_cast<long long>(row.count.failed));
+                else
+                    swprintf(detail, 96, L"%lld / %lld 枚", static_cast<long long>(row.count.done), static_cast<long long>(images));
+                RECT dr = {m + nameW, y, rc.right - m, y + popupPx(16)};
+                SetTextColor(dc, RGB(120, 120, 120));
+                DrawTextW(dc, detail, -1, &dr, DT_LEFT | DT_SINGLELINE);
+                y += popupPx(20);
+            }
+        }
+    }
+    // 下に操作の説明
+    RECT hr = {m, rc.bottom - m - popupPx(16), rc.right - m, rc.bottom - m};
+    SetTextColor(dc, RGB(140, 140, 140));
+    DrawTextW(dc, L"右クリックでメニュー、ダブルクリックで imgdupe を開く", -1, &hr, DT_LEFT | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+    DeleteObject(bold);
+}
+
+void showMenu();
+void openGui();
+
+LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HDC buf = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
+            HGDIOBJ old = SelectObject(buf, bmp);
+            paintPopup(buf, rc);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+            SelectObject(buf, old);
+            DeleteObject(bmp);
+            DeleteDC(buf);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (wp == kPopupTimer) {
+                if (g->popupView == 1 && GetTickCount64() - g->overallAt > 5000) countOverall();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONDOWN: {
+            POINT pt = {static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+            for (const auto& [r, view] : g->popupTabs)
+                if (PtInRect(&r, pt) && g->popupView != view) {
+                    g->popupView = view;
+                    WritePrivateProfileStringW(L"imgdupe", L"indexerPopupView", std::to_wstring(view).c_str(),
+                                               (g->dataDir + L"\\imgdupe.ini").c_str());
+                    if (view == 1) countOverall();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            return 0;
+        }
+        case WM_LBUTTONDBLCLK:
+            ShowWindow(hwnd, SW_HIDE);
+            openGui();
+            return 0;
+        case WM_RBUTTONUP:
+            showMenu();
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wp) == WA_INACTIVE) ShowWindow(hwnd, SW_HIDE);  // ほかを触ったら閉じる
+            return 0;
+        case WM_SHOWWINDOW:
+            if (wp) SetTimer(hwnd, kPopupTimer, 1000, nullptr);
+            else KillTimer(hwnd, kPopupTimer);
+            break;
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) ShowWindow(hwnd, SW_HIDE);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// アイコンの近く（画面の右下など、作業領域の中）に出す
+void togglePopup() {
+    if (!g->popup) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = popupProc;
+        wc.hInstance = g->inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.style = CS_DBLCLKS | CS_DROPSHADOW;
+        wc.lpszClassName = kPopupClass;
+        RegisterClassExW(&wc);
+        g->popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPopupClass, L"imgdupe", WS_POPUP | WS_BORDER, 0, 0, 10, 10,
+                                   nullptr, nullptr, g->inst, nullptr);
+        if (!g->popup) return;
+        g->popupView = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"imgdupe", L"indexerPopupView", 0,
+                                                                         (g->dataDir + L"\\imgdupe.ini").c_str())),
+                                  0, 1);
+    }
+    if (IsWindowVisible(g->popup)) {
+        ShowWindow(g->popup, SW_HIDE);
+        return;
+    }
+    const int w = popupPx(380), h = popupPx(400);
+    POINT pt;
+    GetCursorPos(&pt);
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(mon, &mi)) work = mi.rcWork;
+    const int x = std::clamp(static_cast<int>(pt.x - w / 2), static_cast<int>(work.left), static_cast<int>(work.right - w));
+    const int y = pt.y > (work.top + work.bottom) / 2 ? static_cast<int>(work.bottom - h - popupPx(8)) : static_cast<int>(work.top + popupPx(8));
+    SetWindowPos(g->popup, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    SetForegroundWindow(g->popup);
+    if (g->popupView == 1) countOverall();
+    InvalidateRect(g->popup, nullptr, FALSE);
+}
+
 void updateTip() {
     const std::wstring tip = L"imgdupe（バックグラウンドの解析）\n" + statusText();
     lstrcpynW(g->nid.szTip, tip.c_str(), ARRAYSIZE(g->nid.szTip));
@@ -478,7 +817,11 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_TRAY:
             if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) showMenu();
-            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) openGui();
+            else if (LOWORD(lp) == WM_LBUTTONUP) togglePopup();  // クリックで状況の窓
+            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
+                if (g->popup) ShowWindow(g->popup, SW_HIDE);
+                openGui();
+            }
             return 0;
         case WM_TIMER:
             if (wp == kTipTimer) updateTip();
@@ -500,16 +843,17 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
-    HANDLE mutex = nullptr;
-    // 起動し直しの時は、古い版が終わるまで最大 60 秒待つ
-    for (int i = 0; i < (waitForOld ? 60 : 1); ++i) {
-        mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-        if (mutex && GetLastError() != ERROR_ALREADY_EXISTS) break;
-        if (mutex) CloseHandle(mutex);
-        mutex = nullptr;
-        if (waitForOld) Sleep(1000);
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    if (!mutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 起動し直しの時は、古い版が終わるのを待つ（古い版が長い処理の途中だと時間がかかるので最大 30 分。
+        // 待ちきれずにやめると、古い版が終わった後に何も動いていない状態になっていた）
+        const DWORD w = waitForOld ? WaitForSingleObject(mutex, 30 * 60 * 1000) : WAIT_TIMEOUT;
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+            CloseHandle(mutex);
+            return 0;  // もう動いている
+        }
     }
-    if (!mutex) return 0;  // もう動いている
     // プロセスごと優先度を決める（ONNX Runtime が作るスレッドも含めて。控えめなら CPU とディスクの優先度を下げる）
     applyProcessPriority(loadLevel(dataDir));
     Resident r;

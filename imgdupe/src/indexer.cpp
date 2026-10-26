@@ -57,6 +57,24 @@ void ThumbAnalyzer::threadEnd() {
     if (cb_.threadExit) cb_.threadExit();
 }
 
+// ---------------------------------------------------------------- 総合の進み具合
+
+int64_t imageCount(Db& db) {
+    Stmt st(db.handle(), "SELECT count(*) FROM images");
+    return st.step() ? st.i64(0) : 0;
+}
+
+StageCount stageCount(Db& db, const std::string& stage, int version) {
+    StageCount c;
+    Stmt st(db.handle(), "SELECT state, count(*) FROM stages WHERE stage=? AND version=? GROUP BY state");
+    st.bind(1, stage).bind(2, static_cast<int64_t>(version));
+    while (st.step()) {
+        if (st.i64(0) == static_cast<int64_t>(StageState::Done)) c.done = st.i64(1);
+        else if (st.i64(0) == static_cast<int64_t>(StageState::Failed)) c.failed = st.i64(1);
+    }
+    return c;
+}
+
 // ---------------------------------------------------------------- 1 回分
 
 IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexProgress& progress,

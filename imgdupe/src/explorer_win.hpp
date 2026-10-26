@@ -29,6 +29,7 @@ struct ExplorerSettings {
   int resultsView = 0;      // 同じ画像の一覧: 0 = 画像ごと、1 = フォルダごと
   int viewMode = 0;         // 0 = サムネイル、1 = 詳細（Windows のエクスプローラーの「詳細」と同じ）
   int sortKey = 0;          // 0 = 名前、1 = 更新日時、2 = 種類、3 = サイズ
+  int previewMode = 1;      // 右のプレビュー: 0 = 画像だけ、1 = タグ、2 = プロパティ
   bool sortDesc = false;
   std::vector<std::wstring> tray;  // 取り置いたタグ
 };
@@ -65,7 +66,7 @@ class ExplorerHost {
   virtual void ExplorerSelected(const std::wstring& path, bool image) = 0;     // 選んでいるものが変わった
   virtual void ExplorerFindSameFile(const std::wstring& path) = 0;             // この画像と同じ画像を探す（ドロップなど）
   virtual void ExplorerFindSameUrl(const std::wstring& url) = 0;               // URL の画像と同じ画像を探す
-  virtual void ExplorerAddRoot(const std::wstring& dir) = 0;                   // 調べるフォルダに足す
+  virtual void ExplorerAddRoots(const std::vector<std::wstring>& dirs) = 0;    // 調べるフォルダに足す（いくつも選んだ時はまとめて）
   virtual void ExplorerSettingsChanged(const ExplorerSettings& s) = 0;
   // dir の中の items（名前・フォルダか）の状態（ExplorerState）
   virtual std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) = 0;
@@ -75,6 +76,7 @@ class ExplorerHost {
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
   virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
   virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
+  virtual std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) = 0;  // 画像のプロパティ（名前と値）
   virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
   virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
 };
@@ -97,9 +99,10 @@ class Explorer {
   bool ShowingList() const;                         // 検索の結果を出している
   void RefreshStates();  // インデックスの状態を読み直す
   void RefreshTags();    // タグの表示名が変わった
-  // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ
-  // select: 選ぶもの（paths の番号。-1 なら先頭）
-  void ShowList(const std::wstring& title, std::vector<std::wstring> paths, int select = -1);
+  // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ。
+  // entries: 1 つずつの項目。2 枚以上の束は「まとまり」（重なった絵で出し、開くと中の画像の一覧）。
+  // select: 選ぶもの（entries の番号。-1 なら先頭）
+  void ShowList(const std::wstring& title, std::vector<std::vector<std::wstring>> entries, int select = -1);
   // 下の結果の一覧
   void SetSameStatus(const std::wstring& text);
   void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches);

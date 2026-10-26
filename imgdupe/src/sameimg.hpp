@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -63,6 +64,15 @@ struct SameFolder {
     std::vector<size_t> matches;  // 結果の添字
 };
 std::vector<SameFolder> groupSameByFolder(const std::vector<SameMatch>& matches);
+
+// 検索の結果を、重複（完全一致・見た目一致。最後の「重複を探す」の結果）と差分（CLIP）のまとまりでまとめる。
+// ids の添字の束を返す（束の並びは、束の中で一番前の画像の順。束の中も ids の順）。まとまりに入らない画像は 1 つだけの束
+std::vector<std::vector<size_t>> clusterResults(Db& db, const std::vector<int64_t>& ids);
+
+// 画像のプロパティ（プレビューの「プロパティ」に出す。名前と値の組。分からないものは出さない）。
+// timeText: Unix 秒を文字にする（画面ではその地域の時刻。無ければ UTC）
+std::vector<std::pair<std::string, std::string>> imageProperties(Db& db, int64_t id,
+                                                                 const std::function<std::string(int64_t)>& timeText = nullptr);
 
 // インデックスの状態
 enum class IndexState { None = 0, Pending = 1, Indexed = 2, Partial = 3 };

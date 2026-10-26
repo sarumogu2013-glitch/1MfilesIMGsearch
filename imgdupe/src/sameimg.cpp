@@ -1,7 +1,11 @@
 #include "sameimg.hpp"
 
+#include "meta.hpp"
+
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <map>
 
 namespace imgdupe {
@@ -236,6 +240,150 @@ IndexState folderIndexState(const std::string& dir, const std::vector<std::strin
         if (under(nr, nd)) partial = true;
     }
     return partial ? IndexState::Partial : IndexState::None;
+}
+
+std::vector<std::vector<size_t>> clusterResults(Db& db, const std::vector<int64_t>& ids) {
+    std::unordered_map<int64_t, size_t> pos;  // 画像 ID → ids の添字
+    for (size_t i = 0; i < ids.size(); ++i) pos.emplace(ids[i], i);
+    // 結果どうしを、同じまとまりなら 1 つに（素集合）
+    std::vector<size_t> parent(ids.size());
+    for (size_t i = 0; i < parent.size(); ++i) parent[i] = i;
+    std::function<size_t(size_t)> root = [&](size_t x) {
+        while (parent[x] != x) x = parent[x] = parent[parent[x]];
+        return x;
+    };
+    if (ids.size() > 1) {
+        Stmt st(db.handle(),
+                "SELECT m.group_id, m.image_id FROM group_members m JOIN groups g ON g.id=m.group_id "
+                "WHERE g.kind IN ('exact','similar','variant') ORDER BY m.group_id");
+        int64_t current = -1;
+        size_t first = SIZE_MAX;
+        while (st.step()) {
+            const int64_t gid = st.i64(0);
+            if (gid != current) {
+                current = gid;
+                first = SIZE_MAX;
+            }
+            auto it = pos.find(st.i64(1));
+            if (it == pos.end()) continue;
+            if (first == SIZE_MAX) first = it->second;
+            else parent[root(it->second)] = root(first);
+        }
+    }
+    std::vector<std::vector<size_t>> out;
+    std::unordered_map<size_t, size_t> clusterOf;  // 根 → out の添字
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const size_t r = root(i);
+        auto it = clusterOf.find(r);
+        if (it == clusterOf.end()) {
+            clusterOf.emplace(r, out.size());
+            out.push_back({i});
+        } else {
+            out[it->second].push_back(i);
+        }
+    }
+    return out;
+}
+
+namespace {
+
+std::string dateTimeText(int64_t t) {
+    int y, mo, d, h, mi, s;
+    unixToCivil(t, y, mo, d, h, mi, s);
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
+    return buf;
+}
+
+std::string sizeText(int64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024 * 1024) std::snprintf(buf, sizeof buf, "%.1f MB", bytes / 1048576.0);
+    else if (bytes >= 1024) std::snprintf(buf, sizeof buf, "%.1f KB", bytes / 1024.0);
+    else std::snprintf(buf, sizeof buf, "%lld バイト", static_cast<long long>(bytes));
+    return buf;
+}
+
+}  // namespace
+
+std::vector<std::pair<std::string, std::string>> imageProperties(Db& db, int64_t id,
+                                                                 const std::function<std::string(int64_t)>& timeText) {
+    std::vector<std::pair<std::string, std::string>> out;
+    auto when = [&](int64_t t) { return timeText ? timeText(t) : dateTimeText(t); };
+    auto add = [&](const char* name, const std::string& v) {
+        if (!v.empty()) out.emplace_back(name, v);
+    };
+    {
+        Stmt st(db.handle(), "SELECT path, size, width, height, mtime FROM images WHERE id=?");
+        st.bind(1, id);
+        if (!st.step()) return out;
+        add("パス", st.text(0));
+        if (st.i64(2) > 0) add("大きさ", std::to_string(st.i64(2)) + " × " + std::to_string(st.i64(3)) + " px");
+        add("ファイルサイズ", sizeText(st.i64(1)));
+        if (st.i64(4) > 0) add("更新日時", when(fileTimeToUnix(static_cast<uint64_t>(st.i64(4)))));
+    }
+    {
+        Stmt st(db.handle(),
+                "SELECT format, bit_depth, animated, taken, camera, lens, focal, iso, has_gps, software, rating, title, subject, "
+                "comment, author, created, zone_url, png_text FROM file_meta WHERE image_id=?");
+        st.bind(1, id);
+        if (st.step()) {
+            std::string fmt = st.text(0);
+            if (!fmt.empty() && st.i64(1) > 0) fmt += "（" + std::to_string(st.i64(1)) + " ビット）";
+            if (st.i64(2)) fmt += "・アニメーション";
+            add("形式", fmt);
+            if (st.i64(15) > 0) add("作成日時", when(st.i64(15)));
+            if (st.i64(3) > 0) add("撮影日時", dateTimeText(st.i64(3)));  // EXIF の時刻はその場所の時刻のまま持っている
+            if (!st.isNull(10) && st.i64(10) >= 0) add("星", std::string(static_cast<size_t>(st.i64(10)), '*') + " (" + std::to_string(st.i64(10)) + ")");
+            add("タイトル", st.text(11));
+            add("件名", st.text(12));
+            add("コメント", st.text(13));
+            add("作者", st.text(14));
+            add("カメラ", st.text(4));
+            add("レンズ", st.text(5));
+            if (st.f64(6) > 0) {
+                char b[32];
+                std::snprintf(b, sizeof b, "%.0f mm", st.f64(6));
+                add("焦点距離", b);
+            }
+            if (st.i64(7) > 0) add("ISO", std::to_string(st.i64(7)));
+            if (st.i64(8)) add("位置情報", "あり");
+            add("ソフトウェア", st.text(9));
+            add("ダウンロード元", st.text(16));
+            std::string png = st.text(17);
+            if (png.size() > 400) png = png.substr(0, 400) + "…";
+            add("PNG のテキスト", png);
+        }
+    }
+    {
+        Stmt st(db.handle(), "SELECT sharpness, detail, effective, aesthetic FROM quality WHERE image_id=?");
+        st.bind(1, id);
+        if (st.step()) {
+            char b[96];
+            if (!st.isNull(1)) {
+                std::snprintf(b, sizeof b, "細かさ %.2f（実質 %lldpx）・くっきり %.2f", st.f64(1), static_cast<long long>(st.i64(2)),
+                              st.isNull(0) ? 0.0 : st.f64(0));
+                add("品質", b);
+            }
+            if (!st.isNull(3)) {
+                std::snprintf(b, sizeof b, "%.1f", st.f64(3));
+                add("見栄え", b);
+            }
+        }
+    }
+    {
+        Stmt st(db.handle(),
+                "SELECT g.kind, count(*) - 1 FROM group_members m JOIN groups g ON g.id=m.group_id "
+                "JOIN group_members o ON o.group_id=m.group_id WHERE m.image_id=? GROUP BY m.group_id");
+        st.bind(1, id);
+        while (st.step()) {
+            const std::string k = st.text(0);
+            const std::string n = std::to_string(st.i64(1)) + " 枚";
+            if (k == "exact") add("完全一致", n);
+            else if (k == "similar") add("見た目一致", n);
+            else if (k == "variant") add("差分", n);
+        }
+    }
+    return out;
 }
 
 }  // namespace imgdupe
