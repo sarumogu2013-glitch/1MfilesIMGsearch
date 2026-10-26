@@ -33,6 +33,7 @@
 #include "core.hpp"
 #include "db.hpp"
 #include "dict.hpp"
+#include "tagnames.hpp"
 #include "tagrel.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
@@ -222,6 +223,8 @@ struct App {
     std::unique_ptr<Db> uiDb;  // 画面の表示に使う DB の接続（UI のスレッドだけで使う）
     std::vector<std::string> sourceNames;    // 出どころの一覧の並び
     std::set<std::string> uncheckedSources;  // 外した出どころ
+    std::unordered_map<std::string, std::string> tagNames;  // タグ（小文字）→ 日本語の表示名
+    bool tagJapanese = true;                                // タグを日本語で出す（imgdupe.ini の tagJapanese）
     bool fillingSources = false;
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
@@ -283,6 +286,8 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerSearchTags(const std::vector<std::wstring>& tags) override;
     void ExplorerFindSimilarAi(const std::wstring& path) override;
     void ExplorerRelookup(const std::wstring& path) override;
+    std::wstring ExplorerTagLabel(const std::wstring& tag) override;
+    void ExplorerRenameTag(const std::wstring& tag) override;
 } ex;
 
 int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
@@ -1289,6 +1294,46 @@ Db* uiDb() {
     return app.uiDb.get();
 }
 
+// ---------------------------------------------------------------- タグの表示名
+
+// 同梱の訳（exe に埋め込んだ data/tags_ja.tsv）
+std::string builtinTagNames() {
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_TAGS_JA), MAKEINTRESOURCEW(10));  // RT_RCDATA
+    HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+    const char* p = g ? static_cast<const char*>(LockResource(g)) : nullptr;
+    return p ? std::string(p, SizeofResource(nullptr, r)) : std::string();
+}
+
+// 起動時: 同梱の訳を DB に入れて（変わった時だけ）、表示名を読む
+void loadTagLabels() {
+    app.tagJapanese = iniInt(L"tagJapanese", 1) != 0;
+    if (Db* db = uiDb()) {
+        try {
+            installTagNames(*db, builtinTagNames());
+            app.tagNames = loadTagNames(*db);
+        } catch (const std::exception&) {
+        }
+    }
+}
+
+// 画面に出すタグの名前（日本語で出す設定で、表示名があればそれ）
+std::wstring tagLabel(const std::string& tag) {
+    if (app.tagJapanese) {
+        auto it = app.tagNames.find(tagNameKey(tag));
+        if (it != app.tagNames.end()) return widen(it->second);
+    }
+    return widen(tag);
+}
+
+void refreshTagLabels();
+void syncMenuChecks();
+
+void setTagJapanese(bool on) {
+    app.tagJapanese = on;
+    WritePrivateProfileStringW(L"imgdupe", L"tagJapanese", on ? L"1" : L"0", iniPath().c_str());
+    refreshTagLabels();
+}
+
 // 出どころの表示名
 std::wstring sourceLabel(const std::string& s) {
     static const std::pair<const char*, const wchar_t*> names[] = {
@@ -1567,7 +1612,7 @@ void showSearchInfo(int item) {
             };
             std::vector<std::pair<std::string, Agg>> agg;
             for (const auto& t : tagsOf(*db, info->id)) {
-                if (t.source == kSourceEmbedded) fileTags += (fileTags.empty() ? L"ファイルのタグ: " : L"、") + widen(t.tag);
+                if (t.source == kSourceEmbedded) fileTags += (fileTags.empty() ? L"ファイルのタグ: " : L"、") + tagLabel(t.tag);
                 auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return a.first == t.tag; });
                 if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{}});
                 if (t.source != kSourceEmbedded) it->second.dbOnly = true;
@@ -1583,7 +1628,7 @@ void showSearchInfo(int item) {
                 const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
                 wchar_t c[16];
                 swprintf(c, 16, L" %.2f", p);
-                lines.emplace_back(p, widen(tag) + c + L"（" + a.detail + L"）");
+                lines.emplace_back(p, tagLabel(tag) + c + L"（" + a.detail + L"）");
             }
             std::stable_sort(lines.begin(), lines.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
             for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"検索用タグ: " : L"　") + lines[i].second;
@@ -2273,7 +2318,7 @@ void fillStatsList() {
     for (const auto& r : rows) w.most = std::max(w.most, r.count);
     SendMessageW(w.list, WM_SETREDRAW, FALSE, 0);
     for (size_t i = 0; i < rows.size(); ++i) {
-        std::wstring name = widen(rows[i].key);
+        std::wstring name = view < 4 ? tagLabel(rows[i].key) : widen(rows[i].key);  // 0〜3 はタグ
         LVITEMW it{};
         it.mask = LVIF_TEXT;
         it.iItem = static_cast<int>(i);
@@ -2543,17 +2588,18 @@ void undoTagEdit() {
 
 struct SettingsWindow {
     HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, quality = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
-         variantSim = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
+         variantSim = nullptr, tagJapanese = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
     SettingsWindow& w = settingsWin;
     iniSet(L"autoUpdateCheck", Button_GetCheck(w.autoUpdate) == BST_CHECKED ? L"1" : L"0");
+    if ((Button_GetCheck(w.tagJapanese) == BST_CHECKED) != app.tagJapanese) setTagJapanese(!app.tagJapanese);
     const bool autostart = Button_GetCheck(w.autostart) == BST_CHECKED;
     if (autostart != indexer::autoStartEnabled()) {
         indexer::setAutoStart(autostart);
@@ -2646,7 +2692,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(632), m = px(12);
+    const int cw = px(560), ch = px(694), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -2708,6 +2754,9 @@ void showSettingsWindow() {
         child(WC_STATICW, L"回", SS_NOPREFIX, -1, in + iw - px(24), ry + px(3), px(24), rowH);
         w.sauceStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in + px(18), ry + rowH + px(6), iw - px(18), px(34));
     }
+    gy = group(L"表示", px(52));
+    w.tagJapanese = child(WC_BUTTONW, L"タグを日本語で表示する（タグそのものは英語のまま。日本語でも英語でも検索できます）",
+                          WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGJA, in, gy, iw, rowH);
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
@@ -2718,6 +2767,7 @@ void showSettingsWindow() {
 
     // 今の設定を出す
     Button_SetCheck(w.autoUpdate, iniInt(L"autoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(w.tagJapanese, app.tagJapanese ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.autostart, indexer::autoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.quality, clip::qualityEnabled(app.dataDir) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(w.tagger, iniInt(L"taggerEnabled", 1) ? BST_CHECKED : BST_UNCHECKED);
@@ -3273,8 +3323,8 @@ std::vector<ExplorerTag> ExplorerApp::ExplorerTags(const std::wstring& path) {
         std::vector<std::pair<double, ExplorerTag>> rows;
         for (const auto& [tag, a] : agg) {
             const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
-            if (a.file) rows.push_back({2.0, ExplorerTag{widen(tag), widen(a.kind), 1.0, true}});
-            if (a.dbOnly && p >= 0.35) rows.push_back({p, ExplorerTag{widen(tag), widen(a.kind), p, false}});
+            if (a.file) rows.push_back({2.0, ExplorerTag{widen(tag), widen(a.kind), tagLabel(tag), 1.0, true}});
+            if (a.dbOnly && p >= 0.35) rows.push_back({p, ExplorerTag{widen(tag), widen(a.kind), tagLabel(tag), p, false}});
         }
         std::stable_sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
         for (auto& r : rows) out.push_back(std::move(r.second));
@@ -3285,8 +3335,21 @@ std::vector<ExplorerTag> ExplorerApp::ExplorerTags(const std::wstring& path) {
 
 // タグで検索する（タグをクリック・取り置いたタグを組み合わせて）: 検索のリボンに出して、すぐ探す
 void ExplorerApp::ExplorerSearchTags(const std::vector<std::wstring>& tags) {
+    // 検索の欄には、画面に出している名前で入れる（その名前でそのタグだけに決まる時。ほかはタグそのもの）
+    Db* db = uiDb();
     std::wstring text;
-    for (const auto& t : tags) text += (text.empty() ? L"" : L" ") + t;
+    for (const auto& t : tags) {
+        std::wstring word = t;
+        const std::wstring label = tagLabel(narrow(t));
+        if (db && label != t && label.find_first_of(L" \t\u3000") == std::wstring::npos) {
+            try {
+                const auto named = tagsNamed(*db, narrow(label));
+                if (named.size() == 1 && tagNameKey(named[0]) == tagNameKey(narrow(t))) word = label;
+            } catch (const std::exception&) {
+            }
+        }
+        text += (text.empty() ? L"" : L" ") + word;
+    }
     if (app.tab != 1) switchTab(1);
     SetWindowTextW(app.s.free, text.c_str());
     ComboBox_SetCurSel(app.s.scope, 1);  // タグに限る（名前どおり）
@@ -3306,6 +3369,37 @@ void ExplorerApp::ExplorerFindSimilarAi(const std::wstring& path) {
     if (app.tab != 1) switchTab(1);
     findSimilar(id, fileNameOf(path));
     runSearch();
+}
+
+std::wstring ExplorerApp::ExplorerTagLabel(const std::wstring& tag) { return tagLabel(narrow(tag)); }
+
+// タグの表示名を自分で付ける（空にすると同梱の訳に戻す）
+void ExplorerApp::ExplorerRenameTag(const std::wstring& tag) {
+    Db* db = uiDb();
+    if (!db) return;
+    const std::string key = tagNameKey(narrow(tag));
+    auto it = app.tagNames.find(key);
+    auto input = promptText(L"タグの表示名", L"「" + tag + L"」の表示名（空にすると元の訳に戻ります）",
+                            it != app.tagNames.end() ? widen(it->second) : L"");
+    if (!input) return;
+    std::wstring name = *input;
+    while (!name.empty() && iswspace(name.back())) name.pop_back();
+    while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
+    try {
+        setUserTagName(*db, narrow(tag), narrow(name));
+        app.tagNames = loadTagNames(*db);
+    } catch (const std::exception& e) {
+        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    refreshTagLabels();
+}
+
+// 表示名・表示の言語が変わった: 出しているタグを描き直す
+void refreshTagLabels() {
+    if (ex.view) ex.view->RefreshTags();
+    if (statsWin.wnd) fillStatsList();
+    syncMenuChecks();
 }
 
 void ExplorerApp::ExplorerRelookup(const std::wstring& path) {
@@ -4264,7 +4358,7 @@ void appendMainMenus(HMENU root) {
     popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME});
-    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO});
+    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
     popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
 }
@@ -4275,6 +4369,7 @@ void syncMenuChecks() {
                   MF_BYCOMMAND | (Button_GetCheck(app.exact) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TOGGLE_FLAT,
                   MF_BYCOMMAND | (Button_GetCheck(app.flat) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
 }
 
 void rebuildMenu() {
@@ -4529,6 +4624,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_TAB_SEARCH: switchTab(1); break;
+                case CMD_TAG_JAPANESE: setTagJapanese(!app.tagJapanese); break;
                 case CMD_SAVE_SMART:
                     if (app.tab != 1) switchTab(1);
                     saveSmartFolderUi();
@@ -5085,6 +5181,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         }
     }
     app.thumbThread = std::thread(thumbLoop);
+    loadTagLabels();
+    syncMenuChecks();
     switchTab(std::clamp(iniInt(L"tab", 2), 0, 2));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");

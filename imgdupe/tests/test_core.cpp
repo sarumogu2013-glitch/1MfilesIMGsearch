@@ -24,6 +24,7 @@
 #include "ann.hpp"
 #include "dict.hpp"
 #include "refs.hpp"
+#include "tagnames.hpp"
 #include "tagrel.hpp"
 #include "lookup.hpp"
 #include "stats.hpp"
@@ -2494,6 +2495,61 @@ static void testFreeSearch() {
     CHECK(search(db, d).ids.empty());
 }
 
+static void testTagNames() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-tagnames-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    const auto parsed = parseTagNames("\xEF\xBB\xBF# コメント\nlong_hair\tロングヘア\r\n\nbad line\nshort_hair\tショートヘア\nblue_eyes\t青い目\n");
+    CHECK(parsed.size() == 3 && parsed[0].first == "long_hair" && parsed[0].second == "ロングヘア");
+    const std::string text = "long_hair\tロングヘア\nshort_hair\tショートヘア\nblue_eyes\t青い目\nhatsune_miku\t初音ミク\n";
+    CHECK(installTagNames(db, text));
+    CHECK(!installTagNames(db, text));  // 同じ内容なら入れ直さない
+    auto names = loadTagNames(db);
+    CHECK(names.size() == 4 && names["long_hair"] == "ロングヘア");
+    setUserTagName(db, "Long_Hair", "長髪");  // 自分で付けた名前が優先（大文字小文字は区別しない）
+    names = loadTagNames(db);
+    CHECK(names["long_hair"] == "長髪");
+    CHECK(tagsNamed(db, "長髪") == std::vector<std::string>({"Long_Hair"}));
+    CHECK(tagsNamed(db, "ロングヘア").empty());  // 自分で付けた名前があるので、同梱の訳では合わせない
+    CHECK(tagsWithNameContaining(db, "ヘア", 10) == std::vector<std::string>({"short_hair"}));
+    // 同梱の訳を入れ直しても、自分で付けた名前は残る
+    CHECK(installTagNames(db, text + "red_eyes\t赤い目\n"));
+    CHECK(loadTagNames(db)["long_hair"] == "長髪" && loadTagNames(db)["red_eyes"] == "赤い目");
+    setUserTagName(db, "long_hair", "");
+    CHECK(loadTagNames(db)["long_hair"] == "ロングヘア");
+
+    // 検索: 表示名でもそのタグとして探せる
+    std::vector<ScannedFile> files = {{"C:\\p\\a.jpg", 1, 1}, {"C:\\p\\b.jpg", 1, 2}, {"C:\\p\\c.jpg", 1, 3}};
+    auto ids = upsertScanned(db, files);
+    replaceTags(db, ids["C:\\p\\a.jpg"], "tagger", {TagRow{"long_hair", "general", "tagger", 0.9, false}});
+    replaceTags(db, ids["C:\\p\\b.jpg"], "tagger", {TagRow{"short_hair", "general", "tagger", 0.9, false}});
+    replaceTags(db, ids["C:\\p\\c.jpg"], "tagger", {TagRow{"hatsune_miku", "character", "tagger", 0.9, false}});
+    SearchQuery q;
+    q.freeText = "ロングヘア";
+    CHECK(search(db, q).ids == std::vector<int64_t>({ids["C:\\p\\a.jpg"]}));
+    q.freeText = "ヘア";  // 表示名に語を含むタグ
+    CHECK(search(db, q).ids.size() == 2);
+    q.freeText = "初音ミク";
+    q.freeScope = FreeScope::Tags;
+    CHECK(search(db, q).ids == std::vector<int64_t>({ids["C:\\p\\c.jpg"]}));
+    SearchQuery t;
+    t.tags = {"ショートヘア"};
+    CHECK(search(db, t).ids == std::vector<int64_t>({ids["C:\\p\\b.jpg"]}));
+
+    // 同梱の訳: 読めて、タグも表示名も重ならない
+    std::ifstream f("data/tags_ja.tsv", std::ios::binary);
+    const std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const auto builtin = parseTagNames(all);
+    std::set<std::string> tags, jas;
+    for (const auto& [tag, ja] : builtin) {
+        tags.insert(tag);
+        jas.insert(ja);
+    }
+    CHECK(builtin.size() > 10000 && tags.size() == builtin.size() && jas.size() == builtin.size());
+}
+
 int main() {
     testSha256();
     testFeatures();
@@ -2523,6 +2579,7 @@ int main() {
     testResolveRedirect();
     testSameImage();
     testFreeSearch();
+    testTagNames();
     testExifOrientation();
     testUpdateLogic();
     testKeys();

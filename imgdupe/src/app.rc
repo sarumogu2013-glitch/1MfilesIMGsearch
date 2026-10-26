@@ -4,3 +4,5 @@
 
 IDI_APP ICON "app.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+// タグの日本語の表示名（data/tags_ja.tsv をそのまま埋め込む）
+IDR_TAGS_JA RCDATA "tags_ja.tsv"

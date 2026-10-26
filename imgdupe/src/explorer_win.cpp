@@ -52,7 +52,7 @@ enum {
   ID_BACK, ID_FORWARD, ID_TREE_BTN, ID_PREVIEW_BTN, ID_TREE, ID_SAME_TEXT, ID_SAME_VIEW, ID_SAME_LIST,
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
-enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_SIMILAR_AI,
+enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SIMILAR_AI,
        MENU_RELOOKUP };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
@@ -1769,14 +1769,15 @@ class ExplorerImpl {
           const ExplorerTag& t = previewTags[i];
           if (t.file != (pass == 0)) continue;
           SIZE sz = {};
-          GetTextExtentPoint32W(dc, t.tag.c_str(), int(t.tag.size()), &sz);
+          const std::wstring& label = t.label.empty() ? t.tag : t.label;
+          GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &sz);
           int w = sz.cx + Px(14);
           if (x > nr.left && x + w > nr.right) {
             x = nr.left;
             y += Px(24);
           }
           if (y + Px(20) > rc.bottom) break;
-          RECT r = DrawChip(dc, x, y, t.tag, KindColor(t.kind), false);
+          RECT r = DrawChip(dc, x, y, label, KindColor(t.kind), false);
           tagHits.push_back({r, i});
           x = r.right + Px(5);
         }
@@ -1858,6 +1859,15 @@ class ExplorerImpl {
     previewTags = path.empty() ? std::vector<ExplorerTag>() : host->ExplorerTags(path);
   }
 
+  // タグの表示名が変わった: プレビューのタグを読み直して描き直す
+  void RefreshTags() {
+    previewTagsPath.clear();
+    const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+    LoadPreviewTags(it);
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
+    InvalidateRect(trayWnd, nullptr, FALSE);
+  }
+
   void SaveTray() {
     settings.tray.clear();
     for (auto& t : tray) settings.tray.push_back(t.first);
@@ -1915,7 +1925,8 @@ class ExplorerImpl {
     }
     for (size_t i = 0; i < tray.size(); i++) {
       if (x > traySearchR.left - Px(40)) break;
-      RECT r = DrawChip(dc, x, y, tray[i].first, tray[i].second ? RGB(0, 100, 220) : RGB(150, 150, 150), tray[i].second, true);
+      RECT r = DrawChip(dc, x, y, host->ExplorerTagLabel(tray[i].first), tray[i].second ? RGB(0, 100, 220) : RGB(150, 150, 150),
+                        tray[i].second, true);
       trayHits.push_back({r, {r.right - Px(20), r.top, r.right, r.bottom}, i});
       x = r.right + Px(6);
     }
@@ -1997,12 +2008,18 @@ class ExplorerImpl {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_TAG_SEARCH, L"このタグで検索(&S)");
     AppendMenuW(menu, MF_STRING, MENU_TAG_TRAY, L"取り置く(&K)");
-    AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, L"コピー(&C)");
+    std::wstring shown;  // メニューでは & が下線の印になるので重ねる
+    for (wchar_t c : t.tag) shown += c == L'&' ? std::wstring(L"&&") : std::wstring(1, c);
+    AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, (L"コピー（" + shown + L"）(&C)").c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, MENU_TAG_RENAME, L"表示名を変える(&R)...");
+    const std::wstring tag = t.tag;  // 下で previewTags が読み直されることがある
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
-    if (cmd == MENU_TAG_SEARCH) host->ExplorerSearchTags({t.tag});
-    if (cmd == MENU_TAG_TRAY) AddTray(t.tag);
-    if (cmd == MENU_TAG_COPY) CopyText(t.tag);
+    if (cmd == MENU_TAG_SEARCH) host->ExplorerSearchTags({tag});
+    if (cmd == MENU_TAG_TRAY) AddTray(tag);
+    if (cmd == MENU_TAG_COPY) CopyText(tag);
+    if (cmd == MENU_TAG_RENAME) host->ExplorerRenameTag(tag);
   }
 
   // ---------------------------------------------------------------- 「同じ画像」
@@ -2947,6 +2964,8 @@ std::wstring Explorer::Dir() const { return impl_->dir; }
 std::wstring Explorer::Selected() const { return impl_->SelectedPath(); }
 
 void Explorer::RefreshStates() { impl_->RefreshStates(); }
+
+void Explorer::RefreshTags() { impl_->RefreshTags(); }
 
 void Explorer::SetSameStatus(const std::wstring& text) { SetWindowTextW(impl_->sameText, text.c_str()); }
 

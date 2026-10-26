@@ -60,6 +60,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_BULK_TAG, "BulkTag", L"選んだ画像にタグを付ける・外す(&T)...", "Ctrl+T"},
     {CMD_REVIEW, "ReviewQueue", L"確認キュー（迷っている順に並べる）(&R)", "Ctrl+R"},
     {CMD_UNDO, "Undo", L"タグの操作を元に戻す(&U)", "Ctrl+Z"},
+    {CMD_TAG_JAPANESE, "TagJapanese", L"タグを日本語で表示(&J)", "Ctrl+J"},
     {CMD_SETTINGS, "Settings", L"設定(&S)...", ""},
     {CMD_DICTIONARY, "Dictionary", L"行動・アイテムの辞書(&D)...", ""},
     {CMD_TAGDICT, "TagDictionary", L"タグ辞書（別名・親子）(&T)...", ""},

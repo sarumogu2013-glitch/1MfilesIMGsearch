@@ -1,4 +1,5 @@
 #include "search.hpp"
+#include "tagnames.hpp"
 
 #include "json.hpp"
 #include "quality.hpp"
@@ -22,17 +23,25 @@ std::string lowerAscii(std::string s) {
 }
 
 // そのタグと同じ意味のタグ（tag_dict の別名をたどる）
-std::vector<std::string> aliasesOf(Db& db, const std::string& tag) {
+void dictAliases(Db& db, const std::string& tag, std::set<std::string>& out) {
     std::string canonical = tag;
     {
         Stmt st(db.handle(), "SELECT alias_of FROM tag_dict WHERE tag=? COLLATE NOCASE AND alias_of IS NOT NULL");
         st.bind(1, tag);
         if (st.step() && !st.text(0).empty()) canonical = st.text(0);
     }
-    std::set<std::string> out = {tag, canonical};
+    out.insert(tag);
+    out.insert(canonical);
     Stmt st(db.handle(), "SELECT tag FROM tag_dict WHERE alias_of=? COLLATE NOCASE");
     st.bind(1, canonical);
     while (st.step()) out.insert(st.text(0));
+}
+
+// 別名に加えて、日本語の表示名がそのまま合うタグ（とその別名）も
+std::vector<std::string> aliasesOf(Db& db, const std::string& tag) {
+    std::set<std::string> out;
+    dictAliases(db, tag, out);
+    for (const auto& t : tagsNamed(db, tag)) dictAliases(db, t, out);
     return std::vector<std::string>(out.begin(), out.end());
 }
 
@@ -153,14 +162,24 @@ SearchResult search(Db& db, const SearchQuery& q) {
             std::vector<std::string> out;
             const auto exact = aliasesOf(db, w);
             const std::string lw = lowerAscii(w);
+            auto add = [&](const std::string& t) {
+                const std::string lt = lowerAscii(t);
+                for (const auto& e : exact)
+                    if (lowerAscii(e) == lt) return;
+                for (const auto& o : out)
+                    if (lowerAscii(o) == lt) return;
+                out.push_back(t);
+            };
             for (const auto& t : tagNames) {
                 if (out.size() >= 300) break;
-                const std::string lt = lowerAscii(t);
-                if (lt.find(lw) == std::string::npos) continue;
-                bool same = false;
-                for (const auto& e : exact) same = same || lowerAscii(e) == lt;
-                if (!same) out.push_back(t);
+                if (lowerAscii(t).find(lw) != std::string::npos) add(t);
             }
+            // 日本語の表示名に語を含むタグ（髪 → long_hair など。英数字だけの語は英語のタグ名で足りる）
+            bool ascii = true;
+            for (unsigned char c : w) ascii = ascii && c < 0x80;
+            if (!ascii)
+                for (const auto& t : tagsWithNameContaining(db, w, 300))
+                    if (out.size() < 300) add(t);
             return out;
         };
         // 語 w に合う画像と点数の CTE を name で作る

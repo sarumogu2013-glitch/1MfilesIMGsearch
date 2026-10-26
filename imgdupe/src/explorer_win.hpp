@@ -36,6 +36,7 @@ struct ExplorerSettings {
 // 画像のタグ（プレビューに出す）
 struct ExplorerTag {
   std::wstring tag, kind;
+  std::wstring label;  // 画面に出す名前（日本語の表示名など。空ならタグそのもの）
   double confidence = 0;
   bool file = false;  // ファイルに書き込まれているタグ（実体のタグ）
 };
@@ -72,6 +73,8 @@ class ExplorerHost {
   virtual void ExplorerSearchTags(const std::vector<std::wstring>& tags) = 0;       // タグ（すべてを持つ画像）で検索する
   virtual void ExplorerFindSimilarAi(const std::wstring& path) = 0;                 // 似た画像（CLIP）を探す
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
+  virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
+  virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
 };
 
 class ExplorerImpl;
@@ -89,6 +92,7 @@ class Explorer {
   std::wstring Dir() const;
   std::wstring Selected() const;
   void RefreshStates();  // インデックスの状態を読み直す
+  void RefreshTags();    // タグの表示名が変わった
   // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ
   // select: 選ぶもの（paths の番号。-1 なら先頭）
   void ShowList(const std::wstring& title, std::vector<std::wstring> paths, int select = -1);

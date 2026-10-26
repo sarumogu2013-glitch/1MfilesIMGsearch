@@ -242,6 +242,17 @@ CREATE TABLE IF NOT EXISTS quality(
 );
 )SQL";
 
+// 版 9: タグの表示名（日本語）。source: builtin = 同梱の訳 / user = 自分で付けたもの（こちらが優先）
+const char* const kSchemaV9 = R"SQL(
+CREATE TABLE IF NOT EXISTS tag_names(
+    tag TEXT NOT NULL COLLATE NOCASE,
+    source TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY(tag, source)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS tag_names_name ON tag_names(name);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -360,7 +371,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         if (i == 6)
