@@ -69,8 +69,11 @@ int64_t imageCount(Db& db);
 StageCount stageCount(Db& db, const std::string& stage, int version);
 
 struct IndexProgress {
-    std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
+    std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};  // CPU の側（Idle = 済んで GPU の側を待っている）
     Progress prog;
+    std::atomic<int> gpuPhase{static_cast<int>(IndexPhase::Idle)};  // 同時に進める GPU の側（タガー・CLIP。Idle = していない）
+    Progress gpuProg;
+    std::atomic<unsigned> doneMask{0};  // 今の対象で済んだ段階（1 << IndexPhase）
     std::atomic<int64_t> task{-1};  // 今のスキャンタスクの ID（0 = フォルダ全体の確認、-1 = なし）
 };
 

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <vector>
 
@@ -18,6 +19,8 @@ using winutil::narrow;
 using winutil::widen;
 
 namespace {
+
+constexpr size_t kGpuBatch = 8;  // GPU で一度に流す枚数
 
 bool readFile(const std::wstring& path, std::string& out) {
     FILE* f = _wfopen(path.c_str(), L"rb");
@@ -47,14 +50,36 @@ public:
     int inputSide() const override { return side_; }
     bool gpu() const { return session_.gpu(); }
     bool run(const std::vector<float>& input, std::vector<float>& probs, std::string& error) override {
-        std::vector<int64_t> shape;
-        return session_.run({{session_.inputNames()[0], {1, side_, side_, 3}, input.data(), nullptr}}, session_.outputNames()[0],
-                            probs, shape, error);
+        return runBatch(input, 1, probs, error);
     }
+    // GPU では 8 枚ずつ流す（モデルの入力の枚数が決まっていない時だけ）。CPU は 1 枚ずつでも速さが変わらないので分けない
+    size_t maxBatch() const override { return batch_; }
+    bool runBatch(const std::vector<float>& input, size_t n, std::vector<float>& probs, std::string& error) override {
+        std::vector<int64_t> shape;
+        if (session_.run({{session_.inputNames()[0], {static_cast<int64_t>(n), side_, side_, 3}, input.data(), nullptr}},
+                         session_.outputNames()[0], probs, shape, error))
+            return true;
+        if (n == 1) return false;
+        // まとめて流せなかった（GPU のメモリが足りないなど）: これからは 1 枚ずつにして、今の分も 1 枚ずつやり直す
+        batch_ = 1;
+        const size_t one = input.size() / n;
+        probs.clear();
+        for (size_t k = 0; k < n; ++k) {
+            std::vector<float> in(input.begin() + static_cast<std::ptrdiff_t>(one * k),
+                                  input.begin() + static_cast<std::ptrdiff_t>(one * (k + 1))),
+                out;
+            if (!runBatch(in, 1, out, error)) return false;
+            probs.insert(probs.end(), out.begin(), out.end());
+        }
+        return true;
+    }
+    void setBatch(size_t b) { batch_ = b; }
+    bool dynamicBatch() const { return session_.inputShape(0).size() == 4 && session_.inputShape(0)[0] < 0; }
 
 private:
     onnx::Session session_;
     int side_ = 0;
+    std::atomic<size_t> batch_{1};
 };
 
 }  // namespace
@@ -100,6 +125,7 @@ LoadResult load(const std::wstring& dataDir, int cpuThreads, std::function<void(
         r.error = e;
         return r;
     }
+    if (model->gpu() && model->dynamicBatch()) model->setBatch(kGpuBatch);
     r.device = model->gpu() ? L"GPU（DirectML）" : L"CPU";
     r.analyzer = std::make_shared<imgdupe::TaggerAnalyzer>(
         model, std::move(labels), imgdupe::taggerStageVersion(wd->second.version),

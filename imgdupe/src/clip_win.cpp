@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <unordered_set>
 
@@ -106,10 +107,34 @@ public:
     size_t dim() const override { return 512; }
 
     bool encodeImage(const std::vector<float>& pixels, std::vector<float>& out, std::string& error) override {
+        return encodeImages(pixels, 1, out, error);
+    }
+    // GPU では 16 枚ずつ流す（モデルの入力の枚数が決まっていない時だけ）
+    size_t maxBatch() const override { return batch_; }
+    bool encodeImages(const std::vector<float>& pixels, size_t n, std::vector<float>& out, std::string& error) override {
         if (!visionSession_) return false;
         std::vector<int64_t> shape;
-        return visionSession_->run({{visionSession_->inputNames()[0], {1, 3, side_, side_}, pixels.data(), nullptr}}, visionOut_, out,
-                                   shape, error);
+        if (visionSession_->run({{visionSession_->inputNames()[0], {static_cast<int64_t>(n), 3, side_, side_}, pixels.data(), nullptr}},
+                                visionOut_, out, shape, error) &&
+            out.size() == dim() * n)
+            return true;
+        if (n == 1) return false;
+        // まとめて流せなかった: これからは 1 枚ずつ
+        batch_ = 1;
+        const size_t one = pixels.size() / n;
+        out.clear();
+        for (size_t k = 0; k < n; ++k) {
+            std::vector<float> in(pixels.begin() + static_cast<std::ptrdiff_t>(one * k),
+                                  pixels.begin() + static_cast<std::ptrdiff_t>(one * (k + 1))),
+                v;
+            if (!encodeImages(in, 1, v, error)) return false;
+            out.insert(out.end(), v.begin(), v.end());
+        }
+        return true;
+    }
+    void useGpuBatch() {
+        if (visionSession_ && visionSession_->gpu() && visionSession_->inputShape(0).size() == 4 && visionSession_->inputShape(0)[0] < 0)
+            batch_ = 16;
     }
 
     bool encodeText(const std::string& text, std::vector<float>& out, std::string& error) override {
@@ -136,6 +161,7 @@ public:
     }
 
 private:
+    std::atomic<size_t> batch_{1};
     std::unique_ptr<onnx::Session> visionSession_, textSession_;
     std::string visionOut_;
     int side_ = 224;
@@ -336,6 +362,7 @@ LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::functi
         r.error = L"ベクトルのファイルに書けません（画面で検索中なら、後でもう一度試します）";
         return r;
     }
+    model->useGpuBatch();
     r.device = model->gpu() ? L"GPU（DirectML）" : L"CPU";
     r.analyzer = std::make_shared<imgdupe::ClipAnalyzer>(
         model, writer, imgdupe::clipStageVersion(f.version),

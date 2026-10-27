@@ -267,18 +267,48 @@ struct ClipPayload {
 };
 }  // namespace
 
-AnalyzerOutput ClipAnalyzer::analyze(const AnalyzerInput& in) {
-    AnalyzerOutput out;
+std::shared_ptr<void> ClipAnalyzer::prepare(const AnalyzerInput& in) {
     const int side = model_->imageSide();
     std::vector<uint8_t> px;
     int w = 0, h = 0;
     // 短い辺が side 以上になるよう、少し大きめに読む
-    if (!decode_(in.path, side * 2, px, w, h) || w <= 0 || h <= 0) {
+    if (!decode_(in.path, side * 2, px, w, h) || w <= 0 || h <= 0) return nullptr;
+    auto input = std::make_shared<std::vector<float>>(3 * static_cast<size_t>(side) * side);
+    prepareClipInput(px.data(), w, h, side, input->data());
+    return input;
+}
+
+void ClipAnalyzer::inferBatch(const std::vector<std::shared_ptr<void>>& prepared, std::vector<AnalyzerOutput>& outs) {
+    const size_t n = prepared.size();
+    if (!n) return;
+    const size_t one = 3 * static_cast<size_t>(model_->imageSide()) * model_->imageSide(), dim = model_->dim();
+    std::vector<float> input(one * n);
+    for (size_t k = 0; k < n; ++k) {
+        const auto& v = *std::static_pointer_cast<std::vector<float>>(prepared[k]);
+        std::copy(v.begin(), v.end(), input.begin() + static_cast<std::ptrdiff_t>(one * k));
+    }
+    std::vector<float> all;
+    std::string error;
+    if (!model_->encodeImages(input, n, all, error) || all.size() != dim * n) {
+        for (auto& o : outs) o.ok = false;
+        return;
+    }
+    for (size_t k = 0; k < n; ++k) {
+        auto p = std::make_shared<ClipPayload>();
+        p->v.assign(all.begin() + static_cast<std::ptrdiff_t>(dim * k), all.begin() + static_cast<std::ptrdiff_t>(dim * (k + 1)));
+        normalizeVector(p->v);
+        outs[k].payload = p;
+    }
+}
+
+AnalyzerOutput ClipAnalyzer::analyze(const AnalyzerInput& in) {
+    AnalyzerOutput out;
+    const auto prepared = prepare(in);
+    if (!prepared) {
         out.ok = false;
         return out;
     }
-    std::vector<float> input(3 * static_cast<size_t>(side) * side);
-    prepareClipInput(px.data(), w, h, side, input.data());
+    const std::vector<float>& input = *std::static_pointer_cast<std::vector<float>>(prepared);
     auto p = std::make_shared<ClipPayload>();
     std::string error;
     if (!model_->encodeImage(input, p->v, error) || p->v.size() != model_->dim()) {

@@ -1,6 +1,8 @@
 #include "indexer.hpp"
 
 #include <algorithm>
+#include <exception>
+#include <thread>
 #include <cstring>
 #include <stdexcept>
 
@@ -96,18 +98,31 @@ Outcome outcomeOf(const StageReport& sr) {
     return sr.yielded ? Outcome::Yielded : sr.cancelled ? Outcome::Cancelled : Outcome::Done;
 }
 
-// 解析の段階（ハッシュ〜品質）。within があればその画像だけ
-Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
+Outcome combine(Outcome a, Outcome b) {
+    if (a == Outcome::Cancelled || b == Outcome::Cancelled) return Outcome::Cancelled;
+    if (a == Outcome::Yielded || b == Outcome::Yielded) return Outcome::Yielded;
+    return Outcome::Done;
+}
+
+// 1 つの段階を流す。済んだら progress.doneMask に印を付ける
+Outcome runOne(Db& db, RunState& s, IndexPhase phase, Analyzer& a, const std::vector<int64_t>* within, unsigned threads,
+               std::atomic<int>& phaseOut, Progress& prog, IndexReport& rep, size_t& counter, bool countFailed) {
+    phaseOut = static_cast<int>(phase);
+    const StageReport sr = runStage(db, a, threads, s.cancel, &prog, 256, within, s.opt.preempt);
+    counter += countFailed ? sr.processed : sr.processed - sr.failed;
+    rep.failed += sr.failed;
+    const Outcome o = outcomeOf(sr);
+    if (o == Outcome::Done) s.progress.doneMask.fetch_or(1u << static_cast<int>(phase));
+    return o;
+}
+
+// CPU の段階（ハッシュ・サムネイル・メタデータ・json とフォルダ名・品質）
+Outcome runCpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, unsigned threads, IndexReport& rep) {
     const IndexOptions& opt = s.opt;
     const IndexCallbacks& cb = s.cb;
     IndexProgress& progress = s.progress;
-    IndexReport& rep = s.rep;
     auto stage = [&](IndexPhase phase, Analyzer& a, size_t& counter, bool countFailed) {
-        progress.phase = static_cast<int>(phase);
-        const StageReport sr = runStage(db, a, opt.threads, s.cancel, &progress.prog, 256, within, opt.preempt);
-        counter += countFailed ? sr.processed : sr.processed - sr.failed;
-        rep.failed += sr.failed;
-        return outcomeOf(sr);
+        return runOne(db, s, phase, a, within, threads, progress.phase, progress.prog, rep, counter, countFailed);
     };
     Outcome o;
     HashAnalyzer hash(cb);
@@ -124,15 +139,34 @@ Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
     // json・フォルダ名（ファイルを読むだけなので OS に依存しない）
     NamesAnalyzer names;
     if ((o = stage(IndexPhase::Names, names, rep.names, false)) != Outcome::Done) return o;
+    // 品質（くっきり度・細かさ）
+    if (cb.decodeQuality && cb.qualityEnabled && cb.qualityEnabled() &&
+        !pendingImages(db, kStageQuality, kQualityVersion, 1, within).empty()) {
+        QualityAnalyzer qa(cb.decodeQuality, cb.threadInit, cb.threadExit);
+        if ((o = stage(IndexPhase::Quality, qa, rep.quality, false)) != Outcome::Done) return o;
+    }
+    return Outcome::Done;
+}
+
+// GPU の段階（WD14 タガー・CLIP）。モデルは 1 回の間に 1 度だけ読む
+Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, unsigned threads, IndexReport& rep) {
+    const IndexCallbacks& cb = s.cb;
+    IndexProgress& progress = s.progress;
+    auto stage = [&](IndexPhase phase, Analyzer& a, size_t& counter) {
+        return runOne(db, s, phase, a, within, threads, progress.gpuPhase, progress.gpuProg, rep, counter, false);
+    };
+    Outcome o;
     // WD14 タガー（重い。モデルの読み込みにも時間がかかるので、済んでいない画像がある時だけ読む）
     const int tv = cb.taggerVersion ? cb.taggerVersion() : 0;
     if (tv && cb.makeTagger && !pendingImages(db, stage::kTagger, tv, 1, within).empty()) {
-        progress.phase = static_cast<int>(IndexPhase::Tagger);
+        progress.gpuPhase = static_cast<int>(IndexPhase::Tagger);
+        progress.gpuProg.done = 0;
+        progress.gpuProg.total = 0;
         if (!s.taggerTried) {
             s.taggerTried = true;
             s.tagger = cb.makeTagger(rep.taggerError);
         }
-        if (s.tagger && (o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged, false)) != Outcome::Done) return o;
+        if (s.tagger && (o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged)) != Outcome::Done) return o;
     }
     // CLIP（似た画像・言葉での検索のためのベクトル）
     const int cv = cb.clipVersion ? cb.clipVersion() : 0;
@@ -142,21 +176,67 @@ Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
             cb.prepareClip(db);
         }
         if (!pendingImages(db, kStageClip, cv, 1, within).empty()) {
-            progress.phase = static_cast<int>(IndexPhase::Clip);
+            progress.gpuPhase = static_cast<int>(IndexPhase::Clip);
+            progress.gpuProg.done = 0;
+            progress.gpuProg.total = 0;
             if (!s.clipTried) {
                 s.clipTried = true;
                 s.clip = cb.makeClip(rep.clipError);
             }
-            if (s.clip && (o = stage(IndexPhase::Clip, *s.clip, rep.clipped, false)) != Outcome::Done) return o;
+            if (s.clip && (o = stage(IndexPhase::Clip, *s.clip, rep.clipped)) != Outcome::Done) return o;
         }
     }
-    // 品質（くっきり度・細かさ）
-    if (cb.decodeQuality && cb.qualityEnabled && cb.qualityEnabled() &&
-        !pendingImages(db, kStageQuality, kQualityVersion, 1, within).empty()) {
-        QualityAnalyzer qa(cb.decodeQuality, cb.threadInit, cb.threadExit);
-        if ((o = stage(IndexPhase::Quality, qa, rep.quality, false)) != Outcome::Done) return o;
-    }
     return Outcome::Done;
+}
+
+// 解析の段階。CPU の段階と GPU の段階は別のスレッド（DB の接続も別）で同時に進める
+// （GPU が推論している間に CPU でサムネイルなどを作る）。操作中の「控えめ」（1 スレッド）の時だけは順に。
+// within があればその画像だけ
+Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
+    const IndexOptions& opt = s.opt;
+    IndexProgress& progress = s.progress;
+    progress.doneMask = 0;
+    progress.gpuPhase = static_cast<int>(IndexPhase::Idle);
+    const unsigned all = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
+    Outcome cpu, gpu;
+    IndexReport gpuRep;
+    if (all <= 1) {
+        cpu = runCpuStages(db, s, within, 1, s.rep);
+        progress.phase = static_cast<int>(IndexPhase::Idle);
+        gpu = cpu == Outcome::Done ? runGpuStages(db, s, within, 1, gpuRep) : cpu;
+    } else {
+        // GPU の側は画像を読んで縮める（前処理）スレッドに、全体の 3 分の 1（2 つ以上）
+        const unsigned gpuThreads = std::max(2u, all / 3), cpuThreads = std::max(1u, all - gpuThreads);
+        std::exception_ptr error;
+        gpu = Outcome::Done;
+        std::thread lane([&] {
+            try {
+                Db gdb;
+                if (!gdb.open(opt.dbFile)) throw std::runtime_error("画像の情報（DB）を開けません: " + gdb.error());
+                // このスレッドは推論を流すだけ（画像を読むのは前処理のスレッド）。優先度は下げない（下げると GPU への投入が途切れる）
+                gpu = runGpuStages(gdb, s, within, gpuThreads, gpuRep);
+            } catch (...) {
+                error = std::current_exception();
+            }
+            progress.gpuPhase = static_cast<int>(IndexPhase::Idle);
+        });
+        try {
+            cpu = runCpuStages(db, s, within, cpuThreads, s.rep);
+        } catch (...) {
+            lane.join();
+            throw;
+        }
+        progress.phase = static_cast<int>(IndexPhase::Idle);  // CPU の側は済んだ（GPU の側を待つ）
+        lane.join();
+        if (error) std::rethrow_exception(error);
+    }
+    progress.gpuPhase = static_cast<int>(IndexPhase::Idle);
+    s.rep.tagged += gpuRep.tagged;
+    s.rep.clipped += gpuRep.clipped;
+    s.rep.failed += gpuRep.failed;
+    if (!gpuRep.taggerError.empty()) s.rep.taggerError = gpuRep.taggerError;
+    if (!gpuRep.clipError.empty()) s.rep.clipError = gpuRep.clipError;
+    return combine(cpu, gpu);
 }
 
 // 全体に掛かる仕上げ（差分グループ・照会・辞書）。どれも変わっていなければすぐ終わる

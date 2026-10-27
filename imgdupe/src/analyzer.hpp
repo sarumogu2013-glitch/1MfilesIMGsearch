@@ -52,6 +52,15 @@ public:
     // 各スレッドの始めと終わり（COM の初期化など）
     virtual void threadBegin() {}
     virtual void threadEnd() {}
+
+    // GPU で推論するもの（タガー・CLIP）は、前処理（CPU。画像を読んで縮める）と推論（まとめて）に分けられる。
+    // batchSize() が 0 でなければ、runStage は前処理をいくつものスレッドで先に進め、推論は 1 つのスレッドで batchSize 枚ずつ
+    // 途切れずに続ける（1 枚ずつ呼ぶと GPU が動いたり止まったりを細かく繰り返し、負荷が波打つ）
+    virtual size_t batchSize() const { return 0; }
+    // 前処理（複数のスレッドから同時に呼ばれる）。読めなければ nullptr（その画像は「失敗」）
+    virtual std::shared_ptr<void> prepare(const AnalyzerInput& /*in*/) { return nullptr; }
+    // まとめて推論する（1 つのスレッドから）。outs は prepared と同じ数で渡す
+    virtual void inferBatch(const std::vector<std::shared_ptr<void>>& /*prepared*/, std::vector<AnalyzerOutput>& /*outs*/) {}
 };
 
 struct StageReport {

@@ -41,6 +41,11 @@ public:
     virtual ~TaggerModel() = default;
     virtual int inputSide() const = 0;  // 448 など
     virtual bool run(const std::vector<float>& input, std::vector<float>& probs, std::string& error) = 0;
+    // 一度に流せる枚数（1 なら 1 枚ずつ）。input は n 枚分を続けたもの、probs も n 枚分を続けて返す
+    virtual size_t maxBatch() const { return 1; }
+    virtual bool runBatch(const std::vector<float>& input, size_t n, std::vector<float>& probs, std::string& error) {
+        return n == 1 && run(input, probs, error);
+    }
 };
 
 class TaggerAnalyzer : public Analyzer {
@@ -54,6 +59,9 @@ public:
     std::string stageName() const override { return stage::kTagger; }
     int version() const override { return version_; }
     AnalyzerOutput analyze(const AnalyzerInput& in) override;
+    size_t batchSize() const override { return model_->maxBatch() > 1 ? model_->maxBatch() : 0; }
+    std::shared_ptr<void> prepare(const AnalyzerInput& in) override;
+    void inferBatch(const std::vector<std::shared_ptr<void>>& prepared, std::vector<AnalyzerOutput>& outs) override;
     void threadBegin() override {
         if (init_) init_();
     }

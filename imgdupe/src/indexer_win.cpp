@@ -430,6 +430,8 @@ void workLoop() {
 
 // ---------------------------------------------------------------- タスクトレイ
 
+std::wstring laneText(IndexPhase p, const Progress& pr, const std::wstring& device);
+
 std::wstring statusText() {
     std::wstring wait, last, taggerDevice;
     {
@@ -439,47 +441,11 @@ std::wstring statusText() {
         last = g->lastResult;
     }
     if (g->running) {
-        const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
-        const uint64_t done = g->prog.prog.done, total = g->prog.prog.total;
-        wchar_t t[128];
-        switch (phase) {
-            case IndexPhase::Scan: swprintf(t, 128, L"フォルダを調べています（%llu 枚）", static_cast<unsigned long long>(total)); break;
-            case IndexPhase::Hash:
-                swprintf(t, 128, L"ハッシュ %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Thumb:
-                swprintf(t, 128, L"サムネイル %llu / %llu", static_cast<unsigned long long>(done),
-                         static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Meta:
-                swprintf(t, 128, L"メタデータ %llu / %llu", static_cast<unsigned long long>(done),
-                         static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Clip:
-                swprintf(t, 128, L"CLIP（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
-                         static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Quality:
-                swprintf(t, 128, L"品質 %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Lookup:
-                swprintf(t, 128, L"出典の照会 %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Merge: swprintf(t, 128, L"辞書を当てています"); break;
-            case IndexPhase::Variants:
-                swprintf(t, 128, L"差分グループ %llu / %llu", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Tagger:
-                swprintf(t, 128, L"タグ付け（%ls）%llu / %llu", taggerDevice.c_str(), static_cast<unsigned long long>(done),
-                         static_cast<unsigned long long>(total));
-                break;
-            case IndexPhase::Names:
-                swprintf(t, 128, L"json・フォルダ名 %llu / %llu", static_cast<unsigned long long>(done),
-                         static_cast<unsigned long long>(total));
-                break;
-            default: swprintf(t, 128, L"処理中"); break;
-        }
-        return t;
+        // CPU の側と GPU の側（同時に進めている時は両方）
+        std::wstring t = laneText(static_cast<IndexPhase>(g->prog.phase.load()), g->prog.prog, taggerDevice);
+        const std::wstring gpu = laneText(static_cast<IndexPhase>(g->prog.gpuPhase.load()), g->prog.gpuProg, taggerDevice);
+        if (!gpu.empty()) t += (t.empty() ? L"" : L" ／ ") + gpu;
+        return t.empty() ? L"処理中" : t;
     }
     if (!wait.empty()) return wait;
     return last.empty() ? L"待機中" : last;
@@ -512,6 +478,17 @@ const wchar_t* phaseName(IndexPhase p) {
         case IndexPhase::Merge: return L"仕上げ（辞書・親子関係）";
         default: return L"";
     }
+}
+
+// 1 つの側（CPU / GPU）の今の段階と進み具合。何もしていなければ空
+std::wstring laneText(IndexPhase p, const Progress& pr, const std::wstring& device) {
+    if (p == IndexPhase::Idle || p == IndexPhase::Done) return L"";
+    std::wstring t = phaseName(p);
+    if ((p == IndexPhase::Tagger || p == IndexPhase::Clip) && !device.empty()) t += L"（" + device + L"）";
+    const uint64_t done = pr.done, total = pr.total;
+    if (p == IndexPhase::Scan) t += L"（" + std::to_wstring(total) + L" 枚）";
+    else if (p != IndexPhase::Merge && total) t += L" " + std::to_wstring(done) + L" / " + std::to_wstring(total);
+    return t;
 }
 
 // 総合の数を別のスレッドで数える（数秒ごと）
@@ -635,10 +612,10 @@ void paintTasks(HDC dc, const RECT& rc, int m, int y, HFONT font, HFONT bold) {
         RECT sr = {lr.left, lr.bottom, lr.right, row.bottom - popupPx(2)};
         std::wstring sub;
         if (now) {
-            const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
-            const uint64_t done = g->prog.prog.done, tot = g->prog.prog.total;
-            sub = L"▶ 処理中: " + std::wstring(phaseName(phase));
-            if (phase != IndexPhase::Scan && tot) sub += L" " + std::to_wstring(done) + L" / " + std::to_wstring(tot);
+            std::wstring lanes = laneText(static_cast<IndexPhase>(g->prog.phase.load()), g->prog.prog, L"");
+            const std::wstring gpu = laneText(static_cast<IndexPhase>(g->prog.gpuPhase.load()), g->prog.gpuProg, L"");
+            if (!gpu.empty()) lanes += (lanes.empty() ? L"" : L" ・ ") + gpu;
+            sub = L"▶ 処理中: " + lanes;
             SetTextColor(dc, RGB(30, 130, 60));
         } else {
             sub = fixed ? L"タスクが無くなってから、調べるフォルダ全体の変化を見ます" : taskPathsText(g->tasks[i]);
@@ -729,32 +706,46 @@ void paintPopup(HDC dc, const RECT& rc) {
         y += popupPx(4);
         if (running) {
             const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
-            const uint64_t done = g->prog.prog.done, total = g->prog.prog.total;
+            const auto gpuPhase = static_cast<IndexPhase>(g->prog.gpuPhase.load());
             const int64_t task = g->prog.task;
             if (task == 0) text(L"対象: フォルダ全体の確認", RGB(90, 90, 90));
             else if (const ScanTask* t = task > 0 ? findTask(task) : nullptr) text(L"対象: スキャンタスク「" + widen(t->label) + L"」", RGB(90, 90, 90));
-            SelectObject(dc, bold);
-            std::wstring now = phaseName(phase);
-            if ((phase == IndexPhase::Tagger || phase == IndexPhase::Clip) && !device.empty()) now += L"（" + device + L"）";
-            text(now, RGB(30, 30, 30));
-            SelectObject(dc, font);
-            if (phase != IndexPhase::Scan && total) {
-                drawBar(dc, {m, y, rc.right - m, y + popupPx(10)}, double(done) / double(total), RGB(0, 120, 215));
-                y += popupPx(14);
-                wchar_t t[96];
-                swprintf(t, 96, L"%llu / %llu 枚（%.0f%%）", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total),
-                         100.0 * double(done) / double(total));
-                text(t, RGB(60, 60, 60));
-            } else if (phase == IndexPhase::Scan) {
-                text(std::to_wstring(total) + L" 枚見つけました", RGB(60, 60, 60));
-            }
+            // CPU の側と GPU の側（同時に進める）。それぞれ段階の名前と進み具合の棒
+            auto lane = [&](const wchar_t* side, IndexPhase p, const Progress& pr) {
+                if (p == IndexPhase::Idle || p == IndexPhase::Done) return;
+                SelectObject(dc, bold);
+                std::wstring now = std::wstring(side) + phaseName(p);
+                if ((p == IndexPhase::Tagger || p == IndexPhase::Clip) && !device.empty()) now += L"（" + device + L"）";
+                text(now, RGB(30, 30, 30));
+                SelectObject(dc, font);
+                const uint64_t done = pr.done, total = pr.total;
+                if (p != IndexPhase::Scan && total) {
+                    drawBar(dc, {m, y, rc.right - m, y + popupPx(10)}, double(done) / double(total), RGB(0, 120, 215));
+                    y += popupPx(14);
+                    wchar_t t[96];
+                    swprintf(t, 96, L"%llu / %llu 枚（%.0f%%）", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total),
+                             100.0 * double(done) / double(total));
+                    text(t, RGB(60, 60, 60));
+                } else if (p == IndexPhase::Scan) {
+                    text(std::to_wstring(total) + L" 枚見つけました", RGB(60, 60, 60));
+                }
+            };
+            const bool both = gpuPhase != IndexPhase::Idle;
+            if (both && phase == IndexPhase::Idle) text(L"CPU: 済み（GPU の側を待っています）", RGB(90, 90, 90));
+            lane(both ? L"CPU: " : L"", phase, g->prog.prog);
+            lane(L"GPU: ", gpuPhase, g->prog.gpuProg);
             // 段階の並び（済んだもの・今・まだ）
             y += popupPx(4);
+            const unsigned mask = g->prog.doneMask;
             const IndexPhase order[] = {IndexPhase::Scan, IndexPhase::Hash, IndexPhase::Thumb, IndexPhase::Meta, IndexPhase::Names,
-                                        IndexPhase::Tagger, IndexPhase::Clip, IndexPhase::Variants, IndexPhase::Quality,
+                                        IndexPhase::Tagger, IndexPhase::Clip, IndexPhase::Quality, IndexPhase::Variants,
                                         IndexPhase::Lookup, IndexPhase::Merge};
+            const bool finishing = phase == IndexPhase::Variants || phase == IndexPhase::Lookup || phase == IndexPhase::Merge;
             for (IndexPhase p : order) {
-                const bool cur = p == phase, past = static_cast<int>(p) < static_cast<int>(phase);
+                const bool cur = p == phase || p == gpuPhase;
+                const bool past = !cur && (p == IndexPhase::Scan ? phase != IndexPhase::Scan
+                                           : finishing && static_cast<int>(p) < static_cast<int>(phase) ? true
+                                                                                                         : (mask >> static_cast<int>(p)) & 1u);
                 RECT r = {m, y, rc.right - m, y + popupPx(18)};
                 SetTextColor(dc, cur ? RGB(0, 100, 220) : past ? RGB(40, 140, 60) : RGB(150, 150, 150));
                 const std::wstring line = std::wstring(cur ? L"▶ " : past ? L"✓ " : L"・ ") + phaseName(p);
@@ -877,6 +868,10 @@ LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == kPopupTimer) {
+                if (!IsWindowVisible(hwnd)) {
+                    KillTimer(hwnd, kPopupTimer);
+                    return 0;
+                }
                 if (g->popupView == 1 && GetTickCount64() - g->overallAt > 5000) countOverall();
                 if (g->taskDragFrom < 0) refreshTasks();
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -1005,7 +1000,7 @@ void togglePopup(bool toggle = true, int view = -1) {
         else InvalidateRect(g->popup, nullptr, FALSE);
         return;
     }
-    const int w = popupPx(400), h = popupPx(440);
+    const int w = popupPx(400), h = popupPx(500);
     POINT pt;
     GetCursorPos(&pt);
     RECT work{};
@@ -1016,6 +1011,8 @@ void togglePopup(bool toggle = true, int view = -1) {
     const int x = std::clamp(static_cast<int>(pt.x - w / 2), static_cast<int>(work.left), static_cast<int>(work.right - w));
     const int y = pt.y > (work.top + work.bottom) / 2 ? static_cast<int>(work.bottom - h - popupPx(8)) : static_cast<int>(work.top + popupPx(8));
     SetWindowPos(g->popup, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    // SetWindowPos で出した時は WM_SHOWWINDOW が来ないので、ここで 1 秒ごとの描き直しを始める
+    SetTimer(g->popup, kPopupTimer, 1000, nullptr);
     SetForegroundWindow(g->popup);
     if (g->popupView == 1) countOverall();
     InvalidateRect(g->popup, nullptr, FALSE);

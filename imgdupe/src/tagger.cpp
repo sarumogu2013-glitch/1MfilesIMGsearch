@@ -136,17 +136,45 @@ int taggerStageVersion(const std::string& modelVersion) {
     return static_cast<int>(h & 0x7fffffff) | 1;  // 0 にならないように
 }
 
-AnalyzerOutput TaggerAnalyzer::analyze(const AnalyzerInput& in) {
-    AnalyzerOutput out;
+std::shared_ptr<void> TaggerAnalyzer::prepare(const AnalyzerInput& in) {
     const int side = model_->inputSide();
     std::vector<uint8_t> px;
     int w = 0, h = 0;
-    if (!decode_(in.path, side, px, w, h) || w <= 0 || h <= 0 || w > side || h > side) {
+    if (!decode_(in.path, side, px, w, h) || w <= 0 || h <= 0 || w > side || h > side) return nullptr;
+    auto input = std::make_shared<std::vector<float>>(static_cast<size_t>(side) * side * 3);
+    prepareTaggerInput(px.data(), w, h, side, input->data());
+    return input;
+}
+
+void TaggerAnalyzer::inferBatch(const std::vector<std::shared_ptr<void>>& prepared, std::vector<AnalyzerOutput>& outs) {
+    const size_t n = prepared.size();
+    if (!n) return;
+    const size_t one = static_cast<size_t>(model_->inputSide()) * model_->inputSide() * 3;
+    std::vector<float> input(one * n);
+    for (size_t k = 0; k < n; ++k) {
+        const auto& v = *std::static_pointer_cast<std::vector<float>>(prepared[k]);
+        std::copy(v.begin(), v.end(), input.begin() + static_cast<std::ptrdiff_t>(one * k));
+    }
+    std::vector<float> probs;
+    std::string error;
+    if (!model_->runBatch(input, n, probs, error) || probs.empty() || probs.size() % n != 0) {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        lastError_ = error;
+        for (auto& o : outs) o.ok = false;
+        return;
+    }
+    const size_t per = probs.size() / n;
+    for (size_t k = 0; k < n; ++k) outs[k].tags = taggerTags(probs.data() + per * k, per, labels_);
+}
+
+AnalyzerOutput TaggerAnalyzer::analyze(const AnalyzerInput& in) {
+    AnalyzerOutput out;
+    const auto prepared = prepare(in);
+    if (!prepared) {
         out.ok = false;
         return out;
     }
-    std::vector<float> input(static_cast<size_t>(side) * side * 3);
-    prepareTaggerInput(px.data(), w, h, side, input.data());
+    const std::vector<float>& input = *std::static_pointer_cast<std::vector<float>>(prepared);
     std::vector<float> probs;
     std::string error;
     if (!model_->run(input, probs, error)) {

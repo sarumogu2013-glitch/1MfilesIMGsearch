@@ -67,6 +67,11 @@ public:
     virtual int imageSide() const = 0;  // 224
     virtual size_t dim() const = 0;     // 512
     virtual bool encodeImage(const std::vector<float>& pixels, std::vector<float>& out, std::string& error) = 0;
+    // 一度に流せる枚数（1 なら 1 枚ずつ）。pixels は n 枚分を続けたもの、out も n 枚分を続けて返す
+    virtual size_t maxBatch() const { return 1; }
+    virtual bool encodeImages(const std::vector<float>& pixels, size_t n, std::vector<float>& out, std::string& error) {
+        return n == 1 && encodeImage(pixels, out, error);
+    }
     virtual bool encodeText(const std::string& text, std::vector<float>& out, std::string& error) = 0;
 };
 
@@ -81,6 +86,9 @@ public:
     std::string stageName() const override { return kStageClip; }
     int version() const override { return version_; }
     AnalyzerOutput analyze(const AnalyzerInput& in) override;
+    size_t batchSize() const override { return model_->maxBatch() > 1 ? model_->maxBatch() : 0; }
+    std::shared_ptr<void> prepare(const AnalyzerInput& in) override;
+    void inferBatch(const std::vector<std::shared_ptr<void>>& prepared, std::vector<AnalyzerOutput>& outs) override;
     bool store(Db& db, int64_t imageId, AnalyzerOutput& out) override;
     void threadBegin() override {
         if (init_) init_();

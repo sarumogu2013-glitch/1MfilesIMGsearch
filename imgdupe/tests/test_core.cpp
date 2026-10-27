@@ -670,12 +670,30 @@ static void testIndexer() {
     IndexProgress prog;
     std::atomic<bool> cancel{false};
 
+    // GPU の側（タガー）も同時に流す: 推論を差し替えた解析器（まとめて 2 枚ずつ）
+    struct FakeGpu : Analyzer {
+        std::string stageName() const override { return stage::kTagger; }
+        int version() const override { return 7; }
+        AnalyzerOutput analyze(const AnalyzerInput&) override { return {}; }
+        size_t batchSize() const override { return 2; }
+        std::shared_ptr<void> prepare(const AnalyzerInput& in) override {
+            return in.path.find("broken") != std::string::npos ? nullptr : std::make_shared<std::string>(in.path);
+        }
+        void inferBatch(const std::vector<std::shared_ptr<void>>& prepared, std::vector<AnalyzerOutput>& outs) override {
+            for (size_t k = 0; k < prepared.size(); ++k) outs[k].tags = {{"gpu_tag", "general", "tagger", 0.9, false}};
+        }
+    };
+    cb.taggerVersion = [] { return 7; };
+    cb.makeTagger = [](std::string&) { return std::shared_ptr<Analyzer>(std::make_shared<FakeGpu>()); };
     IndexReport r = indexOnce(opt, cb, prog, cancel);
     CHECK(r.files == 4 && r.added == 4 && r.removed == 0);
     CHECK(r.hashed == 4 && decodes == 4);
-    CHECK(r.thumbs == 3 && r.failed == 1 && encodes == 4);
+    CHECK(r.thumbs == 3 && r.failed == 2 && encodes == 4);  // 読めない画像はサムネイルとタガーで 1 つずつ
     CHECK(r.metas == 4 && metas == 4);
     CHECK(prog.phase == static_cast<int>(IndexPhase::Done));
+    CHECK(r.tagged == 3);  // 読めない 1 枚は失敗
+    CHECK(prog.gpuPhase == static_cast<int>(IndexPhase::Idle));
+    CHECK((prog.doneMask & (1u << static_cast<int>(IndexPhase::Tagger))) && (prog.doneMask & (1u << static_cast<int>(IndexPhase::Thumb))));
 
     // 2 回目は何もしない。消したファイルは DB から消える
     fs::remove(pics / "b.jpg");
@@ -1496,6 +1514,50 @@ static void testTagger() {
                            return true;
                        });
     CHECK(runStage(db, ta2, 1, cancel).processed == 2);
+
+    // まとめて推論する（GPU）: 前処理はいくつものスレッドで、推論は 3 枚ずつ。結果が画像ごとに正しく戻ること
+    struct FakeBatch : Fake {
+        std::atomic<size_t> calls{0}, maxN{0}, images{0};
+        size_t maxBatch() const override { return 3; }
+        bool runBatch(const std::vector<float>& input, size_t n, std::vector<float>& out, std::string& e) override {
+            ++calls;
+            images += n;
+            maxN = std::max<size_t>(maxN, n);
+            const size_t one = input.size() / n;
+            out.clear();
+            for (size_t k = 0; k < n; ++k) {
+                std::vector<float> in(input.begin() + static_cast<std::ptrdiff_t>(one * k), input.begin() + static_cast<std::ptrdiff_t>(one * (k + 1))), o;
+                run(in, o, e);
+                out.insert(out.end(), o.begin(), o.end());
+            }
+            return true;
+        }
+    };
+    std::vector<ScannedFile> many;
+    for (int i = 0; i < 20; ++i) many.push_back({"/w" + std::to_string(i) + ".png", 1, 1});
+    for (int i = 0; i < 5; ++i) many.push_back({"/k" + std::to_string(i) + ".png", 1, 1});  // 黒い画像
+    many.push_back({"/broken.png", 1, 2});
+    const auto ids = upsertScanned(db, many);
+    auto fb = std::make_shared<FakeBatch>();
+    TaggerAnalyzer tb(fb, labels, taggerStageVersion("m3"),
+                      [](const std::string& path, int box, std::vector<uint8_t>& bgra, int& w, int& h) {
+                          if (path == "/broken.png") return false;
+                          w = h = box;
+                          bgra.assign(static_cast<size_t>(box) * box * 4, path[1] == 'k' ? 0 : 255);
+                          if (path[1] == 'k')
+                              for (size_t i = 3; i < bgra.size(); i += 4) bgra[i] = 255;  // 不透明の黒
+                          return true;
+                      });
+    CHECK(tb.batchSize() == 3);
+    rep = runStage(db, tb, 4, cancel);
+    CHECK(rep.processed == ids.size() + 1 && rep.failed == 1);  // 前からある /a.png も
+    CHECK(fb->maxN == 3 && fb->images == ids.size() && fb->calls < fb->images);  // 読めない画像は推論に回さない
+    auto hasGirl = [&](const std::string& p) {  // 白い画像だけ 1girl
+        for (const auto& x : tagsOf(db, ids.at(p)))
+            if (x.tag == "1girl") return true;
+        return false;
+    };
+    CHECK(hasGirl("/w0.png") && hasGirl("/w19.png") && !hasGirl("/k0.png") && !hasGirl("/k4.png"));
     fs::remove_all(dir);
 }
 
