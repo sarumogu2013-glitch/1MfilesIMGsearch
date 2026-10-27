@@ -108,7 +108,10 @@ Outcome combine(Outcome a, Outcome b) {
 Outcome runOne(Db& db, RunState& s, IndexPhase phase, Analyzer& a, const std::vector<int64_t>* within, unsigned threads,
                std::atomic<int>& phaseOut, Progress& prog, IndexReport& rep, size_t& counter, bool countFailed) {
     phaseOut = static_cast<int>(phase);
-    const StageReport sr = runStage(db, a, threads, s.cancel, &prog, 256, within, s.opt.preempt);
+    // 1 スレッドだけの時（控えめで操作中）は前処理が遅く、GPU が数枚ごとに動いたり止まったりする。
+    // まとめた数の 4 倍たまってから続けて流し、その間は休ませる（細かく波打つと、グラフィックカードから音が出やすい）
+    const size_t burst = threads <= 1 && a.batchSize() ? a.batchSize() * 4 : 0;
+    const StageReport sr = runStage(db, a, threads, s.cancel, &prog, 256, within, s.opt.preempt, burst);
     counter += countFailed ? sr.processed : sr.processed - sr.failed;
     rep.failed += sr.failed;
     const Outcome o = outcomeOf(sr);

@@ -12,10 +12,14 @@ namespace imgdupe {
 namespace {
 
 // 前処理と推論を分けた解析器: 前処理のスレッドが読んだ順に待ち行列に入れ、推論のスレッドが batchSize 枚ずつ取り出して続けて流す。
-// 待ち行列は batchSize の 3 倍まで（前処理だけが先に進んでメモリを使い切らないように）
+// burst があれば、待ち行列に burst 枚たまってから流し始め、たまっている間は続けて流す（前処理が遅い時に、GPU が
+// 数枚ごとに動いたり止まったりを繰り返さず、まとめて動いてしばらく休むようにする）。
+// 待ち行列は batchSize の 3 倍（burst があればその 2 倍）まで（前処理だけが先に進んでメモリを使い切らないように）
 void runBatched(Analyzer& analyzer, const std::vector<AnalyzerInput>& inputs, std::vector<AnalyzerOutput>& outputs,
-                std::vector<uint8_t>& finished, unsigned threads, const std::atomic<bool>& cancel, Progress* progress) {
-    const size_t batch = std::max<size_t>(1, analyzer.batchSize()), limit = batch * 3;
+                std::vector<uint8_t>& finished, unsigned threads, const std::atomic<bool>& cancel, Progress* progress, size_t burst) {
+    const size_t batch = std::max<size_t>(1, analyzer.batchSize()), start = std::max(batch, burst);
+    const size_t limit = std::max(batch * 3, burst * 2);
+    bool flowing = false;  // 流している途中（batch 枚あれば続ける）
     std::mutex m;
     std::condition_variable readyCv, roomCv;
     std::deque<std::pair<size_t, std::shared_ptr<void>>> ready;
@@ -60,7 +64,7 @@ void runBatched(Analyzer& analyzer, const std::vector<AnalyzerInput>& inputs, st
             std::unique_lock<std::mutex> lock(m);
             // 止める指示（cancel）は知らせが来ないので、少しずつ待って見直す
             while (!readyCv.wait_for(lock, std::chrono::milliseconds(200),
-                                     [&] { return ready.size() >= batch || producing == 0 || cancel; })) {
+                                     [&] { return ready.size() >= (flowing ? batch : start) || producing == 0 || cancel; })) {
             }
             if (cancel) break;
             while (!ready.empty() && idx.size() < batch) {
@@ -69,6 +73,7 @@ void runBatched(Analyzer& analyzer, const std::vector<AnalyzerInput>& inputs, st
                 ready.pop_front();
             }
             roomCv.notify_all();
+            flowing = ready.size() >= batch;  // 続けて流せる分が残っていれば、待たずに続ける
             if (idx.empty() && producing == 0) break;
         }
         if (idx.empty()) continue;
@@ -113,7 +118,7 @@ void runEach(Analyzer& analyzer, const std::vector<AnalyzerInput>& inputs, std::
 }  // namespace
 
 StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::atomic<bool>& cancel, Progress* progress,
-                     size_t batch, const std::vector<int64_t>* within, const std::atomic<bool>* yield) {
+                     size_t batch, const std::vector<int64_t>* within, const std::atomic<bool>* yield, size_t burst) {
     StageReport rep;
     const std::string name = analyzer.stageName();
     const int version = analyzer.version();
@@ -148,7 +153,7 @@ StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::at
         }
         std::vector<AnalyzerOutput> outputs(ids.size());
         std::vector<uint8_t> finished(ids.size(), 0);
-        if (analyzer.batchSize()) runBatched(analyzer, inputs, outputs, finished, threads, cancel, progress);
+        if (analyzer.batchSize()) runBatched(analyzer, inputs, outputs, finished, threads, cancel, progress, burst);
         else runEach(analyzer, inputs, outputs, finished, threads, cancel, progress);
 
         db.begin();

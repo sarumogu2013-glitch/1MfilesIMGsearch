@@ -1552,6 +1552,16 @@ static void testTagger() {
     rep = runStage(db, tb, 4, cancel);
     CHECK(rep.processed == ids.size() + 1 && rep.failed == 1);  // 前からある /a.png も
     CHECK(fb->maxN == 3 && fb->images == ids.size() && fb->calls < fb->images);  // 読めない画像は推論に回さない
+    // 前処理が 1 スレッドの時は burst 枚たまってから続けて流す（結果は同じ）
+    {
+        Stmt st(db.handle(), "DELETE FROM stages WHERE stage='tagger'");
+        st.step();
+    }
+    fb->calls = 0;
+    fb->images = 0;
+    fb->maxN = 0;
+    rep = runStage(db, tb, 1, cancel, nullptr, 256, nullptr, nullptr, 12);
+    CHECK(rep.processed == ids.size() + 1 && rep.failed == 1 && fb->images == ids.size() && fb->maxN == 3);
     auto hasGirl = [&](const std::string& p) {  // 白い画像だけ 1girl
         for (const auto& x : tagsOf(db, ids.at(p)))
             if (x.tag == "1girl") return true;
