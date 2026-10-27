@@ -81,6 +81,8 @@ class ExplorerHost {
   virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
   virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
   virtual void ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) = 0;  // この画像からタグを外す（手動で「違う」）
+  virtual void ExplorerAddTag(const std::vector<std::wstring>& paths, const std::wstring& tag) = 0;  // 画像にタグを付ける（手動で「正しい」）
+  virtual void ExplorerDropTag(const std::wstring& tag, POINT screen) = 0;  // 取り置いたタグをエクスプローラーの外に落とした
   virtual std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) = 0;  // 画像のプロパティ（名前と値）
   virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
   virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
@@ -108,6 +110,7 @@ class Explorer {
   std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）
   bool ShowingList() const;                         // 検索の結果を出している
   void RefreshStates();  // インデックスの状態を読み直す
+  void PreviewFile(const std::wstring& path);  // 一覧に無い画像をプレビューに出す（一覧で選び直すと戻る）
   void RefreshTags();    // タグの表示名が変わった
   // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ。
   // entries: 1 つずつの項目。2 枚以上の束は「まとまり」（重なった絵で出し、開くと中の画像の一覧）。

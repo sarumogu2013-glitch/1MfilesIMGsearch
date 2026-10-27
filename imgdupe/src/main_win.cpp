@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
@@ -238,7 +239,7 @@ struct App {
     bool tagJapanese = true;                                // タグを日本語で出す（imgdupe.ini の tagJapanese）
     std::wstring reselectPath;       // 次の検索の結果で選ぶ画像（タグをクリックして探した時に選んでいた画像）
     std::wstring returnDir, returnSel;
-    SYSTEMTIME dateShown[2]{};          // 日付の欄に出している日（チェックなしの時もホイールで変えられるように覚える）  // 検索の結果を出す前に見ていたフォルダと選んでいた項目（条件を空にして探すと戻る）
+  // 検索の結果を出す前に見ていたフォルダと選んでいた項目（条件を空にして探すと戻る）
     std::vector<int64_t> idsFilter;  // 検索の条件の「選んだ画像」（選んだ画像を保存したスマートフォルダを開いた時）
     bool fillingSources = false;
     // 出どころの数（全部のタグを数えるので重い。裏で数えて覚えておく）
@@ -320,6 +321,8 @@ struct ExplorerApp : ExplorerHost {
     std::wstring ExplorerTagLabel(const std::wstring& tag) override;
     void ExplorerRenameTag(const std::wstring& tag) override;
     void ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) override;
+    void ExplorerAddTag(const std::vector<std::wstring>& paths, const std::wstring& tag) override;
+    void ExplorerDropTag(const std::wstring& tag, POINT screen) override;
     std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) override;
     void ExplorerSaveSelection() override;
     void ExplorerTagSelection() override;
@@ -1493,10 +1496,209 @@ void refreshSources(bool changed = false) {
     }).detach();
 }
 
+// ---------------------------------------------------------------- 日付の欄（チェック・年・月・日を自分で描く）
+// 年・月・日はそれぞれ別の場所に描くので、その上でホイールを回すとその欄だけが変わる（Windows の日付の部品は欄の場所が分からない）
+
+constexpr UINT DBN_CHANGED = 1;  // 親への WM_COMMAND の通知: 日付かチェックが変わった
+
+struct DateBox {
+    bool on = false;
+    int y = 2000, m = 1, d = 1;
+    int focus = 0;   // キーで変える欄（0 年、1 月、2 日）
+    int hover = -1;  // マウスの下の欄
+    RECT check{}, parts[3]{};
+};
+
+int daysInMonth(int y, int m) {
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return m == 2 && leap ? 29 : d[std::clamp(m, 1, 12) - 1];
+}
+
+DateBox* dateBoxOf(HWND h) { return reinterpret_cast<DateBox*>(GetWindowLongPtrW(h, GWLP_USERDATA)); }
+
+void dateBoxChanged(HWND h) {
+    InvalidateRect(h, nullptr, FALSE);
+    SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(h), DBN_CHANGED), reinterpret_cast<LPARAM>(h));
+}
+
+// 欄 part を step だけ変える（日は月をまたぐ。月は年をまたぐ）
+void dateBoxStep(DateBox& b, int part, int step) {
+    if (part == 0) b.y += step;
+    else if (part == 1) {
+        b.m += step;
+        while (b.m < 1) b.m += 12, --b.y;
+        while (b.m > 12) b.m -= 12, ++b.y;
+    } else {
+        b.d += step;
+        if (b.d < 1) {
+            if (--b.m < 1) b.m = 12, --b.y;
+            b.d = daysInMonth(b.y, b.m);
+        } else if (b.d > daysInMonth(b.y, b.m)) {
+            b.d = 1;
+            if (++b.m > 12) b.m = 1, ++b.y;
+        }
+    }
+    b.y = std::clamp(b.y, 1970, 2999);
+    b.d = std::min(b.d, daysInMonth(b.y, b.m));
+}
+
+int dateBoxPartAt(const DateBox& b, POINT pt) {
+    for (int i = 0; i < 3; ++i)
+        if (PtInRect(&b.parts[i], pt)) return i;
+    // 欄の間（「年」「月」の文字の上など）は、近い方の欄
+    int best = -1, dist = INT_MAX;
+    for (int i = 0; i < 3; ++i) {
+        const int c = (b.parts[i].left + b.parts[i].right) / 2, dd = std::abs(pt.x - c);
+        if (pt.x > b.check.right && dd < dist) best = i, dist = dd;
+    }
+    return best;
+}
+
+LRESULT CALLBACK dateBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    DateBox* b = dateBoxOf(h);
+    switch (msg) {
+        case WM_NCCREATE:
+            SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(new DateBox));
+            break;
+        case WM_NCDESTROY:
+            delete b;
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            break;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT rc;
+            GetClientRect(h, &rc);
+            FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+            const bool focused = GetFocus() == h;
+            HGDIOBJ old = SelectObject(dc, app.font);
+            SetBkMode(dc, TRANSPARENT);
+            // チェック
+            const int cs = std::min<int>(rc.bottom - rc.top - px(6), px(15));
+            b->check = {px(4), (rc.bottom - cs) / 2, px(4) + cs, (rc.bottom - cs) / 2 + cs};
+            RECT cr = b->check;
+            DrawFrameControl(dc, &cr, DFC_BUTTON, DFCS_BUTTONCHECK | (b->on ? DFCS_CHECKED : 0));
+            // 年・月・日（使っていない時は灰色）
+            int x = b->check.right + px(6);
+            const wchar_t* units[] = {L"年", L"月", L"日"};
+            const int vals[] = {b->y, b->m, b->d};
+            for (int i = 0; i < 3; ++i) {
+                wchar_t num[8];
+                swprintf(num, 8, i == 0 ? L"%04d" : L"%02d", vals[i]);
+                SIZE sz{};
+                GetTextExtentPoint32W(dc, i == 0 ? L"0000" : L"00", i == 0 ? 4 : 2, &sz);
+                RECT pr = {x - px(2), rc.top + px(2), x + sz.cx + px(2), rc.bottom - px(2)};
+                b->parts[i] = pr;
+                if (b->hover == i || (focused && b->focus == i)) {
+                    HBRUSH hb = CreateSolidBrush(focused && b->focus == i ? RGB(204, 228, 247) : RGB(232, 240, 250));
+                    FillRect(dc, &pr, hb);
+                    DeleteObject(hb);
+                }
+                SetTextColor(dc, b->on ? RGB(20, 20, 20) : RGB(150, 150, 150));
+                RECT tr = {x, rc.top, x + sz.cx, rc.bottom};
+                DrawTextW(dc, num, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                x += sz.cx + px(2);
+                SIZE us{};
+                GetTextExtentPoint32W(dc, units[i], 1, &us);
+                RECT ur = {x, rc.top, x + us.cx, rc.bottom};
+                SetTextColor(dc, RGB(110, 110, 110));
+                DrawTextW(dc, units[i], -1, &ur, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                x += us.cx + px(4);
+            }
+            SelectObject(dc, old);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(h, &pt);
+            const int part = dateBoxPartAt(*b, pt);
+            if (part < 0) return 0;
+            dateBoxStep(*b, part, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
+            b->on = true;  // ホイールで変えたら使う
+            b->focus = part;
+            dateBoxChanged(h);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            int part = -1;
+            for (int i = 0; i < 3; ++i)
+                if (PtInRect(&b->parts[i], pt)) part = i;
+            if (part != b->hover) {
+                b->hover = part;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            b->hover = -1;
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONDOWN: {
+            SetFocus(h);
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (pt.x <= b->check.right + px(3)) {
+                b->on = !b->on;
+                dateBoxChanged(h);
+                return 0;
+            }
+            const int part = dateBoxPartAt(*b, pt);
+            if (part >= 0) b->focus = part;
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
+        case WM_KEYDOWN:
+            if (wp == VK_LEFT || wp == VK_RIGHT) {
+                b->focus = std::clamp(b->focus + (wp == VK_RIGHT ? 1 : -1), 0, 2);
+                InvalidateRect(h, nullptr, FALSE);
+            } else if (wp == VK_UP || wp == VK_DOWN || wp == VK_PRIOR || wp == VK_NEXT) {
+                dateBoxStep(*b, b->focus, wp == VK_UP ? 1 : wp == VK_DOWN ? -1 : wp == VK_PRIOR ? 10 : -10);
+                b->on = true;
+                dateBoxChanged(h);
+            } else if (wp == VK_SPACE) {
+                b->on = !b->on;
+                dateBoxChanged(h);
+            }
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void registerDateBox() {
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = dateBoxProc;
+    wc.hInstance = app.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"ImgdupeDateBox";
+    RegisterClassExW(&wc);
+}
+
+void dateBoxSet(HWND h, bool on, int y, int m, int d) {
+    if (DateBox* b = dateBoxOf(h)) {
+        b->on = on;
+        b->y = y;
+        b->m = m;
+        b->d = d;
+        InvalidateRect(h, nullptr, FALSE);
+    }
+}
+
 std::optional<int64_t> pickerDate(HWND h, bool endOfDay) {
-    SYSTEMTIME st{};
-    if (DateTime_GetSystemtime(h, &st) != GDT_VALID) return std::nullopt;
-    return civilToUnix(st.wYear, st.wMonth, st.wDay, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
+    const DateBox* b = dateBoxOf(h);
+    if (!b || !b->on) return std::nullopt;
+    return civilToUnix(b->y, b->m, b->d, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
 }
 
 // 並べ替えの選択肢（検索のリボンの並び）
@@ -1558,71 +1760,9 @@ void advancedChanged() {
 void resetDatePickers() {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    SYSTEMTIME from = now;
-    from.wYear = static_cast<WORD>(from.wYear - 1);
-    if (from.wMonth == 2 && from.wDay == 29) from.wDay = 28;
-    DateTime_SetSystemtime(app.s.from, GDT_VALID, &from);
-    DateTime_SetSystemtime(app.s.to, GDT_VALID, &now);
-    // チェックを外す（日付も渡す。Wine は日付が無いと GDT_NONE を無視する）
-    DateTime_SetSystemtime(app.s.from, GDT_NONE, &from);
-    DateTime_SetSystemtime(app.s.to, GDT_NONE, &now);
-    app.dateShown[0] = from;
-    app.dateShown[1] = now;
-}
-
-int daysInMonth(int y, int m) {
-    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    return m == 2 && leap ? 29 : d[std::clamp(m, 1, 12) - 1];
-}
-
-// 日付の欄の上でホイール: カーソルの下の年・月・日を 1 ずつ変え、日付を使う状態（チェックあり）にする
-LRESULT CALLBACK datePickerWheelProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    if (msg != WM_MOUSEWHEEL) return DefSubclassProc(h, msg, wp, lp);
-    POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-    ScreenToClient(h, &pt);
-    RECT rc;
-    GetClientRect(h, &rc);
-    // 文字の位置: 左のチェックの箱の後ろに「yyyy/MM/dd」
-    HDC dc = GetDC(h);
-    HGDIOBJ old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(h, WM_GETFONT, 0, 0)));
-    SIZE year{}, month{}, slash{};
-    GetTextExtentPoint32W(dc, L"0000", 4, &year);
-    GetTextExtentPoint32W(dc, L"00", 2, &month);
-    GetTextExtentPoint32W(dc, L"/", 1, &slash);
-    SelectObject(dc, old);
-    ReleaseDC(h, dc);
-    const int x0 = GetSystemMetrics(SM_CXMENUCHECK) + px(2);  // 左のチェックの箱
-    const int field = pt.x < x0 + year.cx + slash.cx / 2 ? 0 : pt.x < x0 + year.cx + slash.cx + month.cx + slash.cx / 2 ? 1 : 2;
-    const int which = h == app.s.from ? 0 : 1;
-    SYSTEMTIME st{};
-    if (DateTime_GetSystemtime(h, &st) != GDT_VALID) st = app.dateShown[which];
-    const int step = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1;
-    int y = st.wYear, m = st.wMonth, d = st.wDay;
-    if (field == 0) y += step;
-    else if (field == 1) {
-        m += step;
-        if (m < 1) m = 12, --y;
-        if (m > 12) m = 1, ++y;
-    } else {
-        d += step;
-        if (d < 1) {
-            if (--m < 1) m = 12, --y;
-            d = daysInMonth(y, m);
-        } else if (d > daysInMonth(y, m)) {
-            d = 1;
-            if (++m > 12) m = 1, ++y;
-        }
-    }
-    y = std::clamp(y, 1970, 2999);
-    d = std::min(d, daysInMonth(y, m));
-    st.wYear = static_cast<WORD>(y);
-    st.wMonth = static_cast<WORD>(m);
-    st.wDay = static_cast<WORD>(d);
-    DateTime_SetSystemtime(h, GDT_VALID, &st);
-    app.dateShown[which] = st;
-    advancedChanged();
-    return 0;
+    const int fd = now.wMonth == 2 && now.wDay == 29 ? 28 : now.wDay;
+    dateBoxSet(app.s.from, false, now.wYear - 1, now.wMonth, fd);
+    dateBoxSet(app.s.to, false, now.wYear, now.wMonth, now.wDay);
 }
 
 // 条件が変わったら、少し待ってから探す（スライダーを動かしている間や、文字を打っている間は探さない）
@@ -2070,11 +2210,7 @@ void applyQueryToUi(const SearchQuery& q) {
         if (!t) return;
         int y, mo, d, hh, mi, ss;
         unixToCivil(t, y, mo, d, hh, mi, ss);
-        SYSTEMTIME st{};
-        st.wYear = static_cast<WORD>(y);
-        st.wMonth = static_cast<WORD>(mo);
-        st.wDay = static_cast<WORD>(d);
-        DateTime_SetSystemtime(h, GDT_VALID, &st);
+        dateBoxSet(h, true, y, mo, d);
     };
     setDate(app.s.from, q.takenFrom);
     setDate(app.s.to, q.takenTo);
@@ -3912,6 +4048,41 @@ void ExplorerApp::ExplorerFindSimilarAi(const std::wstring& path) {
 
 std::wstring ExplorerApp::ExplorerTagLabel(const std::wstring& tag) { return tagLabel(narrow(tag)); }
 
+// 取り置いたタグを画像に落とした: 検索用タグとして手動で「正しい」と確定する（確度 1.0。Ctrl+Z で戻せる。ファイルは書き換えない）
+void ExplorerApp::ExplorerAddTag(const std::vector<std::wstring>& paths, const std::wstring& tag) {
+    Db* db = uiDb();
+    if (!db) return;
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    std::vector<int64_t> ids;
+    for (const auto& p : paths)
+        if (const int64_t id = findImageId(*db, narrow(p), roots)) ids.push_back(id);
+    if (ids.empty()) {
+        MessageBoxW(app.hwnd, L"インデックスに無い画像にはタグを付けられません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    const std::string t = narrow(tag);
+    const std::string what = ids.size() == 1 ? "タグを付ける: " + t : std::to_string(ids.size()) + " 枚に「" + t + "」";
+    editSelectedTags(ids, what, [&](Db& d, int64_t imageId, TagHistory& history) {
+        history.touch(imageId, t);
+        setManualTag(d, imageId, t, true);
+    });
+}
+
+// 取り置いたタグをエクスプローラーの外に落とした: 検索のフリーワードの欄なら、語として足す（探すのは Enter か「検索」で）
+void ExplorerApp::ExplorerDropTag(const std::wstring& tag, POINT screen) {
+    HWND under = WindowFromPoint(screen);
+    if (under != app.s.free) return;
+    std::wstring text = editText(app.s.free);
+    while (!text.empty() && text.back() == L' ') text.pop_back();
+    text += (text.empty() ? L"" : L" ") + tag;
+    SetWindowTextW(app.s.free, text.c_str());
+    // 「タイトルに限る」ではタグに合わないので、「すべて」にする
+    if (ComboBox_GetCurSel(app.s.scope) == 2) ComboBox_SetCurSel(app.s.scope, 0);
+    SetFocus(app.s.free);
+    SendMessageW(app.s.free, EM_SETSEL, text.size(), text.size());
+}
+
 // この画像からタグを外す: 手動で「違う」と確定する（Ctrl+Z で戻せる。ファイルは書き換えない）
 void ExplorerApp::ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) {
     Db* db = uiDb();
@@ -4304,9 +4475,9 @@ void layoutAdvanced(int y, int W, int h) {
     x = m;
     lbl(app.s.lDate, px(30));
     put(app.s.dateField, px(90), px(200));
-    put(app.s.from, px(120));
+    put(app.s.from, px(170));
     lbl(app.s.lDateTo, px(14));
-    put(app.s.to, px(120));
+    put(app.s.to, px(170));
     put(app.s.unclassified, px(130));
     put(app.s.deadLinks, px(90));
     cy += rowH + px(5);
@@ -4401,14 +4572,11 @@ void createSearchControls() {
     app.s.download = edit(IDC_S_DOWNLOAD, ap);
     app.s.lDate = label(L"日付", ap);
     app.s.dateField = combo(IDC_S_DATEFIELD, ap, {L"撮影日", L"更新日時", L"作成日時"});
-    app.s.from = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHOWNONE, IDC_S_FROM);
+    // 年・月・日の上でホイールを回すと、その欄が 1 ずつ変わる（自分で描く日付の欄）
+    registerDateBox();
+    app.s.from = makeControl(L"ImgdupeDateBox", L"", WS_TABSTOP, IDC_S_FROM, WS_EX_CLIENTEDGE);
     app.s.lDateTo = label(L"〜", ap);
-    app.s.to = makeControl(DATETIMEPICK_CLASSW, L"", WS_TABSTOP | DTS_SHOWNONE, IDC_S_TO);
-    // 年・月・日の上でホイールを回すと、その欄が 1 ずつ変わる（年/月/日 の並びで固定）
-    for (HWND h : {app.s.from, app.s.to}) {
-        DateTime_SetFormat(h, L"yyyy'/'MM'/'dd");
-        SetWindowSubclass(h, datePickerWheelProc, 1, 0);
-    }
+    app.s.to = makeControl(L"ImgdupeDateBox", L"", WS_TABSTOP, IDC_S_TO, WS_EX_CLIENTEDGE);
     resetDatePickers();
     ap.insert(ap.end(), {app.s.from, app.s.to});
     {
@@ -4472,8 +4640,12 @@ void createSearchControls() {
         {app.s.minKb, L"ファイルサイズの下限（KB）"},
         {app.s.maxKb, L"ファイルサイズの上限（KB）"},
         {app.s.dateField, L"日付の条件にどの日時を使うか"},
-        {app.s.from, L"この日から（チェックを入れると使います）。年・月・日の上でホイールを回すと、その欄が変わります"},
-        {app.s.to, L"この日まで（チェックを入れると使います）。年・月・日の上でホイールを回すと、その欄が変わります"},
+        {app.s.from,
+         L"この日から（左のチェックを入れると使います）。年・月・日それぞれの上でホイールを回すと、その欄が 1 ずつ変わります"
+         L"（クリックして ↑↓ キーでも。PageUp / PageDown で 10 ずつ）"},
+        {app.s.to,
+         L"この日まで（左のチェックを入れると使います）。年・月・日それぞれの上でホイールを回すと、その欄が 1 ずつ変わります"
+         L"（クリックして ↑↓ キーでも。PageUp / PageDown で 10 ずつ）"},
         {app.s.unclassified, L"タグが 1 つも無い画像だけ"},
         {app.s.deadLinks, L"出典の投稿が消えている画像だけ（出典を確かめる設定にしてある時）"},
         {app.s.path, L"パスにこの文字を含む画像だけ"},
@@ -4545,10 +4717,6 @@ bool onSearchNotify(NMHDR* nm) {
         }
         return true;
     }
-    if ((nm->hwndFrom == app.s.from || nm->hwndFrom == app.s.to) && nm->code == DTN_DATETIMECHANGE) {
-        advancedChanged();
-        return true;
-    }
     if (nm->hwndFrom == app.tabs && nm->code == TCN_SELCHANGE) {
         switchTab(kTabOrder[std::clamp(TabCtrl_GetCurSel(app.tabs), 0, 3)]);
         return true;
@@ -4575,6 +4743,9 @@ bool onSearchCommand(WPARAM wp) {
             return true;
         case IDC_S_GO:
             runSearch();
+            return true;
+        case IDC_S_FROM: case IDC_S_TO:
+            if (code == DBN_CHANGED) advancedChanged();
             return true;
         case IDC_S_ADVANCED:
             toggleAdvanced();
@@ -4868,6 +5039,7 @@ std::wstring storeQuery(const std::wstring& ext, const std::function<bool(const 
     }
     app.querySel = path;
     refreshQueryFiles();
+    if (ex.view) ex.view->PreviewFile(path);  // 足した画像をプレビューに出す
     return path;
 }
 
@@ -5200,6 +5372,7 @@ LRESULT CALLBACK queryStripProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (i >= 0) {
                 app.querySel = app.queryFiles[i];
                 drawQueryStripLater();
+                if (ex.view) ex.view->PreviewFile(app.querySel);  // 右のプレビューに出す
             }
             return 0;
         }
@@ -5242,6 +5415,7 @@ LRESULT CALLBACK queryStripProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 i = std::clamp(i + (wp == VK_RIGHT ? 1 : -1), 0, static_cast<int>(app.queryFiles.size()) - 1);
                 app.querySel = app.queryFiles[i];
                 drawQueryStripLater();
+                if (ex.view) ex.view->PreviewFile(app.querySel);
             }
             return 0;
         case WM_GETDLGCODE:
@@ -6480,6 +6654,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         // ショートカットキー（ダイアログの Enter・Tab などより先に見る）
         if (handleShortcut(msg)) continue;
+        // ホイールは、カーソルの下の日付の欄に送る（Windows の設定によってはフォーカスのある部品に行くので）
+        if (msg.message == WM_MOUSEWHEEL) {
+            POINT pt{GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam)};
+            HWND under = WindowFromPoint(pt);
+            if (under && (under == app.s.from || under == app.s.to) && under != msg.hwnd) {
+                SendMessageW(under, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
+                continue;
+            }
+        }
         if (IsDialogMessageW(hwnd, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);

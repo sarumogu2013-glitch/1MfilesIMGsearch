@@ -45,6 +45,7 @@ constexpr wchar_t kGridClass[] = L"imgdupe_explorer_grid";
 constexpr wchar_t kPreviewClass[] = L"imgdupe_explorer_preview";
 constexpr wchar_t kTrayClass[] = L"imgdupe_explorer_tray";
 constexpr wchar_t kViewBarClass[] = L"imgdupe_explorer_viewbar";
+constexpr wchar_t kCrumbClass[] = L"imgdupe_explorer_crumbs";
 const wchar_t kListMarker[] = L"\x01list";  // 戻るの履歴で「検索の結果」を表す
 constexpr UINT WM_THUMB_DONE = WM_APP + 41;  // lParam = ThumbResult*
 constexpr UINT_PTR kStateTimer = 1;
@@ -420,7 +421,8 @@ class ExplorerImpl {
   HWND hwnd = nullptr, grid = nullptr;
   HWND upBtn = nullptr, pathText = nullptr, sizeBox = nullptr, slider = nullptr, folderBox = nullptr;
   HWND sizeLabel = nullptr, folderLabel = nullptr, viewLabel = nullptr, sortLabel = nullptr;
-  HWND viewBar = nullptr;  // 表示・並び順・大きさ・表紙・パネルの切り替え（ホームのリボンに置く。親はホストの窓）
+  HWND viewBar = nullptr;
+  HWND crumbs = nullptr;  // アドレスバー: フォルダの階層ごとのボタン（クリックで移動、ドラッグでフォルダを外へ、空いた所のクリックで文字で入力）  // 表示・並び順・大きさ・表紙・パネルの切り替え（ホームのリボンに置く。親はホストの窓）
   HWND backBtn = nullptr, forwardBtn = nullptr, treeBtn = nullptr, previewBtn = nullptr;
   HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
@@ -449,6 +451,9 @@ class ExplorerImpl {
     std::vector<std::wstring> paths;
     for (auto& p : SelectedPaths())
       if (!p.empty()) paths.push_back(p);
+    DragPathsOut(paths);
+  }
+  void DragPathsOut(const std::vector<std::wstring>& paths) {
     if (paths.empty()) return;
     auto* data = new FileDataObject(paths);
     auto* source = new DropSource();
@@ -686,6 +691,8 @@ class ExplorerImpl {
     std::wstring title = listTitle;
     if (stackIndex >= 0) title += L"　＞　まとまり（" + std::to_wstring(items.size()) + L" 枚）";
     SetWindowTextW(pathText, title.c_str());
+    shownTitle = title;
+    if (crumbs) InvalidateRect(crumbs, nullptr, TRUE);
     UpdateNavButtons();
     UpdateSortBox();
     UpdateScroll();
@@ -767,6 +774,7 @@ class ExplorerImpl {
     LoadStates();
     SetWindowTextW(pathText, dir.c_str());
     SendMessageW(pathText, EM_SETSEL, WPARAM(dir.size()), LPARAM(dir.size()));  // 長い時は末尾 (今のフォルダ名) が見えるように
+    if (crumbs) InvalidateRect(crumbs, nullptr, TRUE);
     UpdateNavButtons();
     UpdateScroll();
     EnsureVisible(sel);
@@ -914,7 +922,27 @@ class ExplorerImpl {
     Frame(dc, r, RGB(0, 120, 215));
   }
 
+  // プレビューに出すもの: 外の画像（画像で探すで選んだ画像）を出していればそれ、ほかは選んでいる項目
+  Item external;
+  bool showingExternal = false;
+  const Item* PreviewItem() const {
+    if (showingExternal) return &external;
+    return sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+  }
+  void PreviewFile(const std::wstring& path) {
+    external = Item{};
+    external.path = path;
+    external.name = path.substr(path.find_last_of(L"\\/") + 1);
+    external.image = true;
+    showingExternal = true;
+    UpdatePreview(true);
+  }
+
   void NotifySelected() {
+    if (showingExternal) {  // 一覧で選び直した: 外の画像はやめる
+      showingExternal = false;
+      UpdatePreview(true);
+    }
     const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
     host->ExplorerSelected(it ? it->path : std::wstring(), it && it->image);
   }
@@ -998,7 +1026,7 @@ class ExplorerImpl {
     if (attr == INVALID_FILE_ATTRIBUTES) {
       MessageBoxW(hwnd, (L"見つかりません。\n" + text).c_str(), L"imgdupe", MB_ICONWARNING);
       SetWindowTextW(pathText, dir.c_str());
-      SetFocus(pathText);
+      BeginEditPath();
       SendMessageW(pathText, EM_SETSEL, 0, -1);
       return;
     }
@@ -2005,6 +2033,11 @@ class ExplorerImpl {
       const Thumb* t = CachedThumb(it);
       if (it.Thumbable() && (!t || t->bucket < bucket)) requested = true;
       DrawThumb(dc, mem, it, t, box);
+      if (i == tagDropItem) {  // 取り置いたタグを落とす先
+        Frame(dc, inner, RGB(0, 150, 70));
+        RECT in2 = {inner.left + 1, inner.top + 1, inner.right - 1, inner.bottom - 1};
+        Frame(dc, in2, RGB(0, 150, 70));
+      }
       RECT tr = {cell.left + Px(4), box.bottom + Px(4), cell.right - Px(4), cell.bottom - Px(2)};
       SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
       DrawTextW(dc, DisplayName(it).c_str(), -1, &tr, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX | DT_EDITCONTROL);
@@ -2071,7 +2104,7 @@ class ExplorerImpl {
   // 選んでいるものが変わった・パネルの大きさが変わった: 大きい縮小版を頼む
   void UpdatePreview(bool force = false) {
     if (!settings.showPreview || !preview) return;
-    const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+    const Item* it = PreviewItem();
     std::wstring path = it ? it->path : std::wstring();
     int box = PreviewBox();
     int bucket = std::min(1024, (box + 63) / 64 * 64);
@@ -2136,7 +2169,7 @@ class ExplorerImpl {
     Fill(dc, {rc.left, rc.top, rc.left + 1, rc.bottom}, RGB(220, 220, 220));
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = SelectObject(dc, nameFont);
-    const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+    const Item* it = PreviewItem();
     if (!it) {
       RECT tr = rc;
       SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
@@ -2316,6 +2349,11 @@ class ExplorerImpl {
   std::vector<TrayHit> trayHits;
   RECT traySearchR = {}, trayClearR = {};
   bool trayHot = false;  // タグをドラッグして上に来ている
+  // 取り置いたタグを掴んで、画像（タグを付ける）や検索の欄（語として使う）に落とす
+  int trayDown = -1;        // 押したタグ（tray の番号）
+  bool trayDragging = false;
+  POINT trayDownPt = {};
+  int tagDropItem = -1;     // 落とす先の項目（一覧の番号。枠で示す）
 
   // タグの種類の色 (Danbooru に近い): 作者 赤、キャラ 緑、作品 紫、一般 青、ほか 灰か橙
   static COLORREF KindColor(const std::wstring& kind) {
@@ -2362,7 +2400,7 @@ class ExplorerImpl {
   void RefreshTags() {
     previewTagsPath.clear();
     previewPropsPath.clear();
-    const Item* it = sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+    const Item* it = PreviewItem();
     LoadPreviewTags(it);
     if (preview) InvalidateRect(preview, nullptr, FALSE);
     InvalidateRect(trayWnd, nullptr, FALSE);
@@ -2489,11 +2527,89 @@ class ExplorerImpl {
       case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
-      case WM_LBUTTONUP:
-        self->TrayClick(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+      case WM_LBUTTONDOWN: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        self->trayDown = -1;
+        for (const auto& h : self->trayHits)
+          if (PtInRect(&h.chip, pt) && !PtInRect(&h.close, pt)) self->trayDown = int(h.index);
+        self->trayDragging = false;
+        self->trayDownPt = pt;
+        if (self->trayDown >= 0) SetCapture(hwnd);
         return 0;
+      }
+      case WM_MOUSEMOVE:
+        if (self->trayDown >= 0 && GetCapture() == hwnd) {
+          POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+          if (!self->trayDragging && (abs(pt.x - self->trayDownPt.x) > self->Px(4) || abs(pt.y - self->trayDownPt.y) > self->Px(4)))
+            self->trayDragging = true;
+          if (self->trayDragging) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            ClientToScreen(hwnd, &pt);
+            self->SetTagDropItem(self->TagDropItemAt(pt));
+          }
+        }
+        return 0;
+      case WM_CAPTURECHANGED:
+        if (self->trayDown >= 0 && reinterpret_cast<HWND>(lp) != hwnd) {
+          self->trayDown = -1;
+          self->trayDragging = false;
+          self->SetTagDropItem(-1);
+        }
+        return 0;
+      case WM_LBUTTONUP: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int down = self->trayDown;
+        const bool dragging = self->trayDragging;
+        self->trayDown = -1;
+        self->trayDragging = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        self->SetTagDropItem(-1);
+        if (dragging && down >= 0 && down < int(self->tray.size())) {
+          POINT sp = pt;
+          ClientToScreen(hwnd, &sp);
+          self->DropTrayTag(self->tray[size_t(down)].first, sp);
+          return 0;
+        }
+        self->TrayClick(pt);
+        return 0;
+      }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+  }
+
+  // 取り置いたタグを落とす先の項目（画面の座標）。画像・まとまりの上でなければ -1
+  int TagDropItemAt(POINT screen) const {
+    if (WindowFromPoint(screen) != grid) return -1;
+    POINT pt = screen;
+    ScreenToClient(grid, &pt);
+    const int i = HitTest(pt);
+    return i >= 0 && (items[size_t(i)].image || items[size_t(i)].Stack()) ? i : -1;
+  }
+  void SetTagDropItem(int i) {
+    if (i == tagDropItem) return;
+    tagDropItem = i;
+    InvalidateRect(grid, nullptr, FALSE);
+  }
+
+  // 取り置いたタグを落とした: 画像の上なら検索用タグ（確度 1.0）として付ける（選んでいる画像の上なら選んでいる画像全部に）、
+  // プレビューの上ならプレビューの画像に、ほかはホストに任せる（検索の欄なら語として使う）
+  void DropTrayTag(const std::wstring& tag, POINT screen) {
+    HWND under = WindowFromPoint(screen);
+    std::vector<std::wstring> paths;
+    if (under == grid) {
+      const int i = TagDropItemAt(screen);
+      if (i < 0) return;
+      if (IsPicked(i)) paths = SelectedPaths();
+      else if (items[size_t(i)].Stack()) paths = items[size_t(i)].members;
+      else paths.push_back(items[size_t(i)].path);
+    } else if (under == preview) {
+      const Item* it = PreviewItem();
+      if (it && it->image) paths.push_back(it->path);
+    } else {
+      host->ExplorerDropTag(tag, screen);
+      return;
+    }
+    if (!paths.empty()) host->ExplorerAddTag(paths, tag);
   }
 
   // プレビューのタグを押した・離した
@@ -2722,6 +2838,9 @@ class ExplorerImpl {
     x += nav + Px(6);
     // 表示・並び順・大きさ・表紙・パネルの切り替えは、ホームのリボン（viewBar）にある
     MoveWindow(pathText, x, m + Px(1), std::max(Px(60), int(rc.right - m - x)), bh - Px(2), TRUE);
+    MoveWindow(crumbs, x, m + Px(1), std::max(Px(60), int(rc.right - m - x)), bh - Px(2), TRUE);
+    ShowWindow(crumbs, editingPath ? SW_HIDE : SW_SHOW);
+    ShowWindow(pathText, editingPath ? SW_SHOW : SW_HIDE);
     // 取り置いたタグ
     MoveWindow(trayWnd, 0, h, rc.right, TrayH(), TRUE);
     h += TrayH();
@@ -2765,6 +2884,227 @@ class ExplorerImpl {
     if (settings.showTree && pt.x >= tw && pt.x < tw + SplitW()) return 1;
     if (settings.showPreview && pt.x >= rc.right - pw - SplitW() && pt.x < rc.right - pw) return 2;
     return 0;
+  }
+
+  // ---------------------------------------------------------------- アドレスバー（階層ごとのボタン）
+
+  bool editingPath = false;
+  std::wstring shownTitle;  // 検索の結果の見出し（アドレスバーに出す）
+  struct Crumb {
+    std::wstring label, path;
+    RECT r{};
+  };
+  std::vector<Crumb> crumbList;
+  int crumbHover = -1, crumbPress = -1;
+  POINT crumbPressPt{};
+
+  // 今のフォルダを階層に分ける（C:\ → a → b。\\server\share は 1 つ）
+  static std::vector<Crumb> SplitCrumbs(const std::wstring& path) {
+    std::vector<Crumb> out;
+    std::wstring p = path;
+    for (auto& c : p)
+      if (c == L'/') c = L'\\';
+    size_t i = 0;
+    std::wstring acc;
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') {  // \\server\share
+      size_t a = p.find(L'\\', 2), b = a == std::wstring::npos ? a : p.find(L'\\', a + 1);
+      acc = p.substr(0, b == std::wstring::npos ? p.size() : b);
+      out.push_back({acc, acc + L"\\"});
+      i = b == std::wstring::npos ? p.size() : b + 1;
+    } else if (p.size() >= 2 && p[1] == L':') {
+      acc = p.substr(0, 2);
+      out.push_back({acc, acc + L"\\"});
+      i = p.size() > 2 && p[2] == L'\\' ? 3 : 2;
+    }
+    while (i < p.size()) {
+      size_t j = p.find(L'\\', i);
+      if (j == std::wstring::npos) j = p.size();
+      if (j > i) {
+        const std::wstring name = p.substr(i, j - i);
+        acc += (acc.empty() || acc.back() == L'\\' ? L"" : L"\\") + name;
+        out.push_back({name, acc});
+      }
+      i = j + 1;
+    }
+    return out;
+  }
+
+  void BeginEditPath() {
+    editingPath = true;
+    SetWindowTextW(pathText, listMode ? L"" : dir.c_str());
+    LayoutBar();
+    SetFocus(pathText);
+    SendMessageW(pathText, EM_SETSEL, 0, -1);
+  }
+  void EndEditPath() {
+    if (!editingPath) return;
+    editingPath = false;
+    LayoutBar();
+    InvalidateRect(crumbs, nullptr, TRUE);
+  }
+
+  void PaintCrumbs(HDC dc, const RECT& rc) {
+    Fill(dc, rc, RGB(255, 255, 255));
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ old = SelectObject(dc, font);
+    crumbList.clear();
+    if (listMode) {  // 検索の結果: 見出しの文字だけ
+      const std::wstring& t = shownTitle;
+      RECT tr = {rc.left + Px(6), rc.top, rc.right - Px(4), rc.bottom};
+      SetTextColor(dc, RGB(40, 40, 40));
+      DrawTextW(dc, t.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+      SelectObject(dc, old);
+      return;
+    }
+    std::vector<Crumb> all = SplitCrumbs(dir);
+    const int pad = Px(7), sepW = Px(14);
+    std::vector<int> widths;
+    int total = 0;
+    for (auto& c : all) {
+      SIZE sz{};
+      GetTextExtentPoint32W(dc, c.label.c_str(), int(c.label.size()), &sz);
+      widths.push_back(sz.cx + pad * 2);
+      total += sz.cx + pad * 2 + sepW;
+    }
+    // 入りきらなければ、上の階層から省く（… のクリックで文字の入力）
+    size_t first = 0;
+    const int avail = rc.right - rc.left - Px(40);
+    while (first + 1 < all.size() && total > avail) total -= widths[first++] + sepW;
+    int x = rc.left + Px(2);
+    if (first > 0) {
+      RECT er = {x, rc.top, x + Px(18), rc.bottom};
+      SetTextColor(dc, RGB(90, 90, 90));
+      DrawTextW(dc, L"…", -1, &er, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      x += Px(20);
+    }
+    for (size_t i = first; i < all.size(); i++) {
+      Crumb c = all[i];
+      c.r = {x, rc.top + Px(2), x + widths[i], rc.bottom - Px(2)};
+      const int idx = int(crumbList.size());
+      {  // どの階層も掴めるように、いつも小さなボタンの形に描く（マウスの下は青く）
+        const bool hot = idx == crumbHover || idx == crumbPress;
+        HBRUSH b = CreateSolidBrush(idx == crumbPress ? RGB(204, 228, 247) : hot ? RGB(229, 241, 251) : RGB(243, 245, 248));
+        HPEN pen = CreatePen(PS_SOLID, 1, hot ? RGB(140, 190, 235) : RGB(214, 220, 228));
+        HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, pen);
+        RoundRect(dc, c.r.left, c.r.top, c.r.right, c.r.bottom, Px(4), Px(4));
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(b);
+        DeleteObject(pen);
+      }
+      SetTextColor(dc, i + 1 == all.size() ? RGB(20, 20, 20) : RGB(50, 50, 50));
+      DrawTextW(dc, c.label.c_str(), -1, &c.r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+      x = c.r.right;
+      crumbList.push_back(c);
+      if (i + 1 < all.size()) {  // 区切りの「>」（線で描く。フォントに無いことがあるので）
+        const int cx = x + sepW / 2, cy = (rc.top + rc.bottom) / 2, a = Px(3);
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, Px(1)), RGB(130, 130, 130));
+        HGDIOBJ op = SelectObject(dc, pen);
+        POINT pts[3] = {{cx - a / 2, cy - a}, {cx + a / 2, cy}, {cx - a / 2, cy + a}};
+        Polyline(dc, pts, 3);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        x += sepW;
+      }
+    }
+    SelectObject(dc, old);
+  }
+
+  int CrumbAt(POINT pt) const {
+    for (size_t i = 0; i < crumbList.size(); i++)
+      if (PtInRect(&crumbList[i].r, pt)) return int(i);
+    return -1;
+  }
+
+  static LRESULT CALLBACK CrumbProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, LONG_PTR(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+    auto* self = reinterpret_cast<ExplorerImpl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (!self) return DefWindowProcW(h, msg, wp, lp);
+    switch (msg) {
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        self->PaintCrumbs(dc, rc);
+        EndPaint(h, &ps);
+        return 0;
+      }
+      case WM_MOUSEMOVE: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (self->crumbPress >= 0 && GetCapture() == h) {
+          // 掴んで動かした: そのフォルダを外へドラッグ（エクスプローラーなどにドロップ）
+          if (std::abs(pt.x - self->crumbPressPt.x) > GetSystemMetrics(SM_CXDRAG) ||
+              std::abs(pt.y - self->crumbPressPt.y) > GetSystemMetrics(SM_CYDRAG)) {
+            const std::wstring path = self->crumbList[size_t(self->crumbPress)].path;
+            self->crumbPress = -1;
+            ReleaseCapture();
+            InvalidateRect(h, nullptr, FALSE);
+            self->DragPathsOut({path});
+          }
+          return 0;
+        }
+        const int hit = self->CrumbAt(pt);
+        if (hit != self->crumbHover) {
+          self->crumbHover = hit;
+          InvalidateRect(h, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+        TrackMouseEvent(&tme);
+        return 0;
+      }
+      case WM_MOUSELEAVE:
+        self->crumbHover = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      case WM_LBUTTONDOWN: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int hit = self->CrumbAt(pt);
+        if (hit < 0) {  // 空いた所・…: 文字で入力
+          self->BeginEditPath();
+          return 0;
+        }
+        self->crumbPress = hit;
+        self->crumbPressPt = pt;
+        SetCapture(h);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      }
+      case WM_LBUTTONUP: {
+        const int pressed = self->crumbPress;
+        self->crumbPress = -1;
+        if (GetCapture() == h) ReleaseCapture();
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (pressed >= 0 && self->CrumbAt(pt) == pressed) {
+          const std::wstring path = self->crumbList[size_t(pressed)].path;
+          if (_wcsicmp(path.c_str(), self->dir.c_str()) != 0) self->Navigate(path, std::wstring());
+        }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      }
+      case WM_CAPTURECHANGED:
+        self->crumbPress = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      case WM_RBUTTONUP: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int hit = self->CrumbAt(pt);
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING | (hit < 0 ? MF_GRAYED : 0), 1, L"このフォルダのパスをコピー(&C)");
+        AppendMenuW(menu, MF_STRING | (hit < 0 ? MF_GRAYED : 0), 2, L"エクスプローラーで開く(&E)");
+        AppendMenuW(menu, MF_STRING, 3, L"パスを入力(&A)");
+        ClientToScreen(h, &pt);
+        const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+        DestroyMenu(menu);
+        if (cmd == 1) self->CopyText(self->crumbList[size_t(hit)].path);
+        if (cmd == 2) ShellExecuteW(nullptr, L"open", self->crumbList[size_t(hit)].path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (cmd == 3) self->BeginEditPath();
+        return 0;
+      }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
   }
 
   // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
@@ -3019,6 +3359,11 @@ class ExplorerImpl {
       }
     }
     if (msg == WM_CHAR && hwnd == self->pathText && (wp == L'\r' || wp == 27 || wp == L'\t')) return 0;  // ビープを鳴らさない
+    if (msg == WM_KILLFOCUS && hwnd == self->pathText) {  // 入力を終えた: 階層のボタンに戻す
+      LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+      self->EndEditPath();
+      return r;
+    }
     if (msg == WM_XBUTTONUP) {
       if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) self->Back();
       else self->Forward();
@@ -3377,7 +3722,7 @@ class ExplorerImpl {
           case VK_F5: Load(dir, SelectedPath()); return 0;
           case VK_TAB:
             // Tab でフォルダ一覧へ、Shift + Tab でアドレスバーへ
-            if (GetKeyState(VK_SHIFT) < 0 || !settings.showTree) SetFocus(pathText);
+            if (GetKeyState(VK_SHIFT) < 0 || !settings.showTree) BeginEditPath();
             else SetFocus(tree);
             return 0;
           case 'V':
@@ -3389,7 +3734,7 @@ class ExplorerImpl {
           case 'L':
           case 'D':
             if ((ctrl && wp == 'L') || (alt && wp == 'D')) {
-              SetFocus(pathText);
+              BeginEditPath();
               return 0;
             }
             break;
@@ -3424,7 +3769,7 @@ class ExplorerImpl {
           return 0;
         }
         if (wp == 'D') {
-          SetFocus(pathText);
+          BeginEditPath();
           return 0;
         }
         break;
@@ -3457,6 +3802,12 @@ class ExplorerImpl {
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     pc.lpszClassName = kPreviewClass;
     RegisterClassExW(&pc);
+    WNDCLASSEXW cc = {sizeof(cc)};
+    cc.lpfnWndProc = CrumbProc;
+    cc.hInstance = inst;
+    cc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    cc.lpszClassName = kCrumbClass;
+    RegisterClassExW(&cc);
     WNDCLASSEXW vc = {sizeof(vc)};
     vc.lpfnWndProc = ViewBarProc;
     vc.hInstance = inst;
@@ -3504,6 +3855,8 @@ class ExplorerImpl {
     SendMessageW(pathText, EM_SETCUEBANNER, TRUE, LPARAM(L"フォルダ、または画像の URL（同じ画像を探す）"));
     SHAutoComplete(pathText, SHACF_FILESYS_DIRS);  // フォルダの名前を補う
     SetWindowSubclass(pathText, ChildKeyProc, 1, DWORD_PTR(this));
+    crumbs = CreateWindowExW(WS_EX_CLIENTEDGE, kCrumbClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
+    ShowWindow(pathText, SW_HIDE);
     sizeLabel = makeView(L"STATIC", L"大きさ", SS_LEFT, ID_SIZE_LABEL);
     sizeBox = makeView(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SIZE);
     for (const wchar_t* t : {L"小", L"普通", L"大", L"可変"}) SendMessageW(sizeBox, CB_ADDSTRING, 0, LPARAM(t));
@@ -3649,6 +4002,7 @@ bool Explorer::ShowingList() const { return impl_->listMode; }
 void Explorer::RefreshStates() { impl_->RefreshStates(); }
 
 void Explorer::RefreshTags() { impl_->RefreshTags(); }
+void Explorer::PreviewFile(const std::wstring& path) { impl_->PreviewFile(path); }
 
 void Explorer::SetSameStatus(const std::wstring& text) { SetWindowTextW(impl_->sameText, text.c_str()); }
 
