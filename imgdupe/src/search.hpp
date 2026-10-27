@@ -132,11 +132,15 @@ struct SmartFolder {
     std::string name;
     SearchQuery query;
 };
-std::vector<SmartFolder> smartFolders(Db& db);  // 名前順
+std::vector<SmartFolder> smartFolders(Db& db);  // 並べた順（並べていないものは後ろに名前順）
 // 同じ名前（大文字小文字は区別しない）があれば条件を上書きする。保存した ID を返す
 int64_t saveSmartFolder(Db& db, const std::string& name, const SearchQuery& q);
 bool renameSmartFolder(Db& db, int64_t id, const std::string& name);  // 同じ名前が別にあれば false
 void deleteSmartFolder(Db& db, int64_t id);
+void setSmartFolderOrder(Db& db, const std::vector<int64_t>& ids);  // この並びにする
+// 書き出し（JSON。{"queries": [{"name", "query"}]}）と読み込み（読めなければ false。壊れた項目は飛ばす）
+std::string exportSmartFolders(const std::vector<SmartFolder>& folders);
+bool importSmartFolders(const std::string& text, std::vector<SmartFolder>& out);
 
 // 出どころの一覧（タグの数の多い順）
 std::vector<std::pair<std::string, int64_t>> tagSources(Db& db);

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <windows.h>
+#include <commctrl.h>
 
 #include <string>
 
@@ -44,6 +45,29 @@ inline std::string narrow(const std::wstring& w) {
     std::string s(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
     return s;
+}
+
+// マウスを乗せた時の説明（ツールチップ）。makeTooltip で 1 つ作り、部品ごとに addTooltip で足す。
+// text は呼び出し側がずっと持っている文字列（文字列リテラル）
+inline HWND makeTooltip(HWND owner, int maxWidth) {
+    HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, owner, nullptr, nullptr, nullptr);
+    if (tip) {
+        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, maxWidth);  // 長い説明は折り返す
+        SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+    }
+    return tip;
+}
+
+inline void addTooltip(HWND tip, HWND ctrl, const wchar_t* text) {
+    if (!tip || !ctrl) return;
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = GetParent(ctrl);
+    ti.uId = reinterpret_cast<UINT_PTR>(ctrl);
+    ti.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
 }
 
 }  // namespace winutil

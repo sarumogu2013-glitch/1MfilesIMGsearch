@@ -58,11 +58,14 @@ struct StageReport {
     size_t processed = 0;
     size_t failed = 0;
     bool cancelled = false;
+    bool yielded = false;  // yield で譲った（cancelled も立つ）
 };
 
 // 呼んだ時にその段階が今の版で済んでいない画像を、新しく追加されたものから順に batch 枚ずつ処理する。
-// 結果（タグと段階の状態）はひとまとまりごとに書くので、いつ止めても続きから再開できる
+// 結果（タグと段階の状態）はひとまとまりごとに書くので、いつ止めても続きから再開できる。
+// within があれば、その画像だけ（その並びで）。yield が立ったら、ひとまとまりの切れ目で止める（スキャンタスクの割り込み）
 StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::atomic<bool>& cancel,
-                     Progress* progress = nullptr, size_t batch = 256);
+                     Progress* progress = nullptr, size_t batch = 256, const std::vector<int64_t>* within = nullptr,
+                     const std::atomic<bool>* yield = nullptr);
 
 }  // namespace imgdupe

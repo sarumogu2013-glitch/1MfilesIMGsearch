@@ -59,6 +59,8 @@ using namespace imgdupe;
 using winutil::Com;
 using winutil::narrow;
 using winutil::widen;
+using winutil::addTooltip;
+using winutil::makeTooltip;
 
 namespace {
 
@@ -73,6 +75,7 @@ constexpr UINT WM_APP_EXPANDED = WM_APP + 6;  // lParam: ExpandDone*
 constexpr UINT WM_APP_MODELS = WM_APP + 7;     // lParam: models::ManifestResult*（AI の部品の一覧が届いた）
 constexpr UINT WM_APP_MODEL_PROGRESS = WM_APP + 8;  // lParam: std::wstring*
 constexpr UINT WM_APP_MODELS_DONE = WM_APP + 9;     // lParam: std::wstring*（失敗の理由。空なら成功）
+constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
@@ -228,6 +231,11 @@ struct App {
     std::wstring reselectPath;       // 次の検索の結果で選ぶ画像（タグをクリックして探した時に選んでいた画像）
     std::vector<int64_t> idsFilter;  // 検索の条件の「選んだ画像」（選んだ画像を保存したスマートフォルダを開いた時）
     bool fillingSources = false;
+    // 出どころの数（全部のタグを数えるので重い。裏で数えて覚えておく）
+    std::vector<std::pair<std::string, int64_t>> sourceCounts;
+    ULONGLONG sourceCountsAt = 0;  // 最後に数え終えた時刻（0 = まだ）
+    bool countingSources = false;
+    bool sourcesStale = false;     // 数えている間にまた変わった
     std::vector<SmartFolder> smartList;  // スマートフォルダの一覧（コンボボックスの 1 番目から）
     bool expanding = false;              // フォルダに展開している最中
     int64_t similarTo = 0;               // 「似た画像を探す」の元の画像（0 = 使っていない）
@@ -281,7 +289,9 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerSelected(const std::wstring& path, bool image) override;
     void ExplorerFindSameFile(const std::wstring& path) override;
     void ExplorerFindSameUrl(const std::wstring& url) override;
-    void ExplorerAddRoots(const std::vector<std::wstring>& dirs) override;
+    void ExplorerAddScanTask(const std::vector<std::wstring>& paths, bool top) override;
+    bool ExplorerIsRoot(const std::wstring& dir) override;
+    void ExplorerRemoveRoot(const std::wstring& dir) override;
     void ExplorerSettingsChanged(const ExplorerSettings& s) override;
     std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
     std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) override;
@@ -440,27 +450,79 @@ void addFolder(const std::wstring& raw) {
     ListBox_AddString(app.folders, p.c_str());
 }
 
-void pickFolder() {
+std::vector<std::wstring> pickFolders(const wchar_t* title) {
+    std::vector<std::wstring> out;
     Com<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dlg.put()))))
-        return;
+        return out;
     DWORD opt = 0;
     dlg->GetOptions(&opt);
     dlg->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_ALLOWMULTISELECT);
-    dlg->SetTitle(L"検索するフォルダを選ぶ");
-    if (FAILED(dlg->Show(app.hwnd))) return;
+    dlg->SetTitle(title);
+    if (FAILED(dlg->Show(app.hwnd))) return out;
     Com<IShellItemArray> items;
-    if (FAILED(dlg->GetResults(items.put()))) return;
+    if (FAILED(dlg->GetResults(items.put()))) return out;
     DWORD n = 0;
     items->GetCount(&n);
     for (DWORD i = 0; i < n; ++i) {
         Com<IShellItem> item;
         PWSTR p = nullptr;
         if (SUCCEEDED(items->GetItemAt(i, item.put())) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
-            addFolder(p);
+            out.emplace_back(p);
             CoTaskMemFree(p);
         }
     }
+    return out;
+}
+
+// path が調べるフォルダのどれかの中（か、そのもの）か
+bool underAnyRoot(const std::wstring& path) {
+    const std::wstring p = stripTrailingSlash(path);
+    for (std::wstring r : folderList()) {
+        r = stripTrailingSlash(r);
+        if (p.size() < r.size() || _wcsnicmp(p.c_str(), r.c_str(), r.size()) != 0) continue;
+        if (p.size() == r.size() || p[r.size()] == L'\\' || p[r.size()] == L'/' || r.back() == L'\\') return true;
+    }
+    return false;
+}
+
+// スキャンタスクを足す: まだ調べるフォルダの外のフォルダは調べるフォルダにも足す（これからも変化を見る）。
+// いくつ選んでも 1 つのタスク（操作ごと）。top なら一番上（今のタスクを止めてでも先に）
+void addScanTask(const std::vector<std::wstring>& paths, bool top) {
+    std::vector<std::wstring> list;
+    size_t dirs = 0, files = 0;
+    bool rootsChanged = false;
+    for (const auto& raw : paths) {
+        const std::wstring p = stripTrailingSlash(raw);
+        const DWORD attr = GetFileAttributesW(p.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) continue;
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!underAnyRoot(p)) {
+                addFolder(p);
+                rootsChanged = true;
+            }
+            ++dirs;
+        } else {
+            if (!isImageExt(narrow(p))) continue;
+            ++files;
+        }
+        if (std::find(list.begin(), list.end(), p) == list.end()) list.push_back(p);
+    }
+    if (list.empty()) return;
+    if (rootsChanged) saveSettings();
+    auto nameOf = [](const std::wstring& p) {
+        const size_t k = p.find_last_of(L"\\/");
+        return k == std::wstring::npos || k + 1 == p.size() ? p : p.substr(k + 1);
+    };
+    std::wstring label;
+    if (list.size() == 1) label = (dirs ? L"フォルダ: " : L"画像: ") + nameOf(list[0]);
+    else {
+        if (dirs) label = L"フォルダ " + std::to_wstring(dirs) + L" 個";
+        if (files) label += (label.empty() ? L"" : L"・") + std::wstring(L"画像 ") + std::to_wstring(files) + L" 枚";
+        label += L"（" + nameOf(list[0]) + L" など）";
+    }
+    indexer::addScanTask(app.dataDir, label, list, top);
+    if (!indexer::isRunning()) indexer::start();
 }
 
 std::wstring pickImage() {
@@ -730,7 +792,7 @@ void setRunning(bool on) {
     tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"検索開始");
     SendMessageW(app.dupBar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
     for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat, app.variants}) EnableWindow(h, !on);
-    for (int id : {CMD_ADD_FOLDER, CMD_QUERY}) tbEnable(id, !on);
+    tbEnable(CMD_QUERY, !on);
     tbEnable(CMD_EXPORT, !on && !app.result.groups.empty());
     SendMessageW(app.progress, PBM_SETPOS, 0, 0);
     if (on) {
@@ -744,7 +806,9 @@ void setRunning(bool on) {
 void startSearch(const std::wstring& queryPath) {
     const auto folders = folderList();
     if (folders.empty()) {
-        MessageBoxW(app.hwnd, L"検索するフォルダを追加してください（ウィンドウにドラッグ＆ドロップしても追加できます）。",
+        MessageBoxW(app.hwnd,
+                    L"調べるフォルダがありません。ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、"
+                    L"「ファイル → フォルダをスキャンタスクに追加」で足してください（ウィンドウにドラッグ＆ドロップしても足せます）。",
                     L"imgdupe", MB_ICONINFORMATION);
         return;
     }
@@ -1242,7 +1306,7 @@ void exportResult() {
 
 void showHelp() {
     MessageBoxW(app.hwnd,
-                L"1. 「フォルダを追加」で検索するフォルダを選びます（ウィンドウへのドラッグ＆ドロップでも追加できます。複数可）。\r\n"
+                L"1. ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、「ファイル → フォルダをスキャンタスクに追加」で調べるフォルダを足します（ウィンドウへのドラッグ＆ドロップでも足せます。複数可）。\r\n"
                 L"2. 「検索開始」を押すと、同じ画像のまとまり（グループ）を左に出します。\r\n"
                 L"　・完全一致: 中身がまったく同じファイル\r\n"
                 L"　・見た目一致: 縮小・再圧縮・形式の違い（JPEG と PNG など）があっても見た目が同じ画像\r\n"
@@ -1358,34 +1422,55 @@ std::wstring editText(HWND h) {
     return t;
 }
 
-// 出どころの一覧を DB から作り直す（外したものは外したまま）
-void refreshSources() {
-    Db* db = uiDb();
+// 出どころの一覧を、覚えている数で作り直す（外したものは外したまま）
+void fillSources() {
     app.fillingSources = true;
+    SendMessageW(app.s.sources, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(app.s.sources);
     app.sourceNames.clear();
-    if (db) {
-        try {
-            for (const auto& [name, count] : tagSources(*db)) {
-                const std::wstring text = sourceLabel(name) + L"（" + withCommas(static_cast<uint64_t>(count)) + L"）";
-                LVITEMW it{};
-                it.mask = LVIF_TEXT;
-                it.iItem = static_cast<int>(app.sourceNames.size());
-                it.pszText = const_cast<wchar_t*>(text.c_str());
-                const int i = ListView_InsertItem(app.s.sources, &it);
-                ListView_SetCheckState(app.s.sources, i, app.uncheckedSources.count(name) ? FALSE : TRUE);
-                app.sourceNames.push_back(name);
-            }
-        } catch (const std::exception&) {
-        }
+    for (const auto& [name, count] : app.sourceCounts) {
+        const std::wstring text = sourceLabel(name) + L"（" + withCommas(static_cast<uint64_t>(count)) + L"）";
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = static_cast<int>(app.sourceNames.size());
+        it.pszText = const_cast<wchar_t*>(text.c_str());
+        const int i = ListView_InsertItem(app.s.sources, &it);
+        ListView_SetCheckState(app.s.sources, i, app.uncheckedSources.count(name) ? FALSE : TRUE);
+        app.sourceNames.push_back(name);
     }
     if (app.sourceNames.empty()) {
         LVITEMW it{};
         it.mask = LVIF_TEXT;
-        it.pszText = const_cast<wchar_t*>(L"（タグはまだありません）");
+        it.pszText = const_cast<wchar_t*>(app.sourceCountsAt ? L"（タグはまだありません）" : L"（数えています…）");
         ListView_InsertItem(app.s.sources, &it);
     }
+    SendMessageW(app.s.sources, WM_SETREDRAW, TRUE, 0);
     app.fillingSources = false;
+}
+
+// 出どころの一覧を出す。数は裏で数え直す（タグの数だけ時間がかかるので、検索の画面を開くたびには待たない）。
+// changed: タグを変えた後（数が変わったので数え直す）。そうでなければ、1 分以内に数えていれば数え直さない
+void refreshSources(bool changed = false) {
+    fillSources();
+    if (!changed && app.sourceCountsAt && GetTickCount64() - app.sourceCountsAt < 60 * 1000) return;
+    if (!changed && !app.advancedShown && app.sourceCountsAt) return;  // 見えていなければ、開いた時に
+    if (app.countingSources) {
+        app.sourcesStale = true;
+        return;
+    }
+    app.countingSources = true;
+    app.sourcesStale = false;
+    const std::string file = narrow(dbPath());
+    HWND hwnd = app.hwnd;
+    std::thread([file, hwnd] {
+        auto* out = new std::vector<std::pair<std::string, int64_t>>();
+        try {
+            Db db;
+            if (db.open(file)) *out = tagSources(db);
+        } catch (const std::exception&) {
+        }
+        if (!PostMessageW(hwnd, WM_APP_SOURCES, 0, reinterpret_cast<LPARAM>(out))) delete out;
+    }).detach();
 }
 
 std::optional<int64_t> pickerDate(HWND h, bool endOfDay) {
@@ -1710,7 +1795,6 @@ void clearSearchConditions() {
     app.uncheckedSources.clear();
     refreshSources();
     ComboBox_SetCurSel(app.s.smart, 0);
-    EnableWindow(app.s.smartDelete, FALSE);
     scheduleSearch(10);
 }
 
@@ -1816,7 +1900,6 @@ void refreshSmartFolders(const std::wstring& select) {
         if (!cur.empty() && name == cur) sel = static_cast<int>(i) + 1;
     }
     ComboBox_SetCurSel(app.s.smart, sel);
-    EnableWindow(app.s.smartDelete, sel > 0);
 }
 
 // 保存した条件を画面に戻す（画面に無い項目は使わない）
@@ -1965,6 +2048,229 @@ void deleteSmartFolderUi() {
     refreshSmartFolders(L"");
 }
 
+std::wstring trimmed(std::wstring s);
+
+// 保存した条件のファイル（JSON）を選ぶ
+std::wstring pickQueriesFile(bool save) {
+    Com<IFileDialog> dlg;
+    if (FAILED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                save ? __uuidof(IFileSaveDialog) : __uuidof(IFileOpenDialog), reinterpret_cast<void**>(dlg.put()))))
+        return L"";
+    const COMDLG_FILTERSPEC types[] = {{L"保存した条件（JSON）", L"*.json"}};
+    dlg->SetFileTypes(1, types);
+    dlg->SetDefaultExtension(L"json");
+    if (save) dlg->SetFileName(L"imgdupe_saved_queries");
+    dlg->SetTitle(save ? L"保存した条件を書き出す" : L"保存した条件を読み込む");
+    if (FAILED(dlg->Show(app.hwnd))) return L"";
+    Com<IShellItem> item;
+    PWSTR p = nullptr;
+    if (FAILED(dlg->GetResult(item.put())) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) return L"";
+    std::wstring out(p);
+    CoTaskMemFree(p);
+    return out;
+}
+
+// 保存した条件の管理（削除・並べ替え・名前の変更・書き出し・読み込み）
+void manageSmartFoldersUi() {
+    Db* db = uiDb();
+    if (!db) return;
+    enum { ID_LIST = 100, ID_LOAD, ID_UP, ID_DOWN, ID_RENAME, ID_DELETE, ID_EXPORT, ID_IMPORT };
+    struct State {
+        HWND list = nullptr;
+        bool done = false;
+        int command = 0;  // 押されたボタン（下のループで処理する）
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDOK) st->done = true;
+                else if (LOWORD(wp) == ID_LIST) {
+                    if (HIWORD(wp) == LBN_DBLCLK) st->command = ID_LOAD;
+                } else st->command = LOWORD(wp);
+                return 0;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeManageQueries";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(480), h = px(360);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeManageQueries", L"保存した条件の管理", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                               app.inst, nullptr);
+    if (!dlg) return;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    HWND tip = makeTooltip(dlg, px(320));
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cw, int ch, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cw, ch, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int m = px(12), bw = px(120), bh = px(28), bx = w - m - bw;
+    child(WC_STATICW, L"検索の「保存した条件」に出す順に並びます。", SS_NOPREFIX, -1, m, m, w - 2 * m, px(20));
+    st.list = child(WC_LISTBOXW, L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, ID_LIST, m, m + px(24),
+                    bx - px(8) - m, h - 2 * m - px(24), WS_EX_CLIENTEDGE);
+    int by = m + px(24);
+    auto btn = [&](const wchar_t* text, int id, const wchar_t* help, int gapAfter = 4) {
+        HWND b = child(WC_BUTTONW, text, WS_TABSTOP, id, bx, by, bw, bh);
+        addTooltip(tip, b, help);
+        by += bh + px(gapAfter);
+    };
+    btn(L"読み込む", ID_LOAD, L"選んだ条件を検索の画面に読み込んで探します（ダブルクリックでも）", 12);
+    btn(L"上へ", ID_UP, L"選んだ条件を 1 つ上に動かします");
+    btn(L"下へ", ID_DOWN, L"選んだ条件を 1 つ下に動かします");
+    btn(L"名前を変える…", ID_RENAME, L"選んだ条件の名前を変えます");
+    btn(L"削除", ID_DELETE, L"選んだ条件を削除します（画像は消えません）", 12);
+    btn(L"書き出し…", ID_EXPORT, L"保存した条件を全部 JSON のファイルに書き出します（ほかの PC への引っ越しや控えに）");
+    btn(L"読み込み…", ID_IMPORT, L"書き出した JSON のファイルから条件を読み込みます（同じ名前は上書き）");
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, bx, h - m - bh, bw, bh);
+
+    std::vector<SmartFolder> list;
+    auto fill = [&](int64_t selectId) {
+        try {
+            list = smartFolders(*db);
+        } catch (const std::exception&) {
+            list.clear();
+        }
+        ListBox_ResetContent(st.list);
+        int sel = list.empty() ? -1 : 0;
+        for (size_t i = 0; i < list.size(); ++i) {
+            ListBox_AddString(st.list, widen(list[i].name).c_str());
+            if (list[i].id == selectId) sel = static_cast<int>(i);
+        }
+        ListBox_SetCurSel(st.list, sel);
+    };
+    fill(0);
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(st.list);
+    MSG msg{};
+    bool changed = false;
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!st.command) continue;
+        const int cmd = st.command;
+        st.command = 0;
+        const int i = ListBox_GetCurSel(st.list);
+        const bool has = i >= 0 && i < static_cast<int>(list.size());
+        try {
+            switch (cmd) {
+                case ID_LOAD:
+                    if (has) {
+                        const SearchQuery q = list[i].query;
+                        const std::wstring name = widen(list[i].name);
+                        st.done = true;
+                        EnableWindow(app.hwnd, TRUE);
+                        refreshSmartFolders(name);
+                        applyQueryToUi(q);
+                    }
+                    break;
+                case ID_UP:
+                case ID_DOWN: {
+                    const int j = cmd == ID_UP ? i - 1 : i + 1;
+                    if (!has || j < 0 || j >= static_cast<int>(list.size())) break;
+                    std::vector<int64_t> ids;
+                    for (const auto& f : list) ids.push_back(f.id);
+                    std::swap(ids[i], ids[j]);
+                    setSmartFolderOrder(*db, ids);
+                    fill(list[i].id);
+                    changed = true;
+                    break;
+                }
+                case ID_RENAME:
+                    if (has) {
+                        const auto name = promptText(L"名前を変える", L"新しい名前", widen(list[i].name));
+                        if (name && !trimmed(*name).empty()) {
+                            if (!renameSmartFolder(*db, list[i].id, narrow(trimmed(*name))))
+                                MessageBoxW(dlg, L"同じ名前の条件がもうあります。", L"imgdupe", MB_ICONINFORMATION);
+                            fill(list[i].id);
+                            changed = true;
+                        }
+                        EnableWindow(app.hwnd, FALSE);
+                    }
+                    break;
+                case ID_DELETE:
+                    if (has && MessageBoxW(dlg, (L"「" + widen(list[i].name) + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
+                                           MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+                        deleteSmartFolder(*db, list[i].id);
+                        fill(i + 1 < static_cast<int>(list.size()) ? list[i + 1].id : i > 0 ? list[i - 1].id : 0);
+                        changed = true;
+                    }
+                    break;
+                case ID_EXPORT: {
+                    if (list.empty()) {
+                        MessageBoxW(dlg, L"保存した条件がありません。", L"imgdupe", MB_ICONINFORMATION);
+                        break;
+                    }
+                    const std::wstring file = pickQueriesFile(true);
+                    if (file.empty()) break;
+                    const std::string text = exportSmartFolders(list);
+                    FILE* f = _wfopen(file.c_str(), L"wb");
+                    const bool ok = f && std::fwrite(text.data(), 1, text.size(), f) == text.size();
+                    if (f) std::fclose(f);
+                    MessageBoxW(dlg, ok ? (std::to_wstring(list.size()) + L" 件を書き出しました。").c_str() : L"書き出せませんでした。",
+                                L"imgdupe", ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+                    break;
+                }
+                case ID_IMPORT: {
+                    const std::wstring file = pickQueriesFile(false);
+                    if (file.empty()) break;
+                    std::string text;
+                    if (FILE* f = _wfopen(file.c_str(), L"rb")) {
+                        char buf[65536];
+                        size_t n;
+                        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+                        std::fclose(f);
+                    }
+                    std::vector<SmartFolder> got;
+                    if (!importSmartFolders(text, got)) {
+                        MessageBoxW(dlg, L"保存した条件のファイルとして読めませんでした。", L"imgdupe", MB_ICONWARNING);
+                        break;
+                    }
+                    int64_t last = 0;
+                    for (const auto& g : got) last = saveSmartFolder(*db, g.name, g.query);
+                    fill(last);
+                    changed = true;
+                    MessageBoxW(dlg, (std::to_wstring(got.size()) + L" 件を読み込みました（同じ名前は上書き）。").c_str(), L"imgdupe",
+                                MB_ICONINFORMATION);
+                    break;
+                }
+            }
+        } catch (const std::exception& e) {
+            MessageBoxW(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        }
+    }
+    if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    SetActiveWindow(app.hwnd);
+    if (changed) refreshSmartFolders(L"");
+}
+
 // ---------------------------------------------------------------- ハードリンク展開
 
 std::wstring trimmed(std::wstring s) {
@@ -1995,16 +2301,16 @@ void cleanupTemporaryLinks() {
 
 void expandLinksUi() {
     if (app.expanding) {
-        MessageBoxW(app.hwnd, L"フォルダに展開しています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
+        MessageBoxW(app.hwnd, L"フォルダを作っています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     if (!app.searchTotal) {
-        MessageBoxW(app.hwnd, L"展開する検索結果がありません。", L"imgdupe", MB_ICONINFORMATION);
+        MessageBoxW(app.hwnd, L"フォルダにする検索結果がありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     const int i = ComboBox_GetCurSel(app.s.smart) - 1;
     const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"検索結果";
-    auto input = promptText(L"フォルダに展開", L"フォルダの名前（画像のあるドライブごとに、_vfolders の下に作ります）", initial);
+    auto input = promptText(L"フォルダを作成", L"フォルダの名前（画像のあるドライブごとに、_vfolders の下に作ります）", initial);
     if (!input || trimmed(*input).empty()) return;
     const std::string name = safeFolderName(narrow(trimmed(*input)));
     std::wstring msg = withCommas(app.searchTotal) + L" 枚を、ハードリンクで「" + widen(name) + L"」フォルダに並べます。\r\n\r\n" +
@@ -2334,7 +2640,7 @@ void editSelectedTags(const std::vector<int64_t>& ids, const std::string& descri
         MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
-    refreshSources();
+    refreshSources(true);
     if (ex.view && ex.view->ShowingList()) {
         app.reselect = std::max(0, selectedResult());
         scheduleSearch(10);
@@ -2679,7 +2985,7 @@ void undoTagEdit() {
     }
     app.searchNotice = L"元に戻しました: " + widen(desc);
     app.reselect = std::max(0, selectedResult());
-    refreshSources();
+    refreshSources(true);
     if (ex.view && !ex.view->ShowingList()) ex.view->RefreshTags();
     scheduleSearch(10);
 }
@@ -3031,7 +3337,7 @@ void showDictionaryWindow() {
                     dictWin.applying = false;
                     EnableWindow(dictWin.save, TRUE);
                     setText(dictWin.status, *m);
-                    refreshSources();
+                    refreshSources(true);
                     scheduleSearch(10);
                     return 0;
                 }
@@ -3244,7 +3550,7 @@ void showTagDictWindow() {
                     tagDictBusy(false);
                     setText(tagDictWin.status, *m);
                     tagDictRefreshCounts();
-                    refreshSources();
+                    refreshSources(true);
                     scheduleSearch(10);
                     return 0;
                 }
@@ -3591,11 +3897,51 @@ void ExplorerApp::ExplorerFindSameUrl(const std::wstring& url) {
     }).detach();
 }
 
-void ExplorerApp::ExplorerAddRoots(const std::vector<std::wstring>& dirs) {
-    for (const auto& d : dirs) addFolder(d);
-    saveSettings();  // バックグラウンドの解析の roots にもなる
-    if (!indexer::isRunning()) indexer::start();
-    else if (Db* db = uiDb()) addCommand(*db, "rescan");
+void ExplorerApp::ExplorerAddScanTask(const std::vector<std::wstring>& paths, bool top) { addScanTask(paths, top); }
+
+bool ExplorerApp::ExplorerIsRoot(const std::wstring& dir) {
+    const std::wstring d = stripTrailingSlash(dir);
+    for (const auto& f : folderList())
+        if (lstrcmpiW(stripTrailingSlash(f).c_str(), d.c_str()) == 0) return true;
+    return false;
+}
+
+void removeRoot(const std::wstring& dir) {
+    const std::wstring d = stripTrailingSlash(dir);
+    if (MessageBoxW(app.hwnd,
+                    (L"「" + d + L"」を調べるフォルダから外しますか？\n\nこれからは中の変化を見なくなります。"
+                               L"作ったインデックス（タグなど）は残り、ファイルも消しません。")
+                        .c_str(),
+                    L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    const int n = ListBox_GetCount(app.folders);
+    for (int i = n - 1; i >= 0; --i) {
+        std::wstring s(ListBox_GetTextLen(app.folders, i), L'\0');
+        ListBox_GetText(app.folders, i, &s[0]);
+        if (lstrcmpiW(stripTrailingSlash(s.c_str()).c_str(), d.c_str()) == 0) ListBox_DeleteString(app.folders, i);
+    }
+    saveSettings();
+}
+
+void ExplorerApp::ExplorerRemoveRoot(const std::wstring& dir) { removeRoot(dir); }
+
+// 「調べるフォルダを外す」: 今の調べるフォルダをメニューに並べて、選んだものを外す
+void removeRootMenu() {
+    const auto f = folderList();
+    if (f.empty()) {
+        MessageBoxW(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    HMENU menu = CreatePopupMenu();
+    for (size_t i = 0; i < f.size(); ++i) AppendMenuW(menu, MF_STRING, i + 1, f[i].c_str());
+    POINT pt;
+    GetCursorPos(&pt);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd >= 1 && cmd <= f.size()) {
+        removeRoot(f[cmd - 1]);
+        if (ex.view) ex.view->RefreshStates();
+    }
 }
 
 void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
@@ -3727,12 +4073,15 @@ int tabPos(int id) {
 void switchTab(int t) {
     app.tab = t;
     TabCtrl_SetCurSel(app.tabs, tabPos(t));
+    // 並べ替え・出し入れの間は描かない（部品ごとに描き直すと、エクスプローラーのサムネイルまで何度も描いて遅かった）
+    SendMessageW(app.hwnd, WM_SETREDRAW, FALSE, 0);
     layout();  // 先に並べてから出す（前の場所に絵が残らないように）
     ShowWindow(app.toolbar, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.searchPage) ShowWindow(h, t == 1 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.advancedPage) ShowWindow(h, t == 1 && app.advancedShown ? SW_SHOW : SW_HIDE);
-    RedrawWindow(app.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    SendMessageW(app.hwnd, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(app.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
     if (!ex.shown) {
         ex.shown = true;
         ex.view->Show(explorerStartDir(), L"");
@@ -3782,14 +4131,11 @@ void layoutSearch(int y, int W) {
     lbl(app.s.lSmart, px(84));
     put(app.s.smart, px(170), px(300));
     put(app.s.smartSave, px(56));
-    put(app.s.smartDelete, px(48));
+    put(app.s.smartDelete, px(56));
     x += px(10);
     put(app.s.review, px(96));
-    put(app.s.yes, px(56));
-    put(app.s.no, px(48));
-    put(app.s.bulk, px(56));
     x += px(10);
-    put(app.s.expand, px(118));
+    put(app.s.expand, px(100));
     cy += rowH + px(5);
     x = m;
     MoveWindow(app.s.count, m, cy + px(2), W - 2 * m, rowH - px(4), TRUE);
@@ -3889,12 +4235,15 @@ void createSearchControls() {
     app.s.lSmart = label(L"保存した条件", sp);
     app.s.smart = combo(IDC_S_SMART, sp, {});
     app.s.smartSave = button(L"保存…", IDC_S_SMART_SAVE, sp);
-    app.s.smartDelete = button(L"削除", IDC_S_SMART_DELETE, sp);
+    app.s.smartDelete = button(L"管理…", IDC_S_SMART_DELETE, sp);  // 削除・並べ替え・書き出し
     app.s.review = button(L"確認キュー", IDC_S_REVIEW, sp, BS_AUTOCHECKBOX);
-    app.s.yes = button(L"正しい", IDC_S_YES, sp);
-    app.s.no = button(L"違う", IDC_S_NO, sp);
-    app.s.bulk = button(L"タグ…", IDC_S_BULK, sp);
-    app.s.expand = button(L"フォルダに展開…", IDC_S_EXPAND, sp);
+    // 「正しい」「違う」「タグ…」はリボンに出さない（メニューの「タグ」とキーで使える）
+    std::vector<HWND> unused;
+    app.s.yes = button(L"正しい", IDC_S_YES, unused);
+    app.s.no = button(L"違う", IDC_S_NO, unused);
+    app.s.bulk = button(L"タグ…", IDC_S_BULK, unused);
+    for (HWND h : unused) ShowWindow(h, SW_HIDE);
+    app.s.expand = button(L"フォルダを作成", IDC_S_EXPAND, sp);
     // 3 段目: 件数
     app.s.count = makeControl(WC_STATICW, L"フリーワードを入れて Enter（検索ボタン）で探します。結果はエクスプローラーに出します。",
                               SS_NOPREFIX | SS_ENDELLIPSIS, IDC_S_COUNT);
@@ -3950,6 +4299,46 @@ void createSearchControls() {
     for (HWND h : {app.s.tags, app.s.text, app.s.results}) ShowWindow(h, SW_HIDE);
     for (HWND h : sp) ShowWindow(h, SW_HIDE);
     for (HWND h : ap) ShowWindow(h, SW_HIDE);
+
+    // マウスを乗せた時の説明
+    HWND tip = makeTooltip(app.hwnd, px(380));
+    const std::pair<HWND, const wchar_t*> tips[] = {
+        {app.s.free, L"タグ・タイトル・ファイル名などから探す語。空白で区切るとすべてを含むもの、-語 でその語を含むものを除きます"},
+        {app.s.scope, L"フリーワードで探す所（すべて / タグだけ / タイトルだけ）"},
+        {app.s.go, L"今の条件で探して、結果をエクスプローラーに出します（Enter）"},
+        {app.s.sort, L"結果の並べ方"},
+        {app.s.desc, L"チェックすると逆の順（大きい・新しいものから）に並べます"},
+        {app.s.advanced, L"星・形式・品質・大きさ・日付・パス・出どころなどの細かい条件を出す・隠す"},
+        {app.s.clear, L"条件を全部空に戻します"},
+        {app.s.clip, L"画像の内容を言葉で探します（AI。例: 夕焼けの海、白い猫）。CLIP を入れてある時だけ"},
+        {app.s.smart, L"保存した条件を選ぶと、その条件を読み込んで探します"},
+        {app.s.smartSave, L"今の条件に名前を付けて保存します（スマートフォルダ）"},
+        {app.s.smartDelete, L"保存した条件を削除・並べ替え・名前の変更・書き出し（JSON）・読み込みします"},
+        {app.s.review, L"チェックすると、AI のタグが当たっているか迷っている画像から順に並べます（確かめる時に）"},
+        {app.s.expand,
+         L"検索の結果の画像を、ハードリンクで 1 つのフォルダ（ドライブごとの _vfolders の下）に並べます。"
+         L"ほかのアプリ（ビューアなど）でその画像だけを見られます。容量は増えず、元のファイルも動きません。"
+         L"このソフトを終了すると消えます（残す時は「表示 → 展開したフォルダ」で固定にします）"},
+        {app.s.rating, L"星（レーティング）で絞ります"},
+        {app.s.format, L"ファイルの形式で絞ります"},
+        {app.s.quality, L"くっきり・ぼやけ・拡大された画像などで絞ります（品質を調べてある時だけ）"},
+        {app.s.minW, L"幅がこれ以上（px）の画像だけ"},
+        {app.s.minKb, L"ファイルサイズの下限（KB）"},
+        {app.s.maxKb, L"ファイルサイズの上限（KB）"},
+        {app.s.dateField, L"日付の条件にどの日時を使うか"},
+        {app.s.noTaken, L"撮影日の無い画像だけ"},
+        {app.s.unclassified, L"タグが 1 つも無い画像だけ"},
+        {app.s.deadLinks, L"出典の投稿が消えている画像だけ（出典を確かめる設定にしてある時）"},
+        {app.s.path, L"パスにこの文字を含む画像だけ"},
+        {app.s.download, L"ダウンロード元の URL にこの文字を含む画像だけ"},
+        {app.s.conf, L"タグの確度がこれ以上のものだけをタグとして使います"},
+        {app.s.sources, L"チェックした出どころのタグだけで確度を計算します（数はタグの数）"},
+        {app.exact, L"中身がまったく同じファイルだけを探します（見た目では比べない）"},
+        {app.flat, L"真っ白・真っ黒など単色に近い画像も見た目で比べます（別の画像がまとまりやすくなります）"},
+        {app.variants, L"AI（CLIP）で見つけた差分（表情違い・色違いなど）のまとまりも出します"},
+        {app.threshold, L"小さいほど厳しく（ほぼ同じものだけ）、大きいほどゆるく（似ているものまで）まとめます"},
+    };
+    for (const auto& [h, text] : tips) addTooltip(tip, h, text);
 }
 
 // 検索の画面の通知（処理したら true）
@@ -4054,7 +4443,6 @@ bool onSearchCommand(WPARAM wp) {
             if (code == CBN_SELENDOK || (code == CBN_SELCHANGE && !ComboBox_GetDroppedState(app.s.smart))) {
                 const int i = ComboBox_GetCurSel(app.s.smart) - 1;
                 if (i >= 0 && i < static_cast<int>(app.smartList.size())) applyQueryToUi(app.smartList[i].query);
-                EnableWindow(app.s.smartDelete, i >= 0);
             }
             return true;
         case IDC_S_SMART_SAVE:
@@ -4074,7 +4462,7 @@ bool onSearchCommand(WPARAM wp) {
             bulkTagUi();
             return true;
         case IDC_S_SMART_DELETE:
-            deleteSmartFolderUi();
+            manageSmartFoldersUi();
             return true;
     }
     return false;
@@ -4140,15 +4528,12 @@ void layout() {
     if (app.tab == 2) {
         MoveWindow(app.toolbar, m, y, W - 2 * m, panelH - px(4), TRUE);
     } else if (app.tab == 0) {
-        // 重複を探す: 左にボタン、続いて調べるフォルダ、右にしきい値などと進み具合
+        // 重複を探す: 左にボタン、右にしきい値などと進み具合（調べるフォルダはホームで足す・外す）
         SIZE bar{};
         SendMessageW(app.dupBar, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar));
         const int barW = std::max<int>(bar.cx, px(300));
         MoveWindow(app.dupBar, m, y, barW, panelH - px(4), TRUE);
         int x = m + barW + px(8);
-        MoveWindow(app.foldersLabel, x, y, px(300), px(16), TRUE);
-        MoveWindow(app.folders, x, y + px(17), px(300), panelH - px(22), TRUE);
-        x += px(300) + px(12);
         int cy = y + px(2);
         MoveWindow(app.thresholdCaption, x, cy + px(4), px(58), rowH - px(4), TRUE);
         MoveWindow(app.threshold, x + px(60), cy, px(150), rowH + px(4), TRUE);
@@ -4265,9 +4650,6 @@ const ToolButton kToolButtons[] = {
     {CMD_HELP, 0xE897, L"?", L"使い方", true},
 };
 const ToolButton kDupButtons[] = {
-    {CMD_ADD_FOLDER, 0xE8F4, L"追", L"フォルダを追加", true},
-    {CMD_REMOVE_FOLDER, 0xE738, L"外", L"フォルダを外す", true},
-    {0, 0, nullptr, nullptr, false},
     {CMD_SEARCH, 0xE721, L"検", L"検索開始", true},
     {CMD_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
     {CMD_EXPORT, 0xE74E, L"保", L"結果を保存", false},
@@ -4351,7 +4733,7 @@ void createControls() {
     app.variants = makeControl(WC_BUTTONW, L"差分（AI）も出す", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_VARIANTS);
     app.progress = makeControl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
     SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
-    app.status = makeControl(WC_STATICW, L"フォルダを追加して「検索開始」を押してください。", SS_ENDELLIPSIS | SS_NOPREFIX,
+    app.status = makeControl(WC_STATICW, L"「検索開始」で、調べるフォルダの中の重複を探します。", SS_ENDELLIPSIS | SS_NOPREFIX,
                              IDC_STATUS);
 
     app.groups = makeControl(WC_LISTVIEWW, L"",
@@ -4375,7 +4757,9 @@ void createControls() {
     app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);
     // 結果は下の一覧（重複）とエクスプローラーに出すので、前の画面の一覧と情報欄は使わない
     for (HWND h : {app.groups, app.thumbs, app.info}) ShowWindow(h, SW_HIDE);
-    app.dupPage = {app.dupBar, app.foldersLabel, app.folders, app.thresholdCaption, app.threshold, app.thresholdLabel,
+    // 調べるフォルダの一覧は見せない（中身の入れ物としてだけ使う。足す・外すはホームとファイルのメニュー）
+    for (HWND h : {app.foldersLabel, app.folders}) ShowWindow(h, SW_HIDE);
+    app.dupPage = {app.dupBar, app.thresholdCaption, app.threshold, app.thresholdLabel,
                    app.exact, app.flat, app.variants, app.progress, app.status};
     createSearchControls();
     app.advancedShown = iniInt(L"advancedSearch", 0) != 0;
@@ -4396,8 +4780,41 @@ void copyOut(LVITEMW& item, const std::wstring& s) {
 
 bool onSearchNotify(NMHDR* nm);
 
+// リボンのボタンにマウスを乗せた時の説明
+const wchar_t* commandHelp(int id) {
+    switch (id) {
+        case CMD_OPEN: return L"選んだ画像・ファイルを、関連付けられたアプリで開きます（Enter）";
+        case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
+        case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
+        case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べるフォルダの中から探して下に一覧にします（Ctrl+M）";
+        case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
+        case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
+        case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
+        case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
+        case CMD_HELP: return L"使い方の説明を出します（F1）";
+        case CMD_SEARCH: return L"調べるフォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
+        case CMD_QUERY: return L"画像を 1 枚選んで、それと同じ・似た画像を探します（Ctrl+F）";
+        case CMD_EXPORT: return L"重複の結果を CSV と、サムネイル付きの HTML に書き出します（Ctrl+S）";
+    }
+    return nullptr;
+}
+
 LRESULT onNotify(NMHDR* nm) {
     if (onSearchNotify(nm)) return 0;
+    if ((nm->hwndFrom == app.toolbar || nm->hwndFrom == app.dupBar) && nm->code == TBN_GETINFOTIPW) {
+        auto* it = reinterpret_cast<NMTBGETINFOTIPW*>(nm);
+        if (const wchar_t* help = commandHelp(it->iItem); help && it->pszText && it->cchTextMax > 0)
+            lstrcpynW(it->pszText, help, it->cchTextMax);
+        return 0;
+    }
+    if (nm->code == TTN_GETDISPINFOW &&
+        (nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.toolbar, TB_GETTOOLTIPS, 0, 0)) ||
+         nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.dupBar, TB_GETTOOLTIPS, 0, 0)))) {
+        auto* di = reinterpret_cast<NMTTDISPINFOW*>(nm);
+        SendMessageW(nm->hwndFrom, TTM_SETMAXTIPWIDTH, 0, px(360));
+        if (const wchar_t* help = commandHelp(static_cast<int>(nm->idFrom))) di->lpszText = const_cast<wchar_t*>(help);
+        return 0;
+    }
     if (nm->hwndFrom == app.groups) {
         switch (nm->code) {
             case LVN_GETDISPINFOW: {
@@ -4492,8 +4909,8 @@ void appendMainMenus(HMENU root) {
         }
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
-    popup(L"ファイル(&F)", {CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
+    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
+    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
@@ -4651,13 +5068,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_DROPFILES: {
             HDROP drop = reinterpret_cast<HDROP>(wp);
-            if (!app.running) {
+            {
+                // ウィンドウに落としたフォルダ・画像はスキャンタスクに（1 回の操作で 1 つ）
+                std::vector<std::wstring> paths;
                 const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
                 for (UINT i = 0; i < n; ++i) {
                     wchar_t buf[MAX_PATH * 4];
-                    if (DragQueryFileW(drop, i, buf, static_cast<UINT>(std::size(buf)))) addFolder(buf);
+                    if (DragQueryFileW(drop, i, buf, static_cast<UINT>(std::size(buf)))) paths.emplace_back(buf);
                 }
-                saveSettings();
+                addScanTask(paths, false);
+                if (ex.view) ex.view->RefreshStates();
             }
             DragFinish(drop);
             return 0;
@@ -4678,20 +5098,26 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (LOWORD(wp)) {
                 case CMD_ADD_FOLDER:
                     if (!app.running) {
-                        pickFolder();
+                        for (const auto& f : pickFolders(L"調べるフォルダを選ぶ")) addFolder(f);
                         saveSettings();
+                        if (ex.view) ex.view->RefreshStates();
                     }
                     break;
-                case CMD_REMOVE_FOLDER: {
-                    const int n = ListBox_GetSelCount(app.folders);
-                    if (n > 0) {
-                        std::vector<int> sel(n);
-                        ListBox_GetSelItems(app.folders, n, sel.data());
-                        for (int k = n - 1; k >= 0; --k) ListBox_DeleteString(app.folders, sel[k]);
-                        saveSettings();
-                    }
+                case CMD_REMOVE_FOLDER:
+                    if (!app.running) removeRootMenu();
+                    break;
+                case CMD_SCAN_FOLDER:
+                case CMD_SCAN_FOLDER_TOP: {
+                    const bool top = LOWORD(wp) == CMD_SCAN_FOLDER_TOP;
+                    const auto dirs = pickFolders(top ? L"最優先でスキャンするフォルダを選ぶ" : L"スキャンタスクに追加するフォルダを選ぶ");
+                    if (!dirs.empty()) addScanTask(dirs, top);
+                    if (ex.view) ex.view->RefreshStates();
                     break;
                 }
+                case CMD_SCAN_TASKS:
+                    if (!indexer::isRunning()) indexer::start();
+                    indexer::requestShowTasks(app.dataDir);
+                    break;
                 case CMD_SEARCH:
                     if (app.updating && !app.running) break;  // 更新のダウンロード中
                     if (app.tab != 0) switchTab(0);
@@ -4771,6 +5197,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_DELETE_SMART:
                     if (app.tab != 1) switchTab(1);
                     deleteSmartFolderUi();
+                    break;
+                case CMD_MANAGE_QUERIES:
+                    if (app.tab != 1) switchTab(1);
+                    manageSmartFoldersUi();
                     break;
                 case CMD_EXPAND_LINKS:
                     if (app.tab != 1) switchTab(1);
@@ -4870,6 +5300,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == kExitTimer) DestroyWindow(hwnd);  // 確認に時間がかかりすぎたら、そのまま終わる
             return 0;
+        case WM_APP_SOURCES: {
+            std::unique_ptr<std::vector<std::pair<std::string, int64_t>>> counts(
+                reinterpret_cast<std::vector<std::pair<std::string, int64_t>>*>(lp));
+            app.sourceCounts = std::move(*counts);
+            app.sourceCountsAt = GetTickCount64();
+            app.countingSources = false;
+            fillSources();
+            if (app.sourcesStale) refreshSources(true);
+            return 0;
+        }
         case WM_APP_SEARCHED:
             onSearched(reinterpret_cast<SearchDone*>(lp));
             return 0;

@@ -66,7 +66,10 @@ class ExplorerHost {
   virtual void ExplorerSelected(const std::wstring& path, bool image) = 0;     // 選んでいるものが変わった
   virtual void ExplorerFindSameFile(const std::wstring& path) = 0;             // この画像と同じ画像を探す（ドロップなど）
   virtual void ExplorerFindSameUrl(const std::wstring& url) = 0;               // URL の画像と同じ画像を探す
-  virtual void ExplorerAddRoots(const std::vector<std::wstring>& dirs) = 0;    // 調べるフォルダに足す（いくつも選んだ時はまとめて）
+  // フォルダ・画像をスキャンタスクに足す（いくつも選んだ時は 1 つのタスクにまとめる）。top なら一番上（最優先）
+  virtual void ExplorerAddScanTask(const std::vector<std::wstring>& paths, bool top) = 0;
+  virtual bool ExplorerIsRoot(const std::wstring& dir) = 0;      // 調べるフォルダ（インデックスの対象）そのものか
+  virtual void ExplorerRemoveRoot(const std::wstring& dir) = 0;  // 調べるフォルダから外す（確かめてから）
   virtual void ExplorerSettingsChanged(const ExplorerSettings& s) = 0;
   // dir の中の items（名前・フォルダか）の状態（ExplorerState）
   virtual std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) = 0;

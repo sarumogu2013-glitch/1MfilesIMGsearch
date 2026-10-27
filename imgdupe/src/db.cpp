@@ -253,6 +253,18 @@ CREATE TABLE IF NOT EXISTS tag_names(
 CREATE INDEX IF NOT EXISTS tag_names_name ON tag_names(name);
 )SQL";
 
+// 版 10: 保存した条件の並び（smart_folders.sort。NULL は後ろに名前順）と、スキャンタスク（GUI で「スキャンタスクに追加」した操作ごとに 1 行。priority の小さい順に処理し、済んだら消す）
+const char* const kSchemaV10Columns[] = {"smart_folders.sort INTEGER"};
+const char* const kSchemaV10 = R"SQL(
+CREATE TABLE IF NOT EXISTS scan_tasks(
+    id INTEGER PRIMARY KEY,
+    label TEXT NOT NULL,
+    paths TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    created INTEGER
+);
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -371,24 +383,26 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
-        if (i == 6)
-            for (const char* c : kSchemaV7Columns) {
-                const std::string def = c;
-                const size_t dot = def.find('.'), sp = def.find(' ');
-                const std::string table = def.substr(0, dot), column = def.substr(dot + 1, sp - dot - 1);
-                bool has = false;
-                {
-                    Stmt st(db_, ("PRAGMA table_info(" + table + ")").c_str());
-                    while (st.step()) has = has || st.text(1) == column;
-                }
-                if (!has && !exec(("ALTER TABLE " + table + " ADD COLUMN " + def.substr(dot + 1)).c_str())) {
-                    exec("ROLLBACK");
-                    return false;
-                }
+        std::vector<const char*> columns;  // 無ければ足す列（ALTER TABLE は 2 回当てられないので確かめてから）
+        if (i == 6) columns.assign(std::begin(kSchemaV7Columns), std::end(kSchemaV7Columns));
+        if (i == 9) columns.assign(std::begin(kSchemaV10Columns), std::end(kSchemaV10Columns));
+        for (const char* c : columns) {
+            const std::string def = c;
+            const size_t dot = def.find('.'), sp = def.find(' ');
+            const std::string table = def.substr(0, dot), column = def.substr(dot + 1, sp - dot - 1);
+            bool has = false;
+            {
+                Stmt st(db_, ("PRAGMA table_info(" + table + ")").c_str());
+                while (st.step()) has = has || st.text(1) == column;
             }
+            if (!has && !exec(("ALTER TABLE " + table + " ADD COLUMN " + def.substr(dot + 1)).c_str())) {
+                exec("ROLLBACK");
+                return false;
+            }
+        }
         if (!exec(steps[i])) {
             exec("ROLLBACK");
             return false;
@@ -721,7 +735,20 @@ void setStage(Db& db, int64_t imageId, const std::string& stage, StageState stat
     st.step();
 }
 
-std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version, size_t limit) {
+std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version, size_t limit,
+                                   const std::vector<int64_t>* within) {
+    if (within) {
+        std::vector<int64_t> out;
+        Stmt st(db.handle(), "SELECT 1 FROM stages WHERE image_id=? AND stage=? AND version=? AND state<>0");
+        for (int64_t id : *within) {
+            st.bind(1, id).bind(2, stage).bind(3, static_cast<int64_t>(version));
+            const bool finished = st.step();
+            st.reset();
+            if (!finished) out.push_back(id);
+            if (limit && out.size() >= limit) break;
+        }
+        return out;
+    }
     std::string sql =
         "SELECT i.id FROM images i WHERE NOT EXISTS (SELECT 1 FROM stages s WHERE s.image_id=i.id AND s.stage=?1 "
         "AND s.version=?2 AND s.state<>0) ORDER BY i.added DESC, i.id DESC";
@@ -776,6 +803,98 @@ std::vector<std::string> takeCommands(Db& db) {
         throw;
     }
     return out;
+}
+
+// ---------------------------------------------------------------- スキャンタスク
+
+namespace {
+
+std::string joinLines(const std::vector<std::string>& v) {
+    std::string s;
+    for (const auto& x : v) s += x + "\n";
+    return s;
+}
+
+std::vector<std::string> splitLines(const std::string& s) {
+    std::vector<std::string> out;
+    size_t a = 0;
+    while (a < s.size()) {
+        size_t b = s.find('\n', a);
+        if (b == std::string::npos) b = s.size();
+        if (b > a) out.push_back(s.substr(a, b - a));
+        a = b + 1;
+    }
+    return out;
+}
+
+// 並びをそのまま priority 0, 1, 2 … として書く
+void writeTaskOrder(Db& db, const std::vector<int64_t>& ids) {
+    db.begin();
+    try {
+        Stmt st(db.handle(), "UPDATE scan_tasks SET priority=? WHERE id=?");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            st.bind(1, static_cast<int64_t>(i)).bind(2, ids[i]);
+            st.step();
+            st.reset();
+        }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+}
+
+}  // namespace
+
+int64_t addScanTask(Db& db, const std::string& label, const std::vector<std::string>& paths, bool top) {
+    Stmt mm(db.handle(), top ? "SELECT min(priority) FROM scan_tasks" : "SELECT max(priority) FROM scan_tasks");
+    int64_t pri = 0;
+    if (mm.step() && !mm.isNull(0)) pri = mm.i64(0) + (top ? -1 : 1);
+    Stmt st(db.handle(), "INSERT INTO scan_tasks(label,paths,priority,created) VALUES(?,?,?,?)");
+    st.bind(1, label).bind(2, joinLines(paths)).bind(3, pri).bind(4, nowUnix());
+    st.step();
+    Stmt id(db.handle(), "SELECT last_insert_rowid()");
+    return id.step() ? id.i64(0) : 0;
+}
+
+std::vector<ScanTask> scanTasks(Db& db) {
+    std::vector<ScanTask> out;
+    Stmt st(db.handle(), "SELECT id,label,paths,created FROM scan_tasks ORDER BY priority,id");
+    while (st.step()) out.push_back({st.i64(0), st.text(1), splitLines(st.text(2)), st.i64(3)});
+    return out;
+}
+
+void moveScanTask(Db& db, int64_t id, TaskMove where) {
+    std::vector<int64_t> ids;
+    for (const auto& t : scanTasks(db)) ids.push_back(t.id);
+    const auto it = std::find(ids.begin(), ids.end(), id);
+    if (it == ids.end()) return;
+    const size_t i = static_cast<size_t>(it - ids.begin());
+    switch (where) {
+        case TaskMove::Top: std::rotate(ids.begin(), ids.begin() + i, ids.begin() + i + 1); break;
+        case TaskMove::Up:
+            if (i > 0) std::swap(ids[i], ids[i - 1]);
+            break;
+        case TaskMove::Down:
+            if (i + 1 < ids.size()) std::swap(ids[i], ids[i + 1]);
+            break;
+        case TaskMove::Bottom: std::rotate(ids.begin() + i, ids.begin() + i + 1, ids.end()); break;
+    }
+    writeTaskOrder(db, ids);
+}
+
+void setScanTaskOrder(Db& db, const std::vector<int64_t>& ids) {
+    // 渡されなかったもの（その間に足されたもの）は後ろに残す
+    std::vector<int64_t> all = ids;
+    for (const auto& t : scanTasks(db))
+        if (std::find(ids.begin(), ids.end(), t.id) == ids.end()) all.push_back(t.id);
+    writeTaskOrder(db, all);
+}
+
+void removeScanTask(Db& db, int64_t id) {
+    Stmt st(db.handle(), "DELETE FROM scan_tasks WHERE id=?");
+    st.bind(1, id);
+    st.step();
 }
 
 // ---------------------------------------------------------------- 古いキャッシュ

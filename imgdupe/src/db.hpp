@@ -15,7 +15,7 @@ struct sqlite3_stmt;
 namespace imgdupe {
 
 // 今のスキーマの版。テーブルを変えたら上げ、Db::open の移行処理に足す
-constexpr int kSchemaVersion = 9;
+constexpr int kSchemaVersion = 10;
 
 // 1 つの SQL 文（プリペアドステートメント）
 class Stmt {
@@ -125,8 +125,9 @@ std::vector<TagRow> tagsOf(Db& db, int64_t imageId);
 // ---------------------------------------------------------------- 段階（stages）
 
 void setStage(Db& db, int64_t imageId, const std::string& stage, StageState state, int version);
-// その段階が version で済んでいない画像（新しく追加されたものから）
-std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version, size_t limit = 0);
+// その段階が version で済んでいない画像（新しく追加されたものから）。within があれば、その中から（その並びで）
+std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version, size_t limit = 0,
+                                   const std::vector<int64_t>* within = nullptr);
 
 // ---------------------------------------------------------------- GUI と indexer のやりとり
 
@@ -141,6 +142,22 @@ std::vector<std::string> getRoots(Db& db);
 void addCommand(Db& db, const std::string& command, const std::string& target = "");
 // まだ済んでいない指示を古い順に取り出し、済みにする
 std::vector<std::string> takeCommands(Db& db);
+
+// スキャンタスク（scan_tasks）: GUI の「スキャンタスクに追加」1 回で 1 つ。paths はフォルダかファイル。
+// indexer は並びの上から 1 つずつ、その中の画像だけ全部の段階を済ませ、済んだら消す
+struct ScanTask {
+    int64_t id = 0;
+    std::string label;
+    std::vector<std::string> paths;
+    int64_t created = 0;
+};
+enum class TaskMove { Top, Up, Down, Bottom };
+// top なら一番上、そうでなければ一番下に足す。ID を返す
+int64_t addScanTask(Db& db, const std::string& label, const std::vector<std::string>& paths, bool top);
+std::vector<ScanTask> scanTasks(Db& db);  // 処理する順
+void moveScanTask(Db& db, int64_t id, TaskMove where);
+void setScanTaskOrder(Db& db, const std::vector<int64_t>& ids);
+void removeScanTask(Db& db, int64_t id);
 
 // 古いキャッシュ（imgdupe_cache.bin）を読み込む。取り込んだ数を返す
 size_t importCache(Db& db, const Cache& cache, int hashVersion);

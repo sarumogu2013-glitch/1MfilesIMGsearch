@@ -698,7 +698,7 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
 
 std::vector<SmartFolder> smartFolders(Db& db) {
     std::vector<SmartFolder> out;
-    Stmt st(db.handle(), "SELECT id, name, query FROM smart_folders ORDER BY name COLLATE NOCASE");
+    Stmt st(db.handle(), "SELECT id, name, query FROM smart_folders ORDER BY sort IS NULL, sort, name COLLATE NOCASE");
     while (st.step()) {
         SmartFolder f;
         f.id = st.i64(0);
@@ -737,6 +737,49 @@ void deleteSmartFolder(Db& db, int64_t id) {
     Stmt st(db.handle(), "DELETE FROM smart_folders WHERE id=?");
     st.bind(1, id);
     st.step();
+}
+
+void setSmartFolderOrder(Db& db, const std::vector<int64_t>& ids) {
+    db.begin();
+    try {
+        Stmt st(db.handle(), "UPDATE smart_folders SET sort=? WHERE id=?");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            st.bind(1, static_cast<int64_t>(i)).bind(2, ids[i]);
+            st.step();
+            st.reset();
+        }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+}
+
+std::string exportSmartFolders(const std::vector<SmartFolder>& folders) {
+    std::string out = "{\n  \"imgdupe\": \"saved-queries\",\n  \"version\": 1,\n  \"queries\": [";
+    for (size_t i = 0; i < folders.size(); ++i) {
+        out += i ? ",\n    {\"name\": " : "\n    {\"name\": ";
+        jsonString(out, folders[i].name);
+        out += ", \"query\": " + queryToJson(folders[i].query) + "}";
+    }
+    out += folders.empty() ? "]\n}\n" : "\n  ]\n}\n";
+    return out;
+}
+
+bool importSmartFolders(const std::string& text, std::vector<SmartFolder>& out) {
+    Json root;
+    if (!parseJson(text, root) || root.type != Json::Object) return false;
+    const Json* list = root.get("queries");
+    if (!list || list->type != Json::Array) return false;
+    for (const Json& item : list->arr) {
+        const Json* q = item.get("query");
+        SmartFolder f;
+        f.name = item.getString("name");
+        if (f.name.empty() || !q || q->type != Json::Object) continue;
+        if (!queryFromJson(jsonText(*q), f.query)) continue;
+        out.push_back(std::move(f));
+    }
+    return true;
 }
 
 std::vector<std::pair<std::string, int64_t>> tagSources(Db& db) {

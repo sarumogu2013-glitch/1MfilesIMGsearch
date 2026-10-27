@@ -703,6 +703,88 @@ static void testIndexer() {
     fs::remove_all(root);
 }
 
+static void testScanTasks() {
+    const fs::path root = fs::temp_directory_path() / "imgdupe-task-test";
+    fs::remove_all(root);
+    const fs::path pics = root / "pics", extra = root / "extra";
+    writeRaw(pics / "a.jpg", pattern(1));
+    writeRaw(pics / "b.jpg", pattern(2));
+    writeRaw(extra / "c.jpg", pattern(3));
+    writeRaw(extra / "d.jpg", pattern(4));
+
+    Db db;
+    CHECK(db.open((root / "imgdupe.db").string()));
+    // 並び: 足した順、top は一番上
+    const int64_t t1 = addScanTask(db, "フォルダ: extra", {extra.string()}, false);
+    const int64_t t2 = addScanTask(db, "ファイル: a.jpg", {(pics / "a.jpg").string()}, true);
+    const int64_t t3 = addScanTask(db, "3", {"/nowhere"}, false);
+    auto order = [&] {
+        std::vector<int64_t> v;
+        for (const auto& t : scanTasks(db)) v.push_back(t.id);
+        return v;
+    };
+    CHECK((order() == std::vector<int64_t>{t2, t1, t3}));
+    CHECK(scanTasks(db)[1].paths.size() == 1 && scanTasks(db)[1].label == "フォルダ: extra");
+    moveScanTask(db, t3, TaskMove::Top);
+    CHECK((order() == std::vector<int64_t>{t3, t2, t1}));
+    moveScanTask(db, t3, TaskMove::Down);
+    CHECK((order() == std::vector<int64_t>{t2, t3, t1}));
+    moveScanTask(db, t2, TaskMove::Bottom);
+    CHECK((order() == std::vector<int64_t>{t3, t1, t2}));
+    setScanTaskOrder(db, {t2, t3});
+    CHECK((order() == std::vector<int64_t>{t2, t3, t1}));
+    removeScanTask(db, t3);
+    CHECK((order() == std::vector<int64_t>{t2, t1}));
+
+    // タスクだけの回: ファイル 1 つとフォルダだけを調べ、全部済ませてタスクを消す（roots の pics/b.jpg は触らない）
+    int decodes = 0;
+    const Callbacks base = fakeCallbacks(decodes);
+    IndexCallbacks cb;
+    cb.scan = [&base](const std::string& r, std::vector<ScannedFile>& out) {
+        if (fs::is_regular_file(r)) {
+            out.push_back({r, static_cast<uint64_t>(fs::file_size(r)),
+                           static_cast<int64_t>(fs::last_write_time(r).time_since_epoch().count())});
+            return;
+        }
+        if (fs::exists(r)) base.scan(r, out);
+    };
+    cb.decode = base.decode;
+    IndexOptions opt;
+    opt.roots = {pics.string()};
+    opt.dbFile = (root / "imgdupe.db").string();
+    opt.packDir = root.string();
+    opt.thumbnails = false;
+    opt.threads = 2;
+    opt.fullPass = false;
+    std::atomic<bool> preempt{false};
+    opt.preempt = &preempt;
+    IndexProgress prog;
+    std::atomic<bool> cancel{false};
+    IndexReport r = indexOnce(opt, cb, prog, cancel);
+    CHECK(r.tasks == 2 && r.files == 3 && r.hashed == 3 && decodes == 3);
+    CHECK(scanTasks(db).empty());
+    CHECK(imageCount(db) == 3);
+    CHECK(prog.task == -1);
+
+    // フォルダ全体: 残りの b.jpg だけ
+    decodes = 0;
+    opt.fullPass = true;
+    r = indexOnce(opt, cb, prog, cancel);
+    CHECK(r.tasks == 0 && r.hashed == 1 && decodes == 1 && imageCount(db) == 4);
+
+    // yield が立っていれば、段階はすぐ譲る
+    {
+        Stmt st(db.handle(), "DELETE FROM stages");
+        st.step();
+    }
+    preempt = true;
+    HashAnalyzer hash(cb);
+    const StageReport sr = runStage(db, hash, 1, cancel, nullptr, 256, nullptr, &preempt);
+    CHECK(sr.yielded && sr.cancelled && sr.processed == 0);
+    db.close();
+    fs::remove_all(root);
+}
+
 static std::vector<uint8_t> pngChunk(const std::string& type, const std::string& data) {
     std::vector<uint8_t> c;
     const uint32_t n = static_cast<uint32_t>(data.size());
@@ -1106,6 +1188,22 @@ static void testSearch() {
     CHECK((ids(folders[1].query) == V{a, b, c}));      // 保存した条件で、今の DB を探す
     CHECK(saveSmartFolder(db, "PNG", m) == s2);          // 大文字小文字は区別しない
     CHECK(!renameSmartFolder(db, s1, "Png") && renameSmartFolder(db, s1, "初音ミク"));
+    // 並べ替え・書き出し・読み込み
+    setSmartFolderOrder(db, {s1, s2});
+    folders = smartFolders(db);
+    CHECK(folders.size() == 2 && folders[0].id == s1 && folders[1].id == s2);
+    const int64_t s3 = saveSmartFolder(db, "a", m);  // 並べていないものは後ろ
+    CHECK(smartFolders(db).back().id == s3);
+    deleteSmartFolder(db, s3);
+    {
+        std::vector<SmartFolder> back;
+        CHECK(importSmartFolders(exportSmartFolders(smartFolders(db)), back));
+        CHECK(back.size() == 2 && back[0].name == "初音ミク" && back[0].query.tags == std::vector<std::string>{"hatsune_miku"});
+        CHECK(std::abs(back[0].query.minConfidence - 0.2) < 1e-9);
+        CHECK(queryToJson(back[1].query) == queryToJson(m));
+        std::vector<SmartFolder> none;
+        CHECK(!importSmartFolders("not json", none) && importSmartFolders(exportSmartFolders({}), none) && none.empty());
+    }
     deleteSmartFolder(db, s2);
     folders = smartFolders(db);
     CHECK(folders.size() == 1 && folders[0].name == "初音ミク" && folders[0].id == s1);
@@ -2612,6 +2710,7 @@ int main() {
     testDb();
     testPack();
     testIndexer();
+    testScanTasks();
     testMeta();
     testSearch();
     testLinks();

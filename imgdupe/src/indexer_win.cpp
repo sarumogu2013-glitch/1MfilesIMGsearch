@@ -47,12 +47,14 @@ constexpr UINT_PTR kPopupTimer = 2;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"imgdupe-indexer";
 constexpr UINT WM_TRAY = WM_APP + 1;
+constexpr UINT WM_SHOW_TASKS = WM_APP + 2;  // GUI から「スキャンタスクの一覧」
 constexpr UINT_PTR kTipTimer = 1;
 constexpr ULONGLONG kChangeQuietMs = 10 * 1000;       // フォルダが変わってから、これだけ静かになったら調べる
 constexpr ULONGLONG kRescanMs = 30 * 60 * 1000;       // 変化が無くても、これだけたったら調べ直す
 constexpr DWORD kIdleMs = 60 * 1000;                  // これだけ操作が無ければ全力で処理する
 
-enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT, ID_LOAD0 = 100 };  // ID_LOAD0 + 負荷
+enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT, ID_TASKS, ID_LOAD0 = 100 };  // ID_LOAD0 + 負荷
+enum : UINT { ID_TASK_TOP = 1, ID_TASK_UP, ID_TASK_DOWN, ID_TASK_BOTTOM, ID_TASK_REMOVE };
 
 std::wstring exePath() {
     std::wstring buf(MAX_PATH, L'\0');
@@ -79,7 +81,9 @@ struct Resident {
     std::mutex m;
     std::condition_variable cv;
     std::atomic<bool> quit{false}, paused{false}, cancelRun{false}, running{false};
-    std::atomic<bool> dirty{true};             // 調べ直しが要る
+    std::atomic<bool> dirty{true};             // 調べ直しが要る（フォルダ全体）
+    std::atomic<bool> tasksDirty{true};        // スキャンタスクが足された
+    std::atomic<bool> preempt{false};          // 今のタスクより上に別のタスクが来た（indexOnce が切れ目で譲る）
     std::atomic<ULONGLONG> changeTick{0};      // フォルダの変化に気づいた時刻（0 = なし）
     std::vector<std::wstring> roots;           // watcher が見ているフォルダ（m で守る）
     std::atomic<unsigned> rootsGen{0};
@@ -91,7 +95,7 @@ struct Resident {
 
     // タスクトレイのアイコンをクリックした時の状況の窓
     HWND popup = nullptr;
-    int popupView = 0;                          // 0 = 新規作成中、1 = 総合
+    int popupView = 0;                          // 0 = 新規作成中、1 = 総合、2 = タスク
     std::vector<std::pair<RECT, int>> popupTabs;
     struct OverallRow {
         std::wstring name;
@@ -101,6 +105,16 @@ struct Resident {
     int64_t overallImages = -1;                 // DB の画像の数（-1 = まだ数えていない。m で守る）
     ULONGLONG overallAt = 0;                    // 最後に数えた時刻
     std::atomic<bool> counting{false};
+    // スキャンタスクの一覧（UI のスレッドだけで使う）
+    Db uiDb;
+    bool uiDbOpen = false;
+    std::vector<ScanTask> tasks;
+    std::vector<std::pair<RECT, int64_t>> taskRows;  // 見えている行（ID）
+    int64_t taskSel = 0;
+    int taskScroll = 0;                              // 上に送った量（px）
+    int taskDragFrom = -1, taskDropAt = -1;           // ドラッグで並べ替え中（行の番号・入れる所）
+    POINT taskDragPt{};
+    bool taskMenuOpen = false;                        // 行のメニューを出している間は閉じない
 };
 
 Resident* g = nullptr;
@@ -140,6 +154,32 @@ void applyProcessPriority(int load) {
     }
     SetPriorityClass(self, PROCESS_MODE_BACKGROUND_END);
     SetPriorityClass(self, load == kLoadMedium ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+}
+
+// スキャンタスクの並びが変わった時: 今のタスク（かフォルダ全体の確認）より上に別のものが来たら、切れ目で譲ってもらう
+void checkPreempt(const std::vector<ScanTask>& tasks) {
+    if (!g->running) return;
+    const int64_t cur = g->prog.task;
+    if (cur > 0 ? (tasks.empty() || tasks.front().id != cur) : cur == 0 && !tasks.empty()) g->preempt = true;
+}
+
+void checkPreempt(Db& db) {
+    try {
+        checkPreempt(scanTasks(db));
+    } catch (const std::exception&) {
+    }
+}
+
+// GUI からの指示
+void handleCommand(Db& db, const std::string& c) {
+    if (c == "quit") g->quit = true;
+    else if (c == "rescan") g->dirty = true;
+    else if (c == "pause") g->paused = true;
+    else if (c == "resume") g->paused = false;
+    else if (c == "tasks") {
+        g->tasksDirty = true;
+        checkPreempt(db);
+    } else if (c == "showtasks") PostMessageW(g->hwnd, WM_SHOW_TASKS, 0, 0);
 }
 
 void setStatus(std::wstring* field, const std::wstring& v) {
@@ -184,8 +224,10 @@ void watchLoop() {
 
 // ---------------------------------------------------------------- 処理
 
-void runOnce(const std::vector<std::wstring>& roots) {
+void runOnce(const std::vector<std::wstring>& roots, bool full) {
     IndexOptions opt;
+    opt.fullPass = full;
+    opt.preempt = &g->preempt;
     for (const auto& r : roots) opt.roots.push_back(narrow(r));
     // 見本画像のフォルダも読む（CLIP のベクトルを作って、見本に使う）
     if (GetFileAttributesW(clip::refsDir(g->dataDir).c_str()) != INVALID_FILE_ATTRIBUTES)
@@ -203,7 +245,21 @@ void runOnce(const std::vector<std::wstring>& roots) {
     std::atomic<uint64_t>& found = g->prog.prog.total;
     IndexCallbacks cb;
     cb.scan = [&found](const std::string& root, std::vector<ScannedFile>& files) {
-        imgwin::scanFolder(widen(root), files, found, g->cancelRun);
+        const std::wstring w = widen(root);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &fa) && !(fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            // スキャンタスクのファイル 1 つ
+            if (!isImageExt(root)) return;
+            ScannedFile f;
+            f.path = root;
+            f.size = (static_cast<uint64_t>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+            f.mtime = static_cast<int64_t>((static_cast<uint64_t>(fa.ftLastWriteTime.dwHighDateTime) << 32) |
+                                           fa.ftLastWriteTime.dwLowDateTime);
+            files.push_back(std::move(f));
+            found.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        imgwin::scanFolder(w, files, found, g->cancelRun);
     };
     cb.decode = [](const std::string& path) { return imgwin::decodeFeatures(widen(path)); };
     cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
@@ -266,12 +322,7 @@ void runOnce(const std::vector<std::wstring>& roots) {
         for (unsigned tick = 0; !done; ++tick) {
             if (cmdOk && tick % 3 == 0) {
                 try {
-                    for (const auto& c : takeCommands(cmdDb)) {
-                        if (c == "quit") g->quit = true;
-                        else if (c == "rescan") g->dirty = true;
-                        else if (c == "pause") g->paused = true;
-                        else if (c == "resume") g->paused = false;
-                    }
+                    for (const auto& c : takeCommands(cmdDb)) handleCommand(cmdDb, c);
                 } catch (const std::exception&) {
                 }
             }
@@ -285,13 +336,17 @@ void runOnce(const std::vector<std::wstring>& roots) {
     try {
         const IndexReport r = indexOnce(opt, cb, g->prog, g->cancelRun);
         if (r.cancelled) {
-            g->dirty = true;
+            if (full) g->dirty = true;
+            g->tasksDirty = true;
         } else {
-            wchar_t t[200];
+            wchar_t t[240];
             SYSTEMTIME now;
             GetLocalTime(&now);
-            swprintf(t, 200, L"%02d:%02d に完了（画像 %zu 枚、追加 %zu・削除 %zu、ハッシュ %zu、サムネイル %zu、メタデータ %zu）",
-                     now.wHour, now.wMinute, r.files, r.added, r.removed, r.hashed, r.thumbs, r.metas);
+            if (full)
+                swprintf(t, 240, L"%02d:%02d に完了（画像 %zu 枚、追加 %zu・削除 %zu、ハッシュ %zu、サムネイル %zu、メタデータ %zu）",
+                         now.wHour, now.wMinute, r.files, r.added, r.removed, r.hashed, r.thumbs, r.metas);
+            else
+                swprintf(t, 240, L"%02d:%02d にスキャンタスク %zu 個が完了（画像 %zu 枚）", now.wHour, now.wMinute, r.tasks, r.files);
             setStatus(&g->lastResult, t);
         }
     } catch (const std::exception& e) {
@@ -316,12 +371,7 @@ void workLoop() {
     std::vector<std::string> rootsUtf8;
     while (!g->quit) {
         try {
-            for (const auto& c : takeCommands(db)) {
-                if (c == "quit") g->quit = true;
-                else if (c == "rescan") g->dirty = true;
-                else if (c == "pause") g->paused = true;
-                else if (c == "resume") g->paused = false;
-            }
+            for (const auto& c : takeCommands(db)) handleCommand(db, c);
             const std::vector<std::string> r = getRoots(db);
             if (r != rootsUtf8) {
                 rootsUtf8 = r;
@@ -344,17 +394,30 @@ void workLoop() {
         if (lastRun && now - lastRun > kRescanMs) g->dirty = true;
 
         g->load = loadLevel(g->dataDir);
-        std::wstring reason = g->paused ? L"一時停止中" : rootsUtf8.empty() ? L"調べるフォルダがありません" : busyReason();
+        bool haveTasks = false;
+        if (g->tasksDirty) {
+            try {
+                haveTasks = !scanTasks(db).empty();
+            } catch (const std::exception&) {
+            }
+            if (!haveTasks) g->tasksDirty = false;
+        }
+        const bool full = g->dirty && !rootsUtf8.empty();
+        std::wstring reason = g->paused                         ? L"一時停止中"
+                              : rootsUtf8.empty() && !haveTasks ? L"調べるフォルダがありません"
+                                                                : busyReason();
         setStatus(&g->waitReason, reason);
-        if (g->dirty && reason.empty()) {
-            g->dirty = false;
+        if ((full || haveTasks) && reason.empty()) {
+            if (full) g->dirty = false;
+            g->tasksDirty = false;
             g->cancelRun = false;
+            g->preempt = false;
             std::vector<std::wstring> roots;
             {
                 std::lock_guard<std::mutex> lock(g->m);
                 roots = g->roots;
             }
-            runOnce(roots);
+            runOnce(roots, full);
             lastRun = GetTickCount64();
             continue;
         }
@@ -496,6 +559,111 @@ void drawBar(HDC dc, RECT r, double ratio, COLORREF color) {
     if (f.right > f.left) fillRect(dc, f, color);
 }
 
+// スキャンタスクの一覧を読み直す（UI のスレッド）
+void refreshTasks() {
+    try {
+        if (!g->uiDbOpen) g->uiDbOpen = g->uiDb.open(dbFileOf(g->dataDir));
+        if (g->uiDbOpen) g->tasks = scanTasks(g->uiDb);
+    } catch (const std::exception&) {
+    }
+}
+
+const ScanTask* findTask(int64_t id) {
+    for (const auto& t : g->tasks)
+        if (t.id == id) return &t;
+    return nullptr;
+}
+
+// 一覧の行の高さと、一覧の場所（paintPopup が決める）
+int taskRowH() { return popupPx(46); }
+int g_taskTop = 0, g_taskBottom = 0;
+
+// 並びを変えた・外した後: 今の処理より上に来たものがあれば譲ってもらう
+void afterTaskChange() {
+    refreshTasks();
+    checkPreempt(g->tasks);
+    g->tasksDirty = true;
+    g->cv.notify_all();
+    if (g->popup) InvalidateRect(g->popup, nullptr, FALSE);
+}
+
+std::wstring taskPathsText(const ScanTask& t) {
+    if (t.paths.empty()) return L"";
+    std::wstring s = widen(t.paths.front());
+    if (t.paths.size() > 1) s += L" ほか " + std::to_wstring(t.paths.size() - 1) + L" 個";
+    return s;
+}
+
+void paintTasks(HDC dc, const RECT& rc, int m, int y, HFONT font, HFONT bold) {
+    const int rowH = taskRowH();
+    g_taskTop = y;
+    g_taskBottom = rc.bottom - m - popupPx(22);
+    g->taskRows.clear();
+    const bool running = g->running;
+    const int64_t cur = running ? g->prog.task.load() : -1;
+    const size_t n = g->tasks.size();
+    const int total = static_cast<int>(n + 1) * rowH;
+    g->taskScroll = std::clamp(g->taskScroll, 0, std::max(0, total - (g_taskBottom - g_taskTop)));
+    HRGN clip = CreateRectRgn(0, g_taskTop, rc.right, g_taskBottom);
+    SelectClipRgn(dc, clip);
+    for (size_t i = 0; i <= n; ++i) {
+        const int top = g_taskTop + static_cast<int>(i) * rowH - g->taskScroll;
+        if (top + rowH < g_taskTop || top > g_taskBottom) continue;
+        RECT row = {m, top, rc.right - m, top + rowH - popupPx(4)};
+        const bool fixed = i == n;  // 最後の行: いつものフォルダ全体の確認（動かせない）
+        const int64_t id = fixed ? 0 : g->tasks[i].id;
+        const bool now = cur == id && (fixed ? cur == 0 : true);
+        const bool sel = !fixed && g->taskSel == id;
+        HBRUSH b = CreateSolidBrush(sel ? RGB(220, 234, 252) : now ? RGB(232, 245, 236) : RGB(255, 255, 255));
+        HPEN pen = CreatePen(PS_SOLID, 1, sel ? RGB(0, 120, 215) : RGB(215, 220, 228));
+        HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, pen);
+        RoundRect(dc, row.left, row.top, row.right, row.bottom, popupPx(6), popupPx(6));
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(b);
+        DeleteObject(pen);
+        // 番号
+        RECT nr = {row.left + popupPx(6), row.top, row.left + popupPx(30), row.bottom};
+        SetTextColor(dc, fixed ? RGB(150, 150, 150) : RGB(0, 100, 220));
+        SelectObject(dc, bold);
+        DrawTextW(dc, fixed ? L"―" : std::to_wstring(i + 1).c_str(), -1, &nr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RECT lr = {row.left + popupPx(34), row.top + popupPx(4), row.right - popupPx(6), row.top + popupPx(22)};
+        SetTextColor(dc, fixed ? RGB(110, 110, 110) : RGB(30, 30, 30));
+        const std::wstring label = fixed ? L"フォルダ全体の確認（いつもの処理）" : widen(g->tasks[i].label);
+        DrawTextW(dc, label.c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, font);
+        RECT sr = {lr.left, lr.bottom, lr.right, row.bottom - popupPx(2)};
+        std::wstring sub;
+        if (now) {
+            const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
+            const uint64_t done = g->prog.prog.done, tot = g->prog.prog.total;
+            sub = L"▶ 処理中: " + std::wstring(phaseName(phase));
+            if (phase != IndexPhase::Scan && tot) sub += L" " + std::to_wstring(done) + L" / " + std::to_wstring(tot);
+            SetTextColor(dc, RGB(30, 130, 60));
+        } else {
+            sub = fixed ? L"タスクが無くなってから、調べるフォルダ全体の変化を見ます" : taskPathsText(g->tasks[i]);
+            SetTextColor(dc, RGB(120, 120, 120));
+        }
+        DrawTextW(dc, sub.c_str(), -1, &sr,
+                  DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | (fixed || now ? DT_END_ELLIPSIS : DT_PATH_ELLIPSIS));
+        if (!fixed) g->taskRows.push_back({row, id});
+    }
+    // ドラッグで入れる所
+    if (g->taskDropAt >= 0) {
+        const int ly = g_taskTop + g->taskDropAt * rowH - g->taskScroll - popupPx(3);
+        fillRect(dc, {m, ly, rc.right - m, ly + popupPx(3)}, RGB(0, 120, 215));
+    }
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(clip);
+    if (n == 0) {
+        RECT er = {m, g_taskTop + rowH + popupPx(6), rc.right - m, g_taskBottom};
+        SetTextColor(dc, RGB(120, 120, 120));
+        DrawTextW(dc,
+                  L"スキャンタスクはありません。imgdupe でフォルダやファイルを右クリックして「スキャンタスクに追加」で足せます。",
+                  -1, &er, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+    }
+}
+
 void paintPopup(HDC dc, const RECT& rc) {
     fillRect(dc, rc, RGB(250, 251, 253));
     SetBkMode(dc, TRANSPARENT);
@@ -517,10 +685,10 @@ void paintPopup(HDC dc, const RECT& rc) {
     g->popupTabs.clear();
     {
         int x = m;
-        const wchar_t* names[] = {L"新規作成中", L"総合"};
-        for (int k = 0; k < 2; ++k) {
+        const std::wstring names[] = {L"新規作成中", L"総合", L"タスク（" + std::to_wstring(g->tasks.size()) + L"）"};
+        for (int k = 0; k < 3; ++k) {
             SIZE sz{};
-            GetTextExtentPoint32W(dc, names[k], static_cast<int>(wcslen(names[k])), &sz);
+            GetTextExtentPoint32W(dc, names[k].c_str(), static_cast<int>(names[k].size()), &sz);
             RECT r = {x, y, x + sz.cx + popupPx(20), y + popupPx(24)};
             const bool on = g->popupView == k;
             HBRUSH b = CreateSolidBrush(on ? RGB(0, 100, 220) : RGB(255, 255, 255));
@@ -532,7 +700,7 @@ void paintPopup(HDC dc, const RECT& rc) {
             DeleteObject(b);
             DeleteObject(pen);
             SetTextColor(dc, on ? RGB(255, 255, 255) : RGB(60, 60, 60));
-            DrawTextW(dc, names[k], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(dc, names[k].c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             g->popupTabs.push_back({r, k});
             x = r.right + popupPx(6);
         }
@@ -562,6 +730,9 @@ void paintPopup(HDC dc, const RECT& rc) {
         if (running) {
             const auto phase = static_cast<IndexPhase>(g->prog.phase.load());
             const uint64_t done = g->prog.prog.done, total = g->prog.prog.total;
+            const int64_t task = g->prog.task;
+            if (task == 0) text(L"対象: フォルダ全体の確認", RGB(90, 90, 90));
+            else if (const ScanTask* t = task > 0 ? findTask(task) : nullptr) text(L"対象: スキャンタスク「" + widen(t->label) + L"」", RGB(90, 90, 90));
             SelectObject(dc, bold);
             std::wstring now = phaseName(phase);
             if ((phase == IndexPhase::Tagger || phase == IndexPhase::Clip) && !device.empty()) now += L"（" + device + L"）";
@@ -593,6 +764,8 @@ void paintPopup(HDC dc, const RECT& rc) {
         } else {
             text(last.empty() ? L"まだ新しく作るものはありません" : L"前回: " + last, RGB(60, 60, 60));
         }
+    } else if (g->popupView == 2) {
+        paintTasks(dc, rc, m, y, font, bold);
     } else {
         int64_t images;
         std::vector<Resident::OverallRow> rows;
@@ -637,7 +810,9 @@ void paintPopup(HDC dc, const RECT& rc) {
     // 下に操作の説明
     RECT hr = {m, rc.bottom - m - popupPx(16), rc.right - m, rc.bottom - m};
     SetTextColor(dc, RGB(140, 140, 140));
-    DrawTextW(dc, L"右クリックでメニュー、ダブルクリックで imgdupe を開く", -1, &hr, DT_LEFT | DT_SINGLELINE);
+    DrawTextW(dc,
+              g->popupView == 2 ? L"ドラッグで並べ替え、右クリックで一番上へ・外す など" : L"右クリックでメニュー、ダブルクリックで imgdupe を開く",
+              -1, &hr, DT_LEFT | DT_SINGLELINE);
     SelectObject(dc, oldFont);
     DeleteObject(font);
     DeleteObject(bold);
@@ -645,6 +820,40 @@ void paintPopup(HDC dc, const RECT& rc) {
 
 void showMenu();
 void openGui();
+
+// スキャンタスクの行の右クリック
+void taskMenu(HWND hwnd, int64_t id) {
+    size_t index = 0;
+    for (size_t i = 0; i < g->tasks.size(); ++i)
+        if (g->tasks[i].id == id) index = i;
+    const bool first = index == 0, last = index + 1 >= g->tasks.size();
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (first ? MF_GRAYED : 0), ID_TASK_TOP, L"一番上へ（最優先）(&T)");
+    AppendMenuW(menu, MF_STRING | (first ? MF_GRAYED : 0), ID_TASK_UP, L"1 つ上へ(&U)");
+    AppendMenuW(menu, MF_STRING | (last ? MF_GRAYED : 0), ID_TASK_DOWN, L"1 つ下へ(&D)");
+    AppendMenuW(menu, MF_STRING | (last ? MF_GRAYED : 0), ID_TASK_BOTTOM, L"一番下へ(&B)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_TASK_REMOVE, L"タスクから外す(&R)");
+    POINT pt;
+    GetCursorPos(&pt);
+    g->taskMenuOpen = true;
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    g->taskMenuOpen = false;
+    DestroyMenu(menu);
+    if (!cmd || !g->uiDbOpen) return;
+    try {
+        switch (cmd) {
+            case ID_TASK_TOP: moveScanTask(g->uiDb, id, TaskMove::Top); break;
+            case ID_TASK_UP: moveScanTask(g->uiDb, id, TaskMove::Up); break;
+            case ID_TASK_DOWN: moveScanTask(g->uiDb, id, TaskMove::Down); break;
+            case ID_TASK_BOTTOM: moveScanTask(g->uiDb, id, TaskMove::Bottom); break;
+            case ID_TASK_REMOVE: removeScanTask(g->uiDb, id); break;
+        }
+    } catch (const std::exception&) {
+    }
+    afterTaskChange();
+    if (GetForegroundWindow() != hwnd) SetForegroundWindow(hwnd);
+}
 
 LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -669,30 +878,97 @@ LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kPopupTimer) {
                 if (g->popupView == 1 && GetTickCount64() - g->overallAt > 5000) countOverall();
+                if (g->taskDragFrom < 0) refreshTasks();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
         case WM_LBUTTONDOWN: {
             POINT pt = {static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
             for (const auto& [r, view] : g->popupTabs)
-                if (PtInRect(&r, pt) && g->popupView != view) {
-                    g->popupView = view;
-                    WritePrivateProfileStringW(L"imgdupe", L"indexerPopupView", std::to_wstring(view).c_str(),
-                                               (g->dataDir + L"\\imgdupe.ini").c_str());
-                    if (view == 1) countOverall();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                if (PtInRect(&r, pt)) {
+                    if (g->popupView != view) {
+                        g->popupView = view;
+                        WritePrivateProfileStringW(L"imgdupe", L"indexerPopupView", std::to_wstring(view).c_str(),
+                                                   (g->dataDir + L"\\imgdupe.ini").c_str());
+                        if (view == 1) countOverall();
+                        refreshTasks();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
                 }
+            if (g->popupView == 2)
+                for (size_t i = 0; i < g->taskRows.size(); ++i)
+                    if (PtInRect(&g->taskRows[i].first, pt)) {
+                        g->taskSel = g->taskRows[i].second;
+                        for (size_t k = 0; k < g->tasks.size(); ++k)
+                            if (g->tasks[k].id == g->taskSel) g->taskDragFrom = static_cast<int>(k);
+                        g->taskDragPt = pt;
+                        SetCapture(hwnd);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    }
             return 0;
         }
+        case WM_MOUSEMOVE:
+            if (g->taskDragFrom >= 0 && GetCapture() == hwnd) {
+                const int y = static_cast<short>(HIWORD(lp));
+                if (g->taskDropAt < 0 && std::abs(y - g->taskDragPt.y) < GetSystemMetrics(SM_CYDRAG)) return 0;
+                const int at = (y - g_taskTop + g->taskScroll + taskRowH() / 2) / taskRowH();
+                g->taskDropAt = std::clamp(at, 0, static_cast<int>(g->tasks.size()));
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (g->taskDragFrom >= 0) {
+                const int from = g->taskDragFrom, at = g->taskDropAt;
+                g->taskDragFrom = g->taskDropAt = -1;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                if (at >= 0 && at != from && at != from + 1 && from < static_cast<int>(g->tasks.size())) {
+                    std::vector<int64_t> ids;
+                    for (const auto& t : g->tasks) ids.push_back(t.id);
+                    const int64_t moved = ids[from];
+                    ids.erase(ids.begin() + from);
+                    ids.insert(ids.begin() + (at > from ? at - 1 : at), moved);
+                    try {
+                        if (g->uiDbOpen) setScanTaskOrder(g->uiDb, ids);
+                    } catch (const std::exception&) {
+                    }
+                    afterTaskChange();
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (g->taskDragFrom >= 0 && reinterpret_cast<HWND>(lp) != hwnd) {
+                g->taskDragFrom = g->taskDropAt = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (g->popupView == 2) {
+                g->taskScroll -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * taskRowH();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
         case WM_LBUTTONDBLCLK:
             ShowWindow(hwnd, SW_HIDE);
             openGui();
             return 0;
-        case WM_RBUTTONUP:
+        case WM_RBUTTONUP: {
+            POINT pt = {static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+            if (g->popupView == 2)
+                for (const auto& [r, id] : g->taskRows)
+                    if (PtInRect(&r, pt)) {
+                        g->taskSel = id;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        taskMenu(hwnd, id);
+                        return 0;
+                    }
             showMenu();
             return 0;
+        }
         case WM_ACTIVATE:
-            if (LOWORD(wp) == WA_INACTIVE) ShowWindow(hwnd, SW_HIDE);  // ほかを触ったら閉じる
+            if (LOWORD(wp) == WA_INACTIVE && !g->taskMenuOpen) ShowWindow(hwnd, SW_HIDE);  // ほかを触ったら閉じる
             return 0;
         case WM_SHOWWINDOW:
             if (wp) SetTimer(hwnd, kPopupTimer, 1000, nullptr);
@@ -705,8 +981,8 @@ LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// アイコンの近く（画面の右下など、作業領域の中）に出す
-void togglePopup() {
+// アイコンの近く（画面の右下など、作業領域の中）に出す。toggle なら、出ている時は隠す
+void togglePopup(bool toggle = true, int view = -1) {
     if (!g->popup) {
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = popupProc;
@@ -720,13 +996,16 @@ void togglePopup() {
         if (!g->popup) return;
         g->popupView = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"imgdupe", L"indexerPopupView", 0,
                                                                          (g->dataDir + L"\\imgdupe.ini").c_str())),
-                                  0, 1);
+                                  0, 2);
     }
+    if (view >= 0) g->popupView = view;
+    refreshTasks();
     if (IsWindowVisible(g->popup)) {
-        ShowWindow(g->popup, SW_HIDE);
+        if (toggle) ShowWindow(g->popup, SW_HIDE);
+        else InvalidateRect(g->popup, nullptr, FALSE);
         return;
     }
-    const int w = popupPx(380), h = popupPx(400);
+    const int w = popupPx(400), h = popupPx(440);
     POINT pt;
     GetCursorPos(&pt);
     RECT work{};
@@ -778,6 +1057,7 @@ void showMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g->paused ? MF_CHECKED : 0), ID_PAUSE, L"一時停止(&P)");
     AppendMenuW(menu, MF_STRING, ID_RESCAN, L"今すぐ調べ直す(&R)");
+    AppendMenuW(menu, MF_STRING, ID_TASKS, L"スキャンタスクの一覧(&T)");
     {
         HMENU sub = CreatePopupMenu();
         for (int i = kLoadLight; i <= kLoadHeavy; ++i)
@@ -796,6 +1076,7 @@ void showMenu() {
         case ID_PAUSE: g->paused = !g->paused; break;
         case ID_RESCAN: g->dirty = true; break;
         case ID_OPEN_GUI: openGui(); break;
+        case ID_TASKS: togglePopup(false, 2); break;
         case ID_QUIT: g->quit = true; break;
         default:
             if (cmd >= ID_LOAD0 + kLoadLight && cmd <= ID_LOAD0 + kLoadHeavy && static_cast<int>(cmd - ID_LOAD0) != g->load) {
@@ -825,6 +1106,9 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (wp == kTipTimer) updateTip();
+            return 0;
+        case WM_SHOW_TASKS:
+            togglePopup(false, 2);
             return 0;
         case WM_CLOSE:
             g->quit = true;
@@ -929,6 +1213,20 @@ void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& root
     std::vector<std::string> r;
     for (const auto& x : roots) r.push_back(narrow(x));
     if (getRoots(db) != r) imgdupe::setRoots(db, r);
+}
+
+void addScanTask(const std::wstring& dataDir, const std::wstring& label, const std::vector<std::wstring>& paths, bool top) {
+    Db db;
+    if (!db.open(dbFileOf(dataDir)) || paths.empty()) return;
+    std::vector<std::string> p;
+    for (const auto& x : paths) p.push_back(narrow(x));
+    imgdupe::addScanTask(db, narrow(label), p, top);
+    addCommand(db, "tasks");
+}
+
+void requestShowTasks(const std::wstring& dataDir) {
+    Db db;
+    if (db.open(dbFileOf(dataDir))) addCommand(db, "showtasks");
 }
 
 bool autoStartEnabled() {

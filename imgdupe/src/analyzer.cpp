@@ -6,13 +6,13 @@
 namespace imgdupe {
 
 StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::atomic<bool>& cancel, Progress* progress,
-                     size_t batch) {
+                     size_t batch, const std::vector<int64_t>* within, const std::atomic<bool>* yield) {
     StageReport rep;
     const std::string name = analyzer.stageName();
     const int version = analyzer.version();
     if (!threads) threads = std::max(1u, std::thread::hardware_concurrency());
     // 対象の一覧は最初に 1 回だけ作る（100 万枚だと数秒かかるので、ひとまとまりごとには問い合わせない）
-    const std::vector<int64_t> all = pendingImages(db, name, version);
+    const std::vector<int64_t> all = pendingImages(db, name, version, 0, within);
     if (progress) {
         progress->done = 0;
         progress->total = all.size();
@@ -20,6 +20,10 @@ StageReport runStage(Db& db, Analyzer& analyzer, unsigned threads, const std::at
     for (size_t from = 0; from < all.size(); from += batch) {
         if (cancel) {
             rep.cancelled = true;
+            break;
+        }
+        if (yield && *yield) {
+            rep.cancelled = rep.yielded = true;
             break;
         }
         const std::vector<int64_t> ids(all.begin() + from, all.begin() + std::min(all.size(), from + batch));

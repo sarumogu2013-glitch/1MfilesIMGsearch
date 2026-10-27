@@ -187,4 +187,30 @@ void jsonString(std::string& out, const std::string& s) {
     out += '"';
 }
 
+std::string jsonText(const Json& v) {
+    std::string out;
+    switch (v.type) {
+        case Json::Null: return "null";
+        case Json::Bool:
+        case Json::Number: return v.str;
+        case Json::String: jsonString(out, v.str); return out;
+        case Json::Array:
+            out = "[";
+            for (size_t i = 0; i < v.arr.size(); ++i) out += (i ? "," : "") + jsonText(v.arr[i]);
+            return out + "]";
+        case Json::Object: {
+            out = "{";
+            bool first = true;
+            for (const auto& [k, x] : v.obj) {
+                if (!first) out += ",";
+                first = false;
+                jsonString(out, k);
+                out += ":" + jsonText(x);
+            }
+            return out + "}";
+        }
+    }
+    return "null";
+}
+
 }  // namespace imgdupe

@@ -53,7 +53,7 @@ enum {
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
-       MENU_RELOOKUP };
+       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
 const int kPresetSizes[3] = {96, 160, 256};
@@ -1228,12 +1228,19 @@ class ExplorerImpl {
 
   // いくつも選んでいる時の右クリックのメニュー
   void MultiMenu(const std::vector<int>& picked, POINT screen) {
-    size_t images = 0;
-    std::vector<std::wstring> dirs;  // インデックスがまだ無い (一部の) フォルダ
+    size_t images = 0, dirCount = 0;
+    std::vector<std::wstring> scan;  // スキャンタスクに足すもの（フォルダと画像。まとまりは中の画像）
     for (int k : picked) {
       const Item& it = items[size_t(k)];
       images += it.image ? (it.Stack() ? it.members.size() : 1) : 0;
-      if (it.dir && it.state != kStateIndexed) dirs.push_back(it.path);
+      if (it.dir) {
+        scan.push_back(it.path);
+        ++dirCount;
+      } else if (it.Stack()) {
+        scan.insert(scan.end(), it.members.begin(), it.members.end());
+      } else if (it.image) {
+        scan.push_back(it.path);
+      }
     }
     const std::wstring n = std::to_wstring(picked.size()), ni = std::to_wstring(images);
     HMENU menu = CreatePopupMenu();
@@ -1243,9 +1250,12 @@ class ExplorerImpl {
     UINT on = images ? MF_STRING : MF_STRING | MF_GRAYED;
     AppendMenuW(menu, on, MENU_SAVE_SMART, (L"選んだ画像（" + ni + L" 枚）をスマートフォルダに保存(&M)...").c_str());
     AppendMenuW(menu, on, MENU_BULK_TAG, (L"選んだ画像（" + ni + L" 枚）にタグを付ける・外す(&T)...").c_str());
-    if (!dirs.empty()) {
+    if (!scan.empty()) {
+      std::wstring what = dirCount ? L"フォルダ " + std::to_wstring(dirCount) + L" 個" : L"";
+      if (images) what += (what.empty() ? L"" : L"・") + std::wstring(L"画像 ") + ni + L" 枚";
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, (L"選んだフォルダ（" + std::to_wstring(dirs.size()) + L" 個）のインデックスを作る(&I)").c_str());
+      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, (L"選んだもの（" + what + L"）をスキャンタスクに追加(&I)").c_str());
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, (L"選んだもの（" + what + L"）をスキャンタスクの一番上に追加(&P)").c_str());
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -1260,7 +1270,8 @@ class ExplorerImpl {
       case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
       case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
       case MENU_ADD_ROOT:
-        host->ExplorerAddRoots(dirs);
+      case MENU_SCAN_TOP:
+        host->ExplorerAddScanTask(scan, cmd == MENU_SCAN_TOP);
         RefreshStates();
         break;
     }
@@ -1289,10 +1300,17 @@ class ExplorerImpl {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SAVE_SMART, L"スマートフォルダに保存(&M)...");
       AppendMenuW(menu, MF_STRING, MENU_BULK_TAG, L"タグを付ける・外す(&T)...");
-    }
-    if (it.dir && it.state != kStateIndexed) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, L"このフォルダのインデックスを作る(&I)");
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"この画像を解析する（最優先）(&I)");
+    } else if (it.Stack()) {
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"このまとまりの画像を解析する（最優先）(&I)");
+    }
+    if (it.dir) {
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, L"スキャンタスクに追加(&I)");
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"スキャンタスクの一番上に追加（最優先）(&P)");
+      if (host->ExplorerIsRoot(it.path)) AppendMenuW(menu, MF_STRING, MENU_REMOVE_ROOT, L"調べるフォルダから外す(&X)...");
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -1307,7 +1325,12 @@ class ExplorerImpl {
       case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
       case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
       case MENU_ADD_ROOT:
-        host->ExplorerAddRoots({path});
+      case MENU_SCAN_TOP:
+        host->ExplorerAddScanTask(it.Stack() ? it.members : std::vector<std::wstring>{path}, cmd == MENU_SCAN_TOP);
+        RefreshStates();
+        break;
+      case MENU_REMOVE_ROOT:
+        host->ExplorerRemoveRoot(path);
         RefreshStates();
         break;
     }
@@ -3465,6 +3488,26 @@ class ExplorerImpl {
     for (const wchar_t* t : {L"画像ごと", L"フォルダごと"}) SendMessageW(sameView, CB_ADDSTRING, 0, LPARAM(t));
     settings.resultsView = std::max(0, std::min(1, settings.resultsView));
     SendMessageW(sameView, CB_SETCURSEL, settings.resultsView, 0);
+    // マウスを乗せた時の説明
+    {
+      HWND tip = winutil::makeTooltip(hwnd, Px(360));
+      const std::pair<HWND, const wchar_t*> tips[] = {
+          {backBtn, L"前に見ていた場所に戻る"},
+          {forwardBtn, L"戻る前の場所に進む"},
+          {upBtn, L"1 つ上のフォルダへ（検索の結果からは前のフォルダへ）"},
+          {treeBtn, L"左のフォルダ一覧を出す・隠す"},
+          {previewBtn, L"右のプレビュー（画像・タグ・プロパティ）を出す・隠す"},
+          {pathText, L"フォルダのパスを入れて Enter で開きます。画像の URL を入れると、同じ画像を探します"},
+          {viewBox, L"サムネイルで並べるか、詳細（名前・日時・大きさなどの列）で並べるか"},
+          {sortBox, L"並べ順"},
+          {sortDirBtn, L"昇順と降順を切り替えます"},
+          {sizeBox, L"サムネイルの大きさ（可変ならスライダーで変えられます）"},
+          {slider, L"サムネイルの大きさ（「可変」の時）"},
+          {folderBox, L"フォルダの表紙に、中のどの画像を出すか"},
+          {sameView, L"同じ画像の一覧を、画像ごとに並べるか、フォルダごとにまとめるか"},
+      };
+      for (const auto& [h, text] : tips) winutil::addTooltip(tip, h, text);
+    }
     sameList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, 0, 10, 10,
                                hwnd, HMENU(INT_PTR(ID_SAME_LIST)), inst, nullptr);

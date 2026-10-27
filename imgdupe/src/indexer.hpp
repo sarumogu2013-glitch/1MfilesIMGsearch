@@ -24,6 +24,11 @@ struct IndexOptions {
     std::string packDir;   // サムネイルのパックを置くフォルダ
     unsigned threads = 0;
     bool thumbnails = true;
+    // false なら、スキャンタスクだけを済ませて終える（roots 全体は調べ直さない）
+    bool fullPass = true;
+    // 立てると、今の段階をひとまとまりの切れ目で止め、スキャンタスクの並びを読み直す（上に別のタスクが来た時）。
+    // indexOnce が下ろす
+    std::atomic<bool>* preempt = nullptr;
 };
 
 struct IndexCallbacks {
@@ -66,9 +71,11 @@ StageCount stageCount(Db& db, const std::string& stage, int version);
 struct IndexProgress {
     std::atomic<int> phase{static_cast<int>(IndexPhase::Idle)};
     Progress prog;
+    std::atomic<int64_t> task{-1};  // 今のスキャンタスクの ID（0 = フォルダ全体の確認、-1 = なし）
 };
 
 struct IndexReport {
+    size_t tasks = 0;  // 済ませたスキャンタスクの数
     size_t files = 0, added = 0, removed = 0, hashed = 0, thumbs = 0, metas = 0, names = 0, tagged = 0, clipped = 0, quality = 0, failed = 0;
     std::string taggerError;  // モデルを読めなかった時の理由
     std::string clipError;
@@ -106,7 +113,8 @@ private:
     ThumbPack& pack_;
 };
 
-// 1 回分: 走査 → 登録（消えたものは消す）→ ハッシュ → サムネイル → メタデータ
+// 1 回分: スキャンタスクを上から 1 つずつ（その中の画像だけ、全部の段階）→ フォルダ全体:
+// 走査 → 登録（消えたものは消す）→ ハッシュ → サムネイル → メタデータ → …
 IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexProgress& progress,
                       const std::atomic<bool>& cancel);
 

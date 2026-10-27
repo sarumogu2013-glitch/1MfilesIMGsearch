@@ -30,4 +30,7 @@ bool parseJson(const std::string& text, Json& out);
 // JSON の文字列として書き出す（"..." とエスケープ込み）。
 void jsonString(std::string& out, const std::string& s);
 
+// 値を JSON の文字列に戻す
+std::string jsonText(const Json& v);
+
 }  // namespace imgdupe

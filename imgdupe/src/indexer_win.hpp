@@ -24,6 +24,11 @@ void requestQuit(const std::wstring& dataDir);
 void requestRescan(const std::wstring& dataDir);
 // GUI から: 調べるフォルダを DB に書く（indexer はこれを見る）
 void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& roots);
+// GUI から: スキャンタスクを足す（paths はフォルダかファイル。top なら一番上 = 今のタスクを止めてでも先に）。
+// label は一覧に出す名前。indexer が動いていなければ呼び出し側が起動する
+void addScanTask(const std::wstring& dataDir, const std::wstring& label, const std::vector<std::wstring>& paths, bool top);
+// GUI から: タスクトレイの状況の窓を「タスク」の表示で出してもらう
+void requestShowTasks(const std::wstring& dataDir);
 
 // 処理の負荷（imgdupe.ini の indexerLoad）。GUI の設定の画面とタスクトレイのメニューで変える
 enum LoadLevel : int {

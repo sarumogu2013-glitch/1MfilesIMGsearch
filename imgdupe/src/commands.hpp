@@ -52,6 +52,10 @@ enum Cmd : int {
     CMD_HELP,
     CMD_ABOUT,
     CMD_EXIT,
+    CMD_SCAN_FOLDER,      // フォルダをスキャンタスクに追加
+    CMD_SCAN_FOLDER_TOP,  // フォルダを最優先でスキャン
+    CMD_SCAN_TASKS,       // スキャンタスクの一覧（タスクトレイの窓）
+    CMD_MANAGE_QUERIES,   // 保存した条件の管理
 };
 
 struct CmdInfo {

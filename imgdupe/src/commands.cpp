@@ -32,8 +32,11 @@ const KeyNameDef kKeyNames[] = {
 };
 
 const std::vector<CmdInfo> kCommands = {
-    {CMD_ADD_FOLDER, "AddFolder", L"フォルダを追加(&A)...", "Ctrl+O"},
-    {CMD_REMOVE_FOLDER, "RemoveFolder", L"選んだフォルダを外す(&R)", ""},
+    {CMD_SCAN_FOLDER, "ScanFolder", L"フォルダをスキャンタスクに追加(&S)...", "Ctrl+O"},
+    {CMD_SCAN_FOLDER_TOP, "ScanFolderTop", L"フォルダを最優先でスキャン(&T)...", "Ctrl+Shift+O"},
+    {CMD_SCAN_TASKS, "ScanTasks", L"スキャンタスクの一覧(&K)", ""},
+    {CMD_ADD_FOLDER, "AddFolder", L"調べるフォルダを追加(&A)...", ""},
+    {CMD_REMOVE_FOLDER, "RemoveFolder", L"調べるフォルダを外す(&R)", ""},
     {CMD_EXPORT, "Export", L"結果を保存(&S)...", "Ctrl+S"},
     {CMD_EXIT, "Exit", L"終了(&X)", ""},
     {CMD_SEARCH, "Search", L"検索開始 / 中止(&S)", "F5"},
@@ -52,9 +55,10 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_TAB_DUPES, "TabDuplicates", L"重複を探す(&D)", "Ctrl+1"},
     {CMD_TAB_SEARCH, "TabSearch", L"検索(&S)", "Ctrl+2"},
     {CMD_SAVE_SMART, "SaveSmartFolder", L"条件をスマートフォルダに保存(&M)...", "Ctrl+Shift+S"},
+    {CMD_MANAGE_QUERIES, "ManageQueries", L"保存した条件の管理(&Q)...", ""},
     {CMD_SAVE_SELECTION, "SaveSelectionSmartFolder", L"選んだ画像をスマートフォルダに保存(&P)...", "Ctrl+Shift+M"},
     {CMD_DELETE_SMART, "DeleteSmartFolder", L"スマートフォルダを削除(&L)", ""},
-    {CMD_EXPAND_LINKS, "ExpandLinks", L"検索結果をフォルダに展開(&X)...", "Ctrl+Shift+E"},
+    {CMD_EXPAND_LINKS, "ExpandLinks", L"検索結果からフォルダを作成(&X)...", "Ctrl+Shift+E"},
     {CMD_LINKS, "Links", L"展開したフォルダ(&F)...", ""},
     {CMD_TAG_YES, "TagCorrect", L"正しい（1 つ目のタグを確定）(&Y)", "Ctrl+Y"},
     {CMD_TAG_NO, "TagWrong", L"違う（1 つ目のタグを否定）(&N)", "Ctrl+N"},
