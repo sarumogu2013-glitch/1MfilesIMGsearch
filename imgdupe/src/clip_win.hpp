@@ -55,5 +55,8 @@ LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads = 0, std::fu
 
 // 言葉をベクトルにする（言葉側のモデルを CPU で読む。最初の 1 回は数秒かかる）。入っていなければ nullptr と理由
 std::shared_ptr<imgdupe::ClipModel> loadText(const std::wstring& dataDir, std::wstring& error);
+// 画像のファイル 1 枚の CLIP のベクトル（インデックスに無い画像で「似た画像を探す」）。画像側のモデルを CPU で読む
+// （最初の 1 回は数秒かかる。読んだモデルは覚えておく）。できなければ false と理由
+bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std::vector<float>& out, std::wstring& error);
 
 }  // namespace clip

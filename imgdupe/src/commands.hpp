@@ -56,6 +56,13 @@ enum Cmd : int {
     CMD_SCAN_FOLDER_TOP,  // フォルダを最優先でスキャン
     CMD_SCAN_TASKS,       // スキャンタスクの一覧（タスクトレイの窓）
     CMD_MANAGE_QUERIES,   // 保存した条件の管理
+    CMD_TAB_QUERY,        // 「画像で探す」のリボン
+    CMD_QUERY_PASTE,      // クリップボードの画像を足す
+    CMD_QUERY_OPEN,       // 画像のファイルを足す
+    CMD_QUERY_URL,        // 画像の URL を足す
+    CMD_QUERY_SAME,       // 選んだ画像と同じ画像を探す
+    CMD_QUERY_SIMILAR,    // 選んだ画像に似た画像を探す（AI）
+    CMD_QUERY_TAGS,       // 選んだ画像のタグを生成（AI）
 };
 
 struct CmdInfo {

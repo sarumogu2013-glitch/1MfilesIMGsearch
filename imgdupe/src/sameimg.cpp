@@ -386,4 +386,58 @@ std::vector<std::pair<std::string, std::string>> imageProperties(Db& db, int64_t
     return out;
 }
 
+// ---------------------------------------------------------------- 画像で探す
+
+std::string queryImageName(int64_t addedUnix, int seq, const std::string& ext) {
+    return "q_" + std::to_string(addedUnix) + "_" + std::to_string(seq) + ext;
+}
+
+int64_t queryImageTime(const std::string& name) {
+    if (name.size() < 5 || name.compare(0, 2, "q_") != 0) return 0;
+    int64_t t = 0;
+    size_t i = 2;
+    for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; ++i) t = t * 10 + (name[i] - '0');
+    if (i == 2 || i >= name.size() || name[i] != '_') return 0;
+    return t;
+}
+
+std::vector<std::string> queryImagesToRemove(const std::vector<std::string>& names, int64_t now, size_t maxCount, int64_t maxAge) {
+    std::vector<std::pair<int64_t, std::string>> ours;
+    for (const auto& n : names)
+        if (const int64_t t = queryImageTime(n)) ours.emplace_back(t, n);
+    // 新しい順（同じ秒なら名前の大きい方 = 後から足した方）
+    std::sort(ours.begin(), ours.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second > b.second; });
+    std::vector<std::string> out;
+    for (size_t i = 0; i < ours.size(); ++i)
+        if (i >= maxCount || now - ours[i].first > maxAge) out.push_back(ours[i].second);
+    return out;
+}
+
+std::vector<uint8_t> bmpFromDib(const uint8_t* dib, size_t size) {
+    auto u32 = [&](size_t at) {
+        return static_cast<uint32_t>(dib[at]) | static_cast<uint32_t>(dib[at + 1]) << 8 | static_cast<uint32_t>(dib[at + 2]) << 16 |
+               static_cast<uint32_t>(dib[at + 3]) << 24;
+    };
+    if (!dib || size < 40) return {};
+    const uint32_t headerSize = u32(0);
+    if (headerSize < 40 || headerSize > size) return {};
+    const unsigned bitCount = static_cast<unsigned>(dib[14] | dib[15] << 8);
+    const uint32_t compression = u32(16), clrUsed = u32(32);
+    size_t extra = 0;
+    if (headerSize == 40 && (compression == 3 || compression == 6)) extra = compression == 3 ? 12 : 16;  // BI_BITFIELDS の色のマスク
+    const size_t colors = clrUsed ? clrUsed : bitCount <= 8 ? (size_t(1) << bitCount) : 0;
+    const size_t offBits = 14 + headerSize + extra + colors * 4;
+    if (offBits - 14 > size) return {};
+    std::vector<uint8_t> out(14 + size);
+    const uint32_t fileSize = static_cast<uint32_t>(out.size());
+    out[0] = 'B';
+    out[1] = 'M';
+    for (int k = 0; k < 4; ++k) {
+        out[2 + k] = static_cast<uint8_t>(fileSize >> (8 * k));
+        out[10 + k] = static_cast<uint8_t>(offBits >> (8 * k));
+    }
+    std::copy(dib, dib + size, out.begin() + 14);
+    return out;
+}
+
 }  // namespace imgdupe

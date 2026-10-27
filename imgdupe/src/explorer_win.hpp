@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -79,10 +80,14 @@ class ExplorerHost {
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
   virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
   virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
+  virtual void ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) = 0;  // この画像からタグを外す（手動で「違う」）
   virtual std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) = 0;  // 画像のプロパティ（名前と値）
   virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
   virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
 };
+
+// ファイルか URL（ブラウザーから）のドロップを受け取る IDropTarget（RegisterDragDrop に渡す。参照は 1 で返す）
+IDropTarget* MakeFileDropTarget(std::function<void(const std::vector<std::wstring>& files, const std::wstring& url)> onDrop);
 
 class ExplorerImpl;
 
@@ -96,6 +101,8 @@ class Explorer {
   bool Visible() const;
   void Move(const RECT& r);
   HWND Window() const;
+  HWND ViewBar() const;            // 表示・並び順・大きさ・表紙・パネルの切り替え（ホストのリボンに置く。親はホストの窓）
+  SIZE ViewBarSize() const;
   std::wstring Dir() const;
   std::wstring Selected() const;                    // 今の項目（プレビューに出しているもの）
   std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）

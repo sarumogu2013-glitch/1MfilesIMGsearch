@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <unordered_set>
 
@@ -372,6 +373,43 @@ LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::functi
         threadInit ? threadInit : std::function<void()>(imgwin::threadBegin),
         threadExit ? threadExit : std::function<void()>(imgwin::threadEnd));
     return r;
+}
+
+bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std::vector<float>& out, std::wstring& error) {
+    static std::mutex m;
+    static std::shared_ptr<OnnxClip> model;
+    static std::string modelVersion;
+    std::lock_guard<std::mutex> lock(m);
+    const Files f = findFiles(dataDir);
+    if (!f.ok) {
+        error = L"CLIP（内容で探す部品）が入っていません。「その他 → AI 解析の部品…」で入れられます";
+        return false;
+    }
+    if (!model || modelVersion != f.version) {
+        auto next = std::make_shared<OnnxClip>();
+        if (std::wstring e = next->open(models::modelsDir(dataDir), f, true, false, false, 2); !e.empty()) {
+            error = e;
+            return false;
+        }
+        model = next;
+        modelVersion = f.version;
+    }
+    const int side = model->imageSide();
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    if (!imgwin::decodeBgra(path, side * 2, px, w, h) || w <= 0 || h <= 0) {
+        error = L"画像を読めませんでした";
+        return false;
+    }
+    std::vector<float> input(3 * static_cast<size_t>(side) * side);
+    imgdupe::prepareClipInput(px.data(), w, h, side, input.data());
+    std::string e;
+    if (!model->encodeImage(input, out, e) || out.size() != model->dim()) {
+        error = L"CLIP で画像をベクトルにできませんでした: " + widen(e);
+        return false;
+    }
+    imgdupe::normalizeVector(out);
+    return true;
 }
 
 std::shared_ptr<imgdupe::ClipModel> loadText(const std::wstring& dataDir, std::wstring& error) {

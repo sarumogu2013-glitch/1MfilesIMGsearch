@@ -44,6 +44,7 @@ constexpr wchar_t kHostClass[] = L"imgdupe_explorer";
 constexpr wchar_t kGridClass[] = L"imgdupe_explorer_grid";
 constexpr wchar_t kPreviewClass[] = L"imgdupe_explorer_preview";
 constexpr wchar_t kTrayClass[] = L"imgdupe_explorer_tray";
+constexpr wchar_t kViewBarClass[] = L"imgdupe_explorer_viewbar";
 const wchar_t kListMarker[] = L"\x01list";  // 戻るの履歴で「検索の結果」を表す
 constexpr UINT WM_THUMB_DONE = WM_APP + 41;  // lParam = ThumbResult*
 constexpr UINT_PTR kStateTimer = 1;
@@ -53,7 +54,7 @@ enum {
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
-       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT };
+       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_REMOVE };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
 const int kPresetSizes[3] = {96, 160, 256};
@@ -418,7 +419,8 @@ class ExplorerImpl {
   ExplorerSettings settings;
   HWND hwnd = nullptr, grid = nullptr;
   HWND upBtn = nullptr, pathText = nullptr, sizeBox = nullptr, slider = nullptr, folderBox = nullptr;
-  HWND sizeLabel = nullptr, folderLabel = nullptr;
+  HWND sizeLabel = nullptr, folderLabel = nullptr, viewLabel = nullptr, sortLabel = nullptr;
+  HWND viewBar = nullptr;  // 表示・並び順・大きさ・表紙・パネルの切り替え（ホームのリボンに置く。親はホストの窓）
   HWND backBtn = nullptr, forwardBtn = nullptr, treeBtn = nullptr, previewBtn = nullptr;
   HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
@@ -2511,13 +2513,19 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, (L"コピー（" + shown + L"）(&C)").c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, MENU_TAG_RENAME, L"表示名を変える(&R)...");
+    if (!previewTagsPath.empty()) {  // タグを出している画像
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, MENU_TAG_REMOVE, L"この画像からこのタグを外す(&X)");
+    }
     const std::wstring tag = t.tag;  // 下で previewTags が読み直されることがある
+    const std::wstring path = previewTagsPath;
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
     if (cmd == MENU_TAG_SEARCH) host->ExplorerSearchTags({tag});
     if (cmd == MENU_TAG_TRAY) AddTray(tag);
     if (cmd == MENU_TAG_COPY) CopyText(tag);
     if (cmd == MENU_TAG_RENAME) host->ExplorerRenameTag(tag);
+    if (cmd == MENU_TAG_REMOVE) host->ExplorerRemoveTag(path, tag);
   }
 
   // ---------------------------------------------------------------- 「同じ画像」
@@ -2712,29 +2720,8 @@ class ExplorerImpl {
     x += nav + Px(2);
     MoveWindow(upBtn, x, m, nav, bh, TRUE);
     x += nav + Px(6);
-    int toggleW = Px(84);
-    MoveWindow(treeBtn, x, m, toggleW, bh, TRUE);
-    x += toggleW + Px(6);
-    int right = rc.right - m;
-    MoveWindow(previewBtn, right - toggleW, m, toggleW, bh, TRUE);
-    right -= toggleW + Px(6);
-    // 右から: 表紙・大きさ・並び順・表示
-    int folderW = Px(130), sizeW = Px(60), sliderW = Px(90), sortW = Px(118), dirW = Px(44), viewW = Px(92);
-    int fx = right - folderW;
-    MoveWindow(folderBox, fx, m, folderW, Px(200), TRUE);
-    int sx = fx - Px(4) - sliderW;
-    MoveWindow(slider, sx, m, sliderW, bh, TRUE);
-    int bx = sx - sizeW - Px(2);
-    MoveWindow(sizeBox, bx, m, sizeW, Px(200), TRUE);
-    int dx = bx - Px(8) - dirW;
-    MoveWindow(sortDirBtn, dx, m, dirW, bh, TRUE);
-    int ox = dx - Px(2) - sortW;
-    MoveWindow(sortBox, ox, m, sortW, Px(220), TRUE);
-    int vx = ox - Px(6) - viewW;
-    MoveWindow(viewBox, vx, m, viewW, Px(200), TRUE);
-    ShowWindow(sizeLabel, SW_HIDE);
-    ShowWindow(folderLabel, SW_HIDE);
-    MoveWindow(pathText, x, m + Px(1), std::max(Px(60), int(vx - x - Px(6))), bh - Px(2), TRUE);
+    // 表示・並び順・大きさ・表紙・パネルの切り替えは、ホームのリボン（viewBar）にある
+    MoveWindow(pathText, x, m + Px(1), std::max(Px(60), int(rc.right - m - x)), bh - Px(2), TRUE);
     // 取り置いたタグ
     MoveWindow(trayWnd, 0, h, rc.right, TrayH(), TRUE);
     h += TrayH();
@@ -2778,6 +2765,58 @@ class ExplorerImpl {
     if (settings.showTree && pt.x >= tw && pt.x < tw + SplitW()) return 1;
     if (settings.showPreview && pt.x >= rc.right - pw - SplitW() && pt.x < rc.right - pw) return 2;
     return 0;
+  }
+
+  // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
+  SIZE ViewBarSize() const { return SIZE{Px(400), Px(80)}; }
+  void LayoutViewBar() {
+    const int rowH = Px(24), gap = Px(3), labelW = Px(46);
+    int y = 0, x = 0;
+    auto label = [&](HWND h, int w) {
+      MoveWindow(h, x, y + Px(4), w, rowH - Px(4), TRUE);
+      x += w;
+    };
+    auto put = [&](HWND h, int w, int dropH = 0) {
+      MoveWindow(h, x, y, w, dropH ? dropH : rowH, TRUE);
+      x += w + Px(4);
+    };
+    label(viewLabel, labelW);
+    put(viewBox, Px(100), Px(200));
+    x += Px(8);
+    label(sortLabel, Px(50));
+    put(sortBox, Px(126), Px(220));
+    put(sortDirBtn, Px(48));
+    y += rowH + gap;
+    x = 0;
+    label(sizeLabel, labelW);
+    put(sizeBox, Px(64), Px(200));
+    put(slider, Px(90));
+    x += Px(4);
+    label(folderLabel, Px(40));
+    put(folderBox, Px(140), Px(200));
+    y += rowH + gap;
+    x = labelW;
+    put(treeBtn, Px(96));
+    put(previewBtn, Px(96));
+  }
+
+  // viewBar: 部品の通知を、エクスプローラーの窓（HostProc）に回す
+  static LRESULT CALLBACK ViewBarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE)
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+    auto* self = reinterpret_cast<ExplorerImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (self && self->hwnd)
+      switch (msg) {
+        case WM_COMMAND:
+        case WM_HSCROLL:
+        case WM_NOTIFY:
+        case WM_CTLCOLORSTATIC:
+          return SendMessageW(self->hwnd, msg, wp, lp);
+        case WM_SIZE:
+          self->LayoutViewBar();
+          return 0;
+      }
+    return DefWindowProcW(hwnd, msg, wp, lp);
   }
 
   void TogglePanel(bool treePanel) {
@@ -3418,6 +3457,13 @@ class ExplorerImpl {
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     pc.lpszClassName = kPreviewClass;
     RegisterClassExW(&pc);
+    WNDCLASSEXW vc = {sizeof(vc)};
+    vc.lpfnWndProc = ViewBarProc;
+    vc.hInstance = inst;
+    vc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    vc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+    vc.lpszClassName = kViewBarClass;
+    RegisterClassExW(&vc);
     WNDCLASSEXW tc = {sizeof(tc)};
     tc.lpfnWndProc = TrayProc;
     tc.hInstance = inst;
@@ -3436,11 +3482,20 @@ class ExplorerImpl {
       SendMessageW(c, WM_SETFONT, WPARAM(font), TRUE);
       return c;
     };
+    // 表示の設定の部品はホームのリボンに置く: 親はホストの窓の子の入れ物。入れ物は通知をこの窓へ回す
+    viewBar = CreateWindowExW(WS_EX_CONTROLPARENT, kViewBarClass, nullptr, WS_CHILD | WS_CLIPCHILDREN, 0, 0, 10, 10, parent, nullptr,
+                              inst, this);
+    auto makeView = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
+      HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | style, 0, 0, 10, 10, viewBar, HMENU(INT_PTR(id)), inst,
+                               nullptr);
+      SendMessageW(c, WM_SETFONT, WPARAM(font), TRUE);
+      return c;
+    };
     backBtn = make(L"BUTTON", L"←", BS_PUSHBUTTON, ID_BACK);
     forwardBtn = make(L"BUTTON", L"→", BS_PUSHBUTTON, ID_FORWARD);
     upBtn = make(L"BUTTON", L"↑", BS_PUSHBUTTON, ID_UP);
-    treeBtn = make(L"BUTTON", L"フォルダ一覧", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_TREE_BTN);
-    previewBtn = make(L"BUTTON", L"プレビュー", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PREVIEW_BTN);
+    treeBtn = makeView(L"BUTTON", L"フォルダ一覧", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_TREE_BTN);
+    previewBtn = makeView(L"BUTTON", L"プレビュー", BS_AUTOCHECKBOX | BS_PUSHLIKE, ID_PREVIEW_BTN);
     SendMessageW(treeBtn, BM_SETCHECK, settings.showTree ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(previewBtn, BM_SETCHECK, settings.showPreview ? BST_CHECKED : BST_UNCHECKED, 0);
     pathText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
@@ -3449,22 +3504,24 @@ class ExplorerImpl {
     SendMessageW(pathText, EM_SETCUEBANNER, TRUE, LPARAM(L"フォルダ、または画像の URL（同じ画像を探す）"));
     SHAutoComplete(pathText, SHACF_FILESYS_DIRS);  // フォルダの名前を補う
     SetWindowSubclass(pathText, ChildKeyProc, 1, DWORD_PTR(this));
-    sizeLabel = make(L"STATIC", L"大きさ", SS_RIGHT, ID_SIZE_LABEL);
-    sizeBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SIZE);
+    sizeLabel = makeView(L"STATIC", L"大きさ", SS_LEFT, ID_SIZE_LABEL);
+    sizeBox = makeView(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SIZE);
     for (const wchar_t* t : {L"小", L"普通", L"大", L"可変"}) SendMessageW(sizeBox, CB_ADDSTRING, 0, LPARAM(t));
-    slider = make(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, ID_SLIDER);
+    slider = makeView(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, ID_SLIDER);
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(kMinSize, kMaxSize));
     SendMessageW(slider, TBM_SETPAGESIZE, 0, 32);
-    folderLabel = make(L"STATIC", L"表紙", SS_RIGHT, ID_FOLDER_LABEL);
-    viewBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_VIEW);
+    folderLabel = makeView(L"STATIC", L"表紙", SS_LEFT, ID_FOLDER_LABEL);
+    viewLabel = makeView(L"STATIC", L"表示", SS_LEFT, ID_FOLDER_LABEL);
+    sortLabel = makeView(L"STATIC", L"並び順", SS_LEFT, ID_FOLDER_LABEL);
+    viewBox = makeView(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_VIEW);
     for (const wchar_t* t : {L"サムネイル", L"詳細"}) SendMessageW(viewBox, CB_ADDSTRING, 0, LPARAM(t));
     settings.viewMode = std::max(0, std::min(1, settings.viewMode));
     SendMessageW(viewBox, CB_SETCURSEL, settings.viewMode, 0);
-    sortBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SORT);
+    sortBox = makeView(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_SORT);
     for (const wchar_t* t : {L"名前順", L"更新日時順", L"種類順", L"サイズ順", L"検索結果の順"}) SendMessageW(sortBox, CB_ADDSTRING, 0, LPARAM(t));
     settings.sortKey = std::max(0, std::min(3, settings.sortKey));
-    sortDirBtn = make(L"BUTTON", L"昇順", BS_PUSHBUTTON, ID_SORT_DIR);
-    folderBox = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_FOLDER);
+    sortDirBtn = makeView(L"BUTTON", L"昇順", BS_PUSHBUTTON, ID_SORT_DIR);
+    folderBox = makeView(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_FOLDER);
     for (const wchar_t* t : {L"1 枚目", L"1・2 枚目", L"最後と 1 枚目", L"最後", L"最後の一つ前と最後"})
       SendMessageW(folderBox, CB_ADDSTRING, 0, LPARAM(t));
     settings.folderStyle = std::max(0, std::min(4, settings.folderStyle));
@@ -3545,6 +3602,10 @@ Explorer::~Explorer() {
   if (impl_->drop) impl_->drop->Release();
 }
 
+IDropTarget* MakeFileDropTarget(std::function<void(const std::vector<std::wstring>&, const std::wstring&)> onDrop) {
+  return new DropTarget(std::move(onDrop));
+}
+
 bool Explorer::Create(HWND parent, ExplorerHost* host, const ExplorerSettings& settings) {
   return impl_->Create(parent, host, settings);
 }
@@ -3574,6 +3635,8 @@ void Explorer::Move(const RECT& r) {
 }
 
 HWND Explorer::Window() const { return impl_->hwnd; }
+HWND Explorer::ViewBar() const { return impl_->viewBar; }
+SIZE Explorer::ViewBarSize() const { return impl_->ViewBarSize(); }
 
 std::wstring Explorer::Dir() const { return impl_->dir; }
 

@@ -88,4 +88,16 @@ int64_t findImageId(Db& db, const std::string& path, const std::vector<std::stri
 // フォルダの下（いくつ下でも）の画像が DB にあるか（roots から外したフォルダや --index で作ったもの）
 bool folderHasIndexed(Db& db, const std::string& dir);
 
+// ---------------------------------------------------------------- 画像で探す（クリップボード・ドロップ・URL の画像）
+
+// 一時に置く画像の名前: q_<追加した Unix 秒>_<番号><拡張子>
+std::string queryImageName(int64_t addedUnix, int seq, const std::string& ext);
+int64_t queryImageTime(const std::string& name);  // この形の名前でなければ 0
+// 消す名前: maxAge 秒より古いもの、新しい順に maxCount 個を超えるもの（「10 枚まで、か 1 日分の少ない方」）。
+// この形でない名前は触らない
+std::vector<std::string> queryImagesToRemove(const std::vector<std::string>& names, int64_t now, size_t maxCount = 10,
+                                             int64_t maxAge = 24 * 60 * 60);
+// クリップボードの DIB（CF_DIB: BITMAPINFOHEADER から始まる）を BMP のファイルの中身にする。読めなければ空
+std::vector<uint8_t> bmpFromDib(const uint8_t* dib, size_t size);
+
 }  // namespace imgdupe

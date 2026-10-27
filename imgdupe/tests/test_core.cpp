@@ -2650,6 +2650,15 @@ static void testFreeSearch() {
     q.sort = SortKey::FileName;
     r = search(db, q).ids;
     CHECK(r.size() == 5 && r[0] == I("C:\\p\\a.jpg") && r[3] == I("C:\\p\\d.jpg") && r[4] == I("C:\\p\\miku_live.jpg"));
+    // ファイルのタグに限る（出どころ embedded のタグだけ）
+    replaceTags(db, I("C:\\p\\b.jpg"), "embedded", {TagRow{"stage", "general", "embedded", 1.0, false}});
+    {
+        SearchQuery f;
+        f.tags = {"stage"};
+        CHECK(search(db, f).ids.size() == 2);  // a（タガー）と b（ファイル）
+        f.sources = {"embedded"};
+        CHECK(search(db, f).ids == std::vector<int64_t>({I("C:\\p\\b.jpg")}));
+    }
     SearchQuery q2;
     q.freeText = "x";
     q.freeScope = FreeScope::Title;
@@ -2729,6 +2738,34 @@ static void testTagNames() {
     CHECK(builtin.size() > 10000 && tags.size() == builtin.size() && jas.size() == builtin.size());
 }
 
+static void testQueryStore() {
+    CHECK(queryImageName(1700000000, 3, ".bmp") == "q_1700000000_3.bmp");
+    CHECK(queryImageTime("q_1700000000_3.bmp") == 1700000000 && queryImageTime("x.bmp") == 0 && queryImageTime("q_abc_1.png") == 0);
+    const int64_t now = 1700100000;
+    std::vector<std::string> names = {"keep.txt"};
+    for (int i = 0; i < 12; ++i) names.push_back(queryImageName(now - 100 * i, 0, ".png"));  // 新しい順に 12 枚
+    names.push_back(queryImageName(now - 2 * 86400, 0, ".png"));                         // 2 日前
+    auto gone = queryImagesToRemove(names, now);
+    std::sort(gone.begin(), gone.end());
+    std::vector<std::string> want = {queryImageName(now - 1000, 0, ".png"), queryImageName(now - 1100, 0, ".png"),
+                                     queryImageName(now - 2 * 86400, 0, ".png")};
+    std::sort(want.begin(), want.end());
+    CHECK(gone == want);  // 11・12 枚目と 1 日より古いもの。ほかの名前は触らない
+    // DIB → BMP: 2×1 の 24bit（行は 4 バイトずつ）
+    std::vector<uint8_t> dib(40 + 8, 0);
+    dib[0] = 40;
+    dib[4] = 2;
+    dib[8] = 1;
+    dib[12] = 1;
+    dib[14] = 24;
+    const auto bmp = bmpFromDib(dib.data(), dib.size());
+    CHECK(bmp.size() == 14 + 48 && bmp[0] == 'B' && bmp[1] == 'M' && bmp[10] == 54 && bmp[2] == 62);
+    dib[16] = 3;  // BI_BITFIELDS: 色のマスク 12 バイトの後ろ
+    dib.resize(40 + 12 + 8);
+    CHECK(bmpFromDib(dib.data(), dib.size())[10] == 66);
+    CHECK(bmpFromDib(dib.data(), 10).empty());
+}
+
 static void testClusterResults() {
     const fs::path dir = fs::temp_directory_path() / "imgdupe-cluster-test";
     fs::remove_all(dir);
@@ -2802,6 +2839,7 @@ int main() {
     testResolveRedirect();
     testSameImage();
     testFreeSearch();
+    testQueryStore();
     testTagNames();
     testClusterResults();
     testExifOrientation();
