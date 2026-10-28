@@ -722,6 +722,29 @@ static void testIndexer() {
 }
 
 static void testScanTasks() {
+    // 調べるフォルダの書き方にそろえる（同じ画像を別のパスで二重に登録しない）
+    CHECK(spellLikeRoot("d:\\Pics\\a\\b.jpg", {"D:\\pics"}) == "D:\\pics\\a\\b.jpg");
+    CHECK(spellLikeRoot("D:/pics/a", {"D:\\pics"}) == "D:\\pics\\a");
+    CHECK(spellLikeRoot("D:\\pics", {"D:\\pics"}) == "D:\\pics");
+    CHECK(spellLikeRoot("D:\\picsX\\a", {"D:\\pics"}) == "D:\\picsX\\a");
+    CHECK(spellLikeRoot("E:\\x", {"D:\\pics"}) == "E:\\x");
+    CHECK(spellLikeRoot("d:\\x", {"D:\\"}) == "D:\\x");
+    {
+        const fs::path dbp = fs::temp_directory_path() / "imgdupe-misspell.db";
+        fs::remove(dbp);
+        Db d;
+        CHECK(d.open(dbp.string()));
+        auto ids = upsertScanned(d, {{"D:\\pics\\a.jpg", 1, 1}, {"d:\\Pics\\a.jpg", 1, 1}, {"d:\\Pics\\only.jpg", 1, 1},
+                                     {"E:\\b.jpg", 1, 1}});
+        setManualTag(d, ids["d:\\Pics\\a.jpg"], "miku", true);
+        CHECK(removeMisspelled(d, {"D:\\pics"}) == 1);  // 正しい書き方の同じ画像があるものだけ
+        CHECK(imageCount(d) == 3);
+        bool moved = false;
+        for (const auto& t : tagsOf(d, ids["D:\\pics\\a.jpg"])) moved |= t.tag == "miku" && t.manual;
+        CHECK(moved);
+        d.close();
+        fs::remove(dbp);
+    }
     const fs::path root = fs::temp_directory_path() / "imgdupe-task-test";
     fs::remove_all(root);
     const fs::path pics = root / "pics", extra = root / "extra";

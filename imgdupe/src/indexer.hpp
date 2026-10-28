@@ -116,6 +116,12 @@ private:
     ThumbPack& pack_;
 };
 
+// path が roots のどれかの中なら、その root の書き方（大文字・小文字、/ と \）にそろえる。どれの中でもなければそのまま
+std::string spellLikeRoot(const std::string& path, const std::vector<std::string>& roots);
+// 調べるフォルダの中なのに書き方が違うパスの画像のうち、正しい書き方の同じ画像が DB にあるもの（二重の登録）を消す。
+// 手動で確定したタグは正しい方へ移す。消した数を返す
+size_t removeMisspelled(Db& db, const std::vector<std::string>& roots);
+
 // 1 回分: スキャンタスクを上から 1 つずつ（その中の画像だけ、全部の段階）→ フォルダ全体:
 // 走査 → 登録（消えたものは消す）→ ハッシュ → サムネイル → メタデータ → …
 IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexProgress& progress,

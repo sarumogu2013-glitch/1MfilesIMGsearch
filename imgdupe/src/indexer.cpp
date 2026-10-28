@@ -296,6 +296,68 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
 
 }  // namespace
 
+std::string spellLikeRoot(const std::string& path, const std::vector<std::string>& roots) {
+    auto norm = [](char c) { return c == '/' ? '\\' : (c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c); };
+    for (const auto& r : roots) {
+        if (r.empty() || path.size() < r.size()) continue;
+        bool same = true;
+        for (size_t i = 0; i < r.size() && same; ++i) same = norm(path[i]) == norm(r[i]);
+        if (!same) continue;
+        // 区切りの所で切れているか（D:\a と D:\ab を取り違えない）
+        const char last = r.back();
+        if (path.size() > r.size() && last != '/' && last != '\\' && path[r.size()] != '/' && path[r.size()] != '\\') continue;
+        std::string out = r + path.substr(r.size());
+        // 後ろの区切りも、調べるフォルダの書き方（\ か /）にそろえる
+        const char sep = r.find('/') != std::string::npos && r.find('\\') == std::string::npos ? '/' : '\\';
+        for (size_t i = r.size(); i < out.size(); ++i)
+            if (out[i] == '/' || out[i] == '\\') out[i] = sep;
+        return out;
+    }
+    return path;
+}
+
+size_t removeMisspelled(Db& db, const std::vector<std::string>& roots) {
+    std::vector<std::pair<int64_t, int64_t>> dup;  // (書き方の違う画像, 正しい書き方の画像)
+    {
+        // 書き方の違うものだけ覚え（ふつうは無い）、正しい書き方は索引で引く（全部のパスを覚えるとメモリを食う）
+        std::vector<std::pair<int64_t, std::string>> odd;
+        Stmt st(db.handle(), "SELECT id, path FROM images");
+        while (st.step()) {
+            const std::string p = st.text(1);
+            std::string right = spellLikeRoot(p, roots);
+            if (right != p) odd.emplace_back(st.i64(0), std::move(right));
+        }
+        Stmt find(db.handle(), "SELECT id FROM images WHERE path=?");
+        for (const auto& [id, right] : odd) {
+            find.bind(1, right);
+            if (find.step() && find.i64(0) != id) dup.emplace_back(id, find.i64(0));
+            find.reset();
+        }
+    }
+    if (dup.empty()) return 0;
+    db.begin();
+    try {
+        // 手動で確定したタグは、正しい書き方の方へ移す（向こうに同じタグの確定があればそちらを残す）
+        Stmt move(db.handle(),
+                  "INSERT OR IGNORE INTO tags(image_id,tag,kind,confidence,source,manual) "
+                  "SELECT ?,tag,kind,confidence,source,manual FROM tags WHERE image_id=? AND manual=1");
+        Stmt del(db.handle(), "DELETE FROM images WHERE id=?");
+        for (const auto& [from, to] : dup) {
+            move.bind(1, to).bind(2, from);
+            move.step();
+            move.reset();
+            del.bind(1, from);
+            del.step();
+            del.reset();
+        }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+    return dup.size();
+}
+
 IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexProgress& progress,
                       const std::atomic<bool>& cancel) {
     IndexReport rep;
@@ -317,10 +379,14 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             // 一番上のスキャンタスク: そのフォルダ・ファイルだけを調べ、全部の段階を済ませる
             const ScanTask& t = tasks.front();
             progress.task = t.id;
+            // 調べるフォルダの中のパスは、調べるフォルダと同じ書き方にする（DB のパスは大文字・小文字や / と \ を区別するので、
+            // 書き方が違うと同じ画像を別の画像としてもう一度登録してしまう）
+            std::vector<std::string> paths;
+            for (const auto& p : t.paths) paths.push_back(spellLikeRoot(p, opt.roots));
             std::vector<std::string> folders;  // 画像の拡張子でないものはフォルダ（中で消えた画像は消す）
-            for (const auto& p : t.paths)
+            for (const auto& p : paths)
                 if (!isImageExt(p)) folders.push_back(p);
-            const std::vector<int64_t> ids = scanAndRegister(db, s, t.paths, folders);
+            const std::vector<int64_t> ids = scanAndRegister(db, s, paths, folders);
             if (cancel) return stop();
             const Outcome o = runStages(db, s, &ids);
             if (o == Outcome::Cancelled) return stop();
@@ -341,6 +407,8 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
         if (!scanned) {
             scanAndRegister(db, s, opt.roots, opt.roots);
             if (cancel) return stop();
+            // 前の版のスキャンタスクで、書き方の違うパスで二重に登録した画像を消す
+            rep.removed += removeMisspelled(db, opt.roots);
             scanned = true;
         }
         const Outcome o = runStages(db, s, nullptr);

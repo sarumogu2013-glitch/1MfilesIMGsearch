@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -115,6 +116,11 @@ struct Resident {
     int taskDragFrom = -1, taskDropAt = -1;           // ドラッグで並べ替え中（行の番号・入れる所）
     POINT taskDragPt{};
     bool taskMenuOpen = false;                        // 行のメニューを出している間は閉じない
+    // 速さ（CPU の側・GPU の側。窓を描くたびに数を覚えて、最近 1 分の増え方から出す）
+    struct Rate {
+        int phase = -1;
+        std::deque<std::pair<ULONGLONG, uint64_t>> samples;
+    } rates[2];
 };
 
 Resident* g = nullptr;
@@ -522,6 +528,30 @@ void countOverall() {
     }).detach();
 }
 
+// 「約 120 枚/秒・残り 約 3 時間 20 分」（まだ測れていなければ空）
+std::wstring rateText(int lane, int phase, uint64_t done, uint64_t total) {
+    Resident::Rate& r = g->rates[lane];
+    const ULONGLONG now = GetTickCount64();
+    if (r.phase != phase || (!r.samples.empty() && done < r.samples.back().second)) r.samples.clear();
+    r.phase = phase;
+    if (r.samples.empty() || now - r.samples.back().first >= 900) r.samples.emplace_back(now, done);
+    while (r.samples.size() > 2 && now - r.samples.front().first > 60 * 1000) r.samples.pop_front();
+    if (r.samples.size() < 3) return L"";
+    const double sec = double(r.samples.back().first - r.samples.front().first) / 1000.0;
+    const double perSec = sec > 0 ? double(r.samples.back().second - r.samples.front().second) / sec : 0;
+    wchar_t t[96];
+    if (perSec < 0.05) return L"速さを測っています…";
+    const double left = total > done ? double(total - done) / perSec : 0;
+    const long long mins = static_cast<long long>(left / 60 + 0.5);
+    if (perSec >= 10) swprintf(t, 96, L"約 %.0f 枚/秒", perSec);
+    else swprintf(t, 96, L"約 %.1f 枚/秒", perSec);
+    std::wstring out = t;
+    if (mins >= 60 * 24) swprintf(t, 96, L"・残り 約 %lld 日 %lld 時間", mins / (60 * 24), mins / 60 % 24);
+    else if (mins >= 60) swprintf(t, 96, L"・残り 約 %lld 時間 %lld 分", mins / 60, mins % 60);
+    else swprintf(t, 96, L"・残り 約 %lld 分", std::max(1LL, mins));
+    return out + t;
+}
+
 void fillRect(HDC dc, RECT r, COLORREF c) {
     HBRUSH b = CreateSolidBrush(c);
     FillRect(dc, &r, b);
@@ -711,7 +741,7 @@ void paintPopup(HDC dc, const RECT& rc) {
             if (task == 0) text(L"対象: フォルダ全体の確認", RGB(90, 90, 90));
             else if (const ScanTask* t = task > 0 ? findTask(task) : nullptr) text(L"対象: スキャンタスク「" + widen(t->label) + L"」", RGB(90, 90, 90));
             // CPU の側と GPU の側（同時に進める）。それぞれ段階の名前と進み具合の棒
-            auto lane = [&](const wchar_t* side, IndexPhase p, const Progress& pr) {
+            auto lane = [&](const wchar_t* side, IndexPhase p, const Progress& pr, int laneNo) {
                 if (p == IndexPhase::Idle || p == IndexPhase::Done) return;
                 SelectObject(dc, bold);
                 std::wstring now = std::wstring(side) + phaseName(p);
@@ -725,15 +755,16 @@ void paintPopup(HDC dc, const RECT& rc) {
                     wchar_t t[96];
                     swprintf(t, 96, L"%llu / %llu 枚（%.0f%%）", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total),
                              100.0 * double(done) / double(total));
-                    text(t, RGB(60, 60, 60));
+                    const std::wstring rate = rateText(laneNo, static_cast<int>(p), done, total);
+                    text(rate.empty() ? std::wstring(t) : std::wstring(t) + L"　" + rate, RGB(60, 60, 60));
                 } else if (p == IndexPhase::Scan) {
                     text(std::to_wstring(total) + L" 枚見つけました", RGB(60, 60, 60));
                 }
             };
             const bool both = gpuPhase != IndexPhase::Idle;
             if (both && phase == IndexPhase::Idle) text(L"CPU: 済み（GPU の側を待っています）", RGB(90, 90, 90));
-            lane(both ? L"CPU: " : L"", phase, g->prog.prog);
-            lane(L"GPU: ", gpuPhase, g->prog.gpuProg);
+            lane(both ? L"CPU: " : L"", phase, g->prog.prog, 0);
+            lane(L"GPU: ", gpuPhase, g->prog.gpuProg, 1);
             // 段階の並び（済んだもの・今・まだ）
             y += popupPx(4);
             const unsigned mask = g->prog.doneMask;
