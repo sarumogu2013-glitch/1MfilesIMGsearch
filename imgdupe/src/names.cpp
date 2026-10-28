@@ -124,6 +124,7 @@ struct NamesPayload {
     bool haveSidecar = false;
     SidecarInfo sidecar;
     std::vector<TagRow> folder;
+    std::string bookDir;  // 本の形のフォルダの直下の画像なら、そのフォルダ（ページの役目は store で同じフォルダの画像から決める）
 };
 
 }  // namespace
@@ -189,28 +190,201 @@ std::string findSidecar(const std::string& imagePath) {
     return {};
 }
 
+namespace {
+
+// 全角のかっこを半角に（【】［］→ []、（）→ ()）
+std::string asciiBrackets(std::string s) {
+    const std::pair<const char*, const char*> table[] = {{"【", "["}, {"】", "]"}, {"［", "["}, {"］", "]"}, {"（", "("}, {"）", ")"}};
+    for (const auto& [from, to] : table) {
+        const std::string f = from;
+        for (size_t p = 0; (p = s.find(f, p)) != std::string::npos;) {
+            s.replace(p, f.size(), to);
+            p += 1;
+        }
+    }
+    return s;
+}
+
+// s[open] のかっこに合う閉じかっこの位置（入れ子も数える）。無ければ npos
+size_t matchClose(const std::string& s, size_t open) {
+    const char o = s[open], c = o == '(' ? ')' : ']';
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i) {
+        if (s[i] == o) ++depth;
+        else if (s[i] == c && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// s[close] の閉じかっこに合う開きかっこの位置
+size_t matchOpen(const std::string& s, size_t close) {
+    const char c = s[close], o = c == ')' ? '(' : '[';
+    int depth = 0;
+    for (size_t i = close + 1; i-- > 0;) {
+        if (s[i] == c) ++depth;
+        else if (s[i] == o && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// 作者の並び（、 , ， & ＆ / ／ で区切る）
+std::vector<std::string> splitAuthors(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur = s;
+    for (const char* sep : {"、", "，", "＆", "／"})
+        for (size_t p = 0; (p = cur.find(sep, p)) != std::string::npos;) cur.replace(p, std::string(sep).size(), ",");
+    for (char& c : cur)
+        if (c == '&' || c == '/') c = ',';
+    size_t a = 0;
+    while (a <= cur.size()) {
+        size_t b = cur.find(',', a);
+        if (b == std::string::npos) b = cur.size();
+        const std::string t = trim(cur.substr(a, b - a), false);
+        if (!t.empty()) out.push_back(t);
+        a = b + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool looksLikeEvent(const std::string& text) {
+    const std::string t = lowerAscii(trim(text, false));
+    if (t.empty()) return false;
+    // C102・c97（コミックマーケット）
+    if (t[0] == 'c' && t.size() >= 2 && std::isdigit(static_cast<unsigned char>(t[1]))) return true;
+    for (const char* w : {"コミケ", "コミックマーケット", "comic market", "comiket", "例大祭", "コミティア", "comitia", "comic1", "サンクリ",
+                          "サンシャインクリエイション", "紅楼夢", "こみトレ", "こみっくトレジャー", "comic treasure", "歌姫庭園", "スパコミ",
+                          "super comic city", "haru comic city", "comic city", "コミックシティ", "超同人祭", "ボーマス", "ふたけっと",
+                          "みみけっと", "コミトレ", "夏コミ", "冬コミ", "エアコミケ", "即売会", "オンリー", "only", "イベント", "m3-",
+                          "ゲームレジェンド", "僕らのラブライブ", "cotton", "gcc", "good comic city", "ガタケット", "コミッククリエイション",
+                          "コミコミ", "サンシャイン", "ゲムマ", "ゲームマーケット", "砲雷撃戦", "我、夜戦に突入す", "神戸かわさき"})
+        if (t.find(w) != std::string::npos) return true;
+    // 年の数字（2023、2023冬 など）
+    for (size_t i = 0; i + 4 <= t.size(); ++i) {
+        bool four = true;
+        for (size_t k = 0; k < 4; ++k) four = four && std::isdigit(static_cast<unsigned char>(t[i + k]));
+        if (four && (t[i] == '1' || t[i] == '2') && (i + 4 == t.size() || !std::isdigit(static_cast<unsigned char>(t[i + 4])))) return true;
+    }
+    return false;
+}
+
+bool parseDoujinName(const std::string& raw, DoujinName& out) {
+    out = DoujinName{};
+    std::string s = trim(asciiBrackets(raw), false);
+    // 先頭の (イベント)（何個でも）
+    while (!s.empty() && s[0] == '(') {
+        const size_t e = matchClose(s, 0);
+        if (e == std::string::npos) return false;
+        const std::string inner = trim(s.substr(1, e - 1), false);
+        if (!inner.empty()) (looksLikeEvent(inner) ? out.events : out.parodies).push_back(inner);
+        s = trim(s.substr(e + 1), false);
+    }
+    // [サークル(作者)] か [作者]
+    if (s.empty() || s[0] != '[') return false;
+    const size_t close = matchClose(s, 0);
+    if (close == std::string::npos) return false;
+    std::string head = trim(s.substr(1, close - 1), false);
+    std::string rest = trim(s.substr(close + 1), false);
+    if (head.empty()) return false;
+    if (head.back() == ')') {
+        const size_t o = matchOpen(head, head.size() - 1);
+        if (o != std::string::npos && o > 0) {
+            out.circle = trim(head.substr(0, o), false);
+            out.authors = splitAuthors(head.substr(o + 1, head.size() - o - 2));
+        } else {
+            out.authors = splitAuthors(head);
+        }
+    } else {
+        out.authors = splitAuthors(head);
+    }
+    // 後ろの (イベント・原作) と [DL版] など（何個でも）
+    std::vector<std::string> tail;
+    while (!rest.empty() && (rest.back() == ')' || rest.back() == ']')) {
+        const size_t o = matchOpen(rest, rest.size() - 1);
+        if (o == std::string::npos) break;
+        if (rest.back() == ')') tail.push_back(trim(rest.substr(o + 1, rest.size() - o - 2), false));
+        rest = trim(rest.substr(0, o), false);
+    }
+    for (auto it = tail.rbegin(); it != tail.rend(); ++it)
+        if (!it->empty()) (looksLikeEvent(*it) ? out.events : out.parodies).push_back(*it);
+    out.title = rest;
+    return !out.authors.empty() || !out.circle.empty();
+}
+
+int naturalCompare(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const unsigned char ca = static_cast<unsigned char>(a[i]), cb = static_cast<unsigned char>(b[j]);
+        if (std::isdigit(ca) && std::isdigit(cb)) {
+            // 続いた数字: 頭の 0 を除いて、桁の数、それから並びで比べる
+            size_t ea = i, eb = j;
+            while (ea < a.size() && std::isdigit(static_cast<unsigned char>(a[ea]))) ++ea;
+            while (eb < b.size() && std::isdigit(static_cast<unsigned char>(b[eb]))) ++eb;
+            size_t sa = i, sb = j;
+            while (sa + 1 < ea && a[sa] == '0') ++sa;
+            while (sb + 1 < eb && b[sb] == '0') ++sb;
+            if (ea - sa != eb - sb) return ea - sa < eb - sb ? -1 : 1;
+            const int c = a.compare(sa, ea - sa, b, sb, eb - sb);
+            if (c) return c < 0 ? -1 : 1;
+            i = ea;
+            j = eb;
+            continue;
+        }
+        const int la = std::tolower(ca), lb = std::tolower(cb);
+        if (la != lb) return la < lb ? -1 : 1;
+        ++i;
+        ++j;
+    }
+    if (i < a.size()) return 1;
+    if (j < b.size()) return -1;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+std::string pageRole(const std::string& name, const std::vector<std::string>& siblings) {
+    if (std::find(siblings.begin(), siblings.end(), name) == siblings.end()) return {};
+    const std::string* first = nullptr;
+    const std::string* last = nullptr;
+    for (const auto& n : siblings) {
+        if (!first || naturalCompare(n, *first) < 0) first = &n;
+        if (!last || naturalCompare(n, *last) > 0) last = &n;
+    }
+    if (name == *first) return "表紙";
+    if (name == *last) return "背表紙";
+    return "本文";
+}
+
 std::vector<TagRow> folderTags(const std::string& imagePath) {
     std::vector<TagRow> out;
-    std::string name = trim(parentName(imagePath), true);
-    if (name.empty() || name[0] == '.' || name.size() > 120 || isStopName(name)) return out;
-    auto add = [&](const std::string& t, const char* kind) {
+    auto add = [&](const std::string& t, const char* kind, double confidence) {
         const std::string s = trim(t, true);
         if (s.empty() || isStopName(s)) return;
         for (const auto& o : out)
-            if (lowerAscii(o.tag) == lowerAscii(s)) return;
-        out.push_back({s, kind, kSourceFolder, kFolderTagConfidence, false});
+            if (lowerAscii(o.tag) == lowerAscii(s) && o.kind == kind) return;
+        out.push_back({s, kind, kSourceFolder, confidence, false});
     };
-    // "[作者] 作品名"、"【作者】作品名"（同人誌などでよくある形）
-    auto bracket = [&](const std::string& open, const std::string& close) {
-        if (name.compare(0, open.size(), open) != 0) return false;
-        const size_t e = name.find(close, open.size());
-        if (e == std::string::npos) return false;
-        add(name.substr(open.size(), e - open.size()), "artist");
-        add(name.substr(e + close.size()), "general");
-        return true;
-    };
-    if (bracket("[", "]") || bracket("【", "】")) return out;
-    add(name, "general");
+    // 画像のあるフォルダから上へ（4 段まで）たどり、最初に見つかった "[サークル(作者)]タイトル(イベント)" の形のフォルダを使う
+    std::string dir = imagePath;
+    for (int level = 0; level < 4; ++level) {
+        const std::string name = trim(parentName(dir), true);
+        if (name.empty()) break;
+        DoujinName d;
+        if (name[0] != '.' && name.size() <= 240 && parseDoujinName(name, d)) {
+            add(d.circle, "circle", kDoujinTagConfidence);
+            for (const auto& a : d.authors) add(a, "artist", kDoujinTagConfidence);
+            add(d.title, "title", kDoujinTagConfidence);
+            for (const auto& e : d.events) add(e, "event", kDoujinTagConfidence);
+            for (const auto& p : d.parodies) add(p, "copyright", kDoujinTagConfidence);
+            if (level == 0) return out;
+            break;
+        }
+        const size_t sep = dir.find_last_of("\\/");
+        if (sep == std::string::npos) break;
+        dir = dir.substr(0, sep);
+    }
+    // 画像のあるフォルダの名前そのもの（よくある名前・日付・数字だけのものは使わない）
+    const std::string name = trim(parentName(imagePath), true);
+    if (!name.empty() && name[0] != '.' && name.size() <= 120 && !isStopName(name)) add(name, "general", kFolderTagConfidence);
     return out;
 }
 
@@ -231,6 +405,11 @@ AnalyzerOutput NamesAnalyzer::analyze(const AnalyzerInput& in) {
         }
     }
     p->folder = folderTags(in.path);
+    {
+        DoujinName d;
+        const size_t sep = in.path.find_last_of("\\/");
+        if (sep != std::string::npos && parseDoujinName(trim(parentName(in.path), true), d)) p->bookDir = in.path.substr(0, sep + 1);
+    }
     out.payload = p;
     return out;
 }
@@ -239,6 +418,21 @@ bool NamesAnalyzer::store(Db& db, int64_t imageId, AnalyzerOutput& out) {
     auto p = std::static_pointer_cast<NamesPayload>(out.payload);
     if (!p) return false;
     replaceTags(db, imageId, kSourceMeta, p->haveSidecar ? p->sidecar.tags : std::vector<TagRow>{});
+    if (!p->bookDir.empty()) {
+        // 本のページの役目: 同じフォルダの直下の画像（DB にあるもの。走査で先に登録してある）の名前順で決める
+        std::vector<std::string> names;
+        std::string self;
+        Stmt st(db.handle(), "SELECT id, path FROM images WHERE path > ? AND path < ?");
+        st.bind(1, p->bookDir).bind(2, p->bookDir + "\xff");
+        while (st.step()) {
+            const std::string rest = st.text(1).substr(p->bookDir.size());
+            if (rest.find_first_of("\\/") != std::string::npos) continue;  // 中のフォルダ
+            if (st.i64(0) == imageId) self = rest;
+            names.push_back(rest);
+        }
+        const std::string role = pageRole(self, names);
+        if (!role.empty()) p->folder.push_back({role, "page", kSourceFolder, kDoujinTagConfidence, false});
+    }
     replaceTags(db, imageId, kSourceFolder, p->folder);
     if (!p->haveSidecar) return true;
     const SidecarInfo& s = p->sidecar;

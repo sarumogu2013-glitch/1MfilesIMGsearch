@@ -2927,7 +2927,7 @@ constexpr UINT WM_STATS_DONE = WM_APP + 53;  // lParam: StatsData*
 
 struct StatsData {
     StatsSummary summary;
-    std::vector<StatRow> rows[6];  // 作者・キャラ・作品・行動・月・形式
+    std::vector<StatRow> rows[9];  // タグ（kStatKinds の並び）・月・形式
     std::wstring error;
 };
 
@@ -2940,8 +2940,10 @@ struct StatsWindow {
 } statsWin;
 
 enum { IDC_SS_VIEW = 400, IDC_SS_LIST };
-const wchar_t* const kStatViews[] = {L"作者別", L"キャラ別", L"作品別", L"行動・アイテム別", L"月ごとの増え方", L"形式別"};
-const std::vector<std::string> kStatKinds[] = {{"artist"}, {"character"}, {"copyright"}, {"action", "item"}};
+const wchar_t* const kStatViews[] = {L"作者別", L"サークル別", L"キャラ別", L"作品別", L"イベント別", L"タイトル別", L"行動・アイテム別",
+                                     L"月ごとの増え方", L"形式別"};
+const std::vector<std::string> kStatKinds[] = {{"artist"}, {"circle"}, {"character"}, {"copyright"}, {"event"}, {"title"}, {"action", "item"}};
+constexpr int kStatTagViews = static_cast<int>(std::size(kStatKinds));  // ここまではタグ。後ろに月・形式
 
 std::wstring statsSummaryText(const StatsSummary& s) {
     std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
@@ -2976,7 +2978,7 @@ void fillStatsList() {
     for (const auto& r : rows) w.most = std::max(w.most, r.count);
     SendMessageW(w.list, WM_SETREDRAW, FALSE, 0);
     for (size_t i = 0; i < rows.size(); ++i) {
-        std::wstring name = view < 4 ? tagLabel(rows[i].key) : widen(rows[i].key);  // 0〜3 はタグ
+        std::wstring name = view < kStatTagViews ? tagLabel(rows[i].key) : widen(rows[i].key);
         LVITEMW it{};
         it.mask = LVIF_TEXT;
         it.iItem = static_cast<int>(i);
@@ -2988,10 +2990,10 @@ void fillStatsList() {
     }
     SendMessageW(w.list, WM_SETREDRAW, TRUE, 0);
     std::wstring note;
-    if (view < 4)
+    if (view < kStatTagViews)
         note = rows.empty() ? L"まだありません（タガー・json・外部照会などでタグが付くと出ます）"
                             : L"確度 0.5 以上（手動で「違う」と確定したものは除く）の上位 500 件。ダブルクリックでそのタグを検索します。";
-    else if (view == 4)
+    else if (view == kStatTagViews)
         note = L"ファイルの作成日時と更新日時の古い方の月で数えます。";
     else
         note = L"形式が分からない画像は拡張子で数えます。";
@@ -3007,9 +3009,9 @@ void loadStats() {
             Db d;
             if (!d.open(narrow(db))) throw std::runtime_error(d.error());
             p->summary = statsSummary(d);
-            for (int i = 0; i < 4; ++i) p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
-            p->rows[4] = monthlyCounts(d);
-            p->rows[5] = formatCounts(d);
+            for (int i = 0; i < kStatTagViews; ++i) p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
+            p->rows[kStatTagViews] = monthlyCounts(d);
+            p->rows[kStatTagViews + 1] = formatCounts(d);
         } catch (const std::exception& e) {
             p->error = L"集計できませんでした: " + widen(e.what());
         }
@@ -3065,7 +3067,7 @@ void showStatsWindow() {
                     if (nm->idFrom == IDC_SS_LIST && nm->code == NM_DBLCLK && statsWin.data) {
                         const int view = ComboBox_GetCurSel(statsWin.view);
                         const int i = ListView_GetNextItem(statsWin.list, -1, LVNI_SELECTED);
-                        if (view >= 0 && view < 4 && i >= 0 && i < static_cast<int>(statsWin.data->rows[view].size())) {
+                        if (view >= 0 && view < kStatTagViews && i >= 0 && i < static_cast<int>(statsWin.data->rows[view].size())) {
                             const std::string& tag = statsWin.data->rows[view][static_cast<size_t>(i)].key;
                             if (tag.find(' ') == std::string::npos) {
                                 statsWin.searchTag = widen(tag);

@@ -2355,13 +2355,17 @@ class ExplorerImpl {
   POINT trayDownPt = {};
   int tagDropItem = -1;     // 落とす先の項目（一覧の番号。枠で示す）
 
-  // タグの種類の色 (Danbooru に近い): 作者 赤、キャラ 緑、作品 紫、一般 青、ほか 灰か橙
+  // タグの種類の色 (Danbooru に近い): 作者 赤、キャラ 緑、作品 紫、一般 青、サークル 暗い赤、タイトル 青緑、イベント 茶、ページ 紺、ほか 灰か橙
   static COLORREF KindColor(const std::wstring& kind) {
     if (kind == L"artist") return RGB(192, 0, 4);
     if (kind == L"character") return RGB(0, 150, 32);
     if (kind == L"copyright") return RGB(160, 0, 170);
     if (kind == L"general") return RGB(0, 100, 220);
     if (kind == L"action" || kind == L"item") return RGB(204, 110, 0);
+    if (kind == L"circle") return RGB(150, 40, 40);   // サークル（作者に近い色）
+    if (kind == L"title") return RGB(0, 125, 125);    // 本のタイトル
+    if (kind == L"event") return RGB(140, 95, 30);    // イベント
+    if (kind == L"page") return RGB(90, 90, 140);     // 表紙・本文・背表紙
     return RGB(110, 110, 110);
   }
 

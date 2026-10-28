@@ -1359,8 +1359,49 @@ static void testNames() {
     };
     using V = std::vector<std::string>;
     CHECK((names("D:\\Pics\\初音ミク\\a.jpg") == V{"general:初音ミク"}));
-    CHECK((names("D:\\Pics\\[作者名] 夏の本\\001.jpg") == V{"artist:作者名", "general:夏の本"}));
+    CHECK((names("D:\\Pics\\[作者名] 夏の本\\001.jpg") == V{"artist:作者名", "title:夏の本"}));
     CHECK((names("D:\\【サークル】\\001.jpg") == V{"artist:サークル"}));
+    // [サークル名(作者名)]タイトル(イベント名・原作名)
+    CHECK((names("D:\\[ABCサークル(山田太郎)]夏の本(C102)\\001.jpg") ==
+           V{"circle:ABCサークル", "artist:山田太郎", "title:夏の本", "event:C102"}));
+    CHECK((names("D:\\(C99) [ABC (山田、佐藤)] 夏の本 (東方Project) [DL版]\\001.jpg") ==
+           V{"circle:ABC", "artist:山田", "artist:佐藤", "title:夏の本", "event:C99", "copyright:東方Project"}));
+    CHECK((names("D:\\【ABC（山田）】夏の本（東方Project）（例大祭20）\\01\\001.jpg") ==  // 全角、中のフォルダ（01 は数字だけなので使わない）
+           V{"circle:ABC", "artist:山田", "title:夏の本", "event:例大祭20", "copyright:東方Project"}));
+    // 本のページの役目（名前順。数字は数として）
+    {
+        const std::vector<std::string> pages = {"10.jpg", "2.jpg", "1.jpg", "cover_b.png"};
+        CHECK(pageRole("1.jpg", pages) == "表紙" && pageRole("2.jpg", pages) == "本文" && pageRole("10.jpg", pages) == "本文" &&
+              pageRole("cover_b.png", pages) == "背表紙" && pageRole("x.jpg", pages).empty());
+        CHECK(pageRole("a.jpg", {"a.jpg"}) == "表紙");
+        const fs::path dbp = fs::temp_directory_path() / "imgdupe-book.db";
+        fs::remove(dbp);
+        Db d;
+        CHECK(d.open(dbp.string()));
+        auto ids = upsertScanned(d, {{"D:\\[A(B)]T\\1.jpg", 1, 1}, {"D:\\[A(B)]T\\2.jpg", 1, 1}, {"D:\\[A(B)]T\\10.jpg", 1, 1},
+                                     {"D:\\[A(B)]T\\sub\\0.jpg", 1, 1}, {"D:\\[A(B)]T2\\0.jpg", 1, 1}});
+        NamesAnalyzer na;
+        std::atomic<bool> stop{false};
+        runStage(d, na, 1, stop);
+        auto role = [&](const char* p) {
+            for (const auto& t : tagsOf(d, ids[p]))
+                if (t.kind == "page") return t.tag;
+            return std::string();
+        };
+        CHECK(role("D:\\[A(B)]T\\1.jpg") == "表紙" && role("D:\\[A(B)]T\\2.jpg") == "本文" && role("D:\\[A(B)]T\\10.jpg") == "背表紙");
+        CHECK(role("D:\\[A(B)]T\\sub\\0.jpg").empty() && role("D:\\[A(B)]T2\\0.jpg") == "表紙");  // 中のフォルダは付けない、別の本
+        d.close();
+        fs::remove(dbp);
+        CHECK(naturalCompare("img2.jpg", "img10.jpg") < 0 && naturalCompare("A.jpg", "a.jpg") != 0 && naturalCompare("007", "7") != 0);
+    }
+    {
+        DoujinName d;
+        CHECK(parseDoujinName("[サークル(作者)]タイトル(2023冬)(オリジナル)", d) && d.circle == "サークル" && d.authors.size() == 1 &&
+              d.title == "タイトル" && d.events == std::vector<std::string>{"2023冬"} && d.parodies == std::vector<std::string>{"オリジナル"});
+        CHECK(!parseDoujinName("夏の本", d) && !parseDoujinName("[]本", d) && !parseDoujinName("[ABC本", d));
+        CHECK(looksLikeEvent("C102") && looksLikeEvent("コミックマーケット103") && looksLikeEvent("COMIC1☆22") && !looksLikeEvent("東方Project"));
+        CHECK(folderTags("D:\\[A(B)]T(C1)\\x.jpg").at(0).confidence > 0.9);
+    }
     CHECK(names("C:\\Users\\me\\Downloads\\a.jpg").empty());
     CHECK(names("D:\\Photos\\2024-05\\a.jpg").empty());
     CHECK(names("E:\\DCIM\\100MEDIA\\a.jpg").empty());
