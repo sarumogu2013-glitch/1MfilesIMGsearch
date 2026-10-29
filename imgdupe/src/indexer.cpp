@@ -11,6 +11,7 @@
 
 #include "clip.hpp"
 #include "log.hpp"
+#include "pathinfer.hpp"
 #include "names.hpp"
 #include "quality.hpp"
 
@@ -305,6 +306,20 @@ bool finish(Db& db, RunState& s, bool lookup) {
         timed(IndexPhase::Lookup, [&] { cb.lookup(db, s.cancel, &progress.prog); });
         if (s.cancel) return false;
     }
+    // フォルダ名から作者・アカウントを推し量る（画像・作者の情報・教えた形が変わっていなければすぐ終わる）
+    timed(IndexPhase::Merge, [&] {
+        try {
+            const InferSummary r = runFolderInference(db, false, &s.cancel);
+            if (!r.skipped) {
+                char t[200];
+                std::snprintf(t, sizeof t, "フォルダ名から推し量った: フォルダ %zu 個のうち変わった %zu 個（画像 %zu 枚を書き直し、推し量れた画像 %zu 枚）%s",
+                              r.dirs, r.changedDirs, r.images, r.tagged, r.cancelled ? "・途中で止めた" : "");
+                logs::info(t);
+            }
+        } catch (const std::exception& e) {
+            logs::error(std::string("フォルダ名から推し量れなかった: ") + e.what());
+        }
+    });
     if (cb.merge) timed(IndexPhase::Merge, [&] { cb.merge(db); });
     return true;
 }

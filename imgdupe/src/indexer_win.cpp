@@ -24,6 +24,7 @@
 #include "image_win.hpp"
 #include "indexer.hpp"
 #include "log.hpp"
+#include "pathinfer.hpp"
 #include "log_win.hpp"
 #include "meta.hpp"
 #include "names.hpp"
@@ -85,6 +86,7 @@ struct Resident {
     std::condition_variable cv;
     std::atomic<bool> quit{false}, paused{false}, cancelRun{false}, running{false};
     std::atomic<bool> dirty{true};             // 調べ直しが要る（フォルダ全体）
+    std::atomic<bool> inferDirty{false};       // フォルダ名からの推し量りだけやり直す（教えた形が変わった）
     std::atomic<bool> tasksDirty{true};        // スキャンタスクが足された
     std::atomic<bool> preempt{false};          // 今のタスクより上に別のタスクが来た（indexOnce が切れ目で譲る）
     std::atomic<ULONGLONG> changeTick{0};      // フォルダの変化に気づいた時刻（0 = なし）
@@ -183,6 +185,7 @@ void handleCommand(Db& db, const std::string& c) {
     logs::info("画面からの指示: " + c);
     if (c == "quit") g->quit = true;
     else if (c == "rescan") g->dirty = true;
+    else if (c == "infer") g->inferDirty = true;
     else if (c == "pause") g->paused = true;
     else if (c == "resume") g->paused = false;
     else if (c == "tasks") {
@@ -442,6 +445,18 @@ void workLoop() {
             }
             runOnce(roots, full);
             lastRun = GetTickCount64();
+            continue;
+        }
+        if (g->inferDirty && !g->paused) {
+            // 教えた形が変わった: フォルダ名からの推し量りだけやり直す（走査はしない）
+            g->inferDirty = false;
+            try {
+                const InferSummary r = runFolderInference(db, false, &g->quit);  // 終わる時は止める
+                logs::info("フォルダ名から推し量り直した: 変わったフォルダ " + std::to_string(r.changedDirs) + " 個・画像 " +
+                           std::to_string(r.images) + " 枚");
+            } catch (const std::exception& e) {
+                logs::error(std::string("フォルダ名から推し量れなかった: ") + e.what());
+            }
             continue;
         }
         std::unique_lock<std::mutex> lock(g->m);
@@ -1225,6 +1240,9 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
     r.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"imgdupe indexer", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst,
                              nullptr);
     if (!r.hwnd) {
+        logs::error("ウィンドウを作れなかった（" + std::to_string(GetLastError()) + "）");
+        g = nullptr;
+        logwin::stop();
         CloseHandle(mutex);
         return 1;
     }
@@ -1276,6 +1294,11 @@ void requestQuit(const std::wstring& dataDir) {
 void requestRescan(const std::wstring& dataDir) {
     Db db;
     if (db.open(dbFileOf(dataDir))) addCommand(db, "rescan");
+}
+
+void requestInfer(const std::wstring& dataDir) {
+    Db db;
+    if (db.open(dbFileOf(dataDir))) addCommand(db, "infer");
 }
 
 void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& roots) {

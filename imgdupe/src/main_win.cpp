@@ -54,6 +54,7 @@
 #include "resource.h"
 #include "search.hpp"
 #include "links.hpp"
+#include "pathinfer.hpp"
 #include "log.hpp"
 #include "log_win.hpp"
 #include "update_win.hpp"
@@ -336,6 +337,7 @@ struct ExplorerApp : ExplorerHost {
     std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) override;
     void ExplorerSaveSelection() override;
     void ExplorerTagSelection() override;
+    void ExplorerTeachFolder(const std::wstring& dir) override;
 } ex;
 
 int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
@@ -1461,6 +1463,7 @@ std::wstring sourceLabel(const std::string& s) {
     static const std::pair<const char*, const wchar_t*> names[] = {
         {"manual", L"手動で確認"}, {"embedded", L"ファイル埋め込み"}, {"meta", L"メタデータ"}, {"id_lookup", L"ID 照会"},
         {"reverse", L"逆画像検索"}, {"folder", L"フォルダ名"}, {"same_folder", L"同じフォルダからの推定"},
+        {"infer", L"フォルダ名からの推定"},
         {"tagger", L"タガー（WD14）"}, {"clip", L"CLIP"}, {"dict", L"辞書"}, {"parent", L"親子関係"}, {"reference", L"見本画像との類似"}, {"ocr", L"OCR"}};
     for (const auto& [k, v] : names)
         if (s == k) return v;
@@ -2351,6 +2354,346 @@ std::wstring pickQueriesFile(bool save) {
     return out;
 }
 
+// ---------------------------------------------------------------- フォルダ名の形を教える
+
+// 役目の選択肢（画面の並び）。"" は使わない
+const std::pair<const char*, const wchar_t*> kTeachRoles[] = {
+    {"", L"（使わない）"},         {"artist", L"作者名"},           {"circle", L"サークル名"},
+    {"title", L"タイトル"},        {"event", L"イベント"},          {"pixiv", L"pixiv のユーザー ID"},
+    {"x", L"X（Twitter）のアカウント"}, {"fanbox", L"FANBOX のクリエイター"}, {"fantia", L"Fantia のファンクラブ ID"},
+    {"skeb", L"Skeb のアカウント"}, {"nijie", L"ニジエのユーザー ID"}, {"misskey", L"Misskey のアカウント"},
+    {"bluesky", L"Bluesky のアカウント"}, {"booth", L"BOOTH のショップ"}, {"patreon", L"Patreon"},
+    {"ci-en", L"Ci-en のクリエイター"}};
+
+std::wstring teachRoleLabel(const std::string& role) {
+    for (const auto& [k, v] : kTeachRoles)
+        if (role == k) return v;
+    return widen(role);
+}
+
+// 形を人に見せる形に（"S ( pixiv D )" → "［文字］(pixiv［数字］)"）
+std::wstring humanShape(const std::string& key) {
+    std::wstring out;
+    size_t a = 0;
+    while (a <= key.size()) {
+        size_t b = key.find(' ', a);
+        if (b == std::string::npos) b = key.size();
+        const std::string t = key.substr(a, b - a);
+        if (t == "D") out += L"［数字］";
+        else if (t == "S") out += L"［文字］";
+        else if (t == "@") out += L"@［名前］";
+        else if (t == "pixiv" || t == "twitter" || t == "fanbox" || t == "fantia" || t == "skeb" || t == "nijie" || t == "id")
+            out += L" " + widen(t) + L" ";
+        else out += widen(t);
+        a = b + 1;
+    }
+    return out;
+}
+
+std::wstring inferredText(const std::vector<InferredTag>& tags) {
+    std::wstring t;
+    for (const auto& x : tags) {
+        if (!t.empty()) t += L"、";
+        if (x.kind == "artist") t += L"作者: ";
+        else if (x.kind == "circle") t += L"サークル: ";
+        else if (x.kind == "title") t += L"タイトル: ";
+        else if (x.kind == "event") t += L"イベント: ";
+        t += widen(x.tag);
+    }
+    return t.empty() ? L"（何も付けない）" : t;
+}
+
+// dir のフォルダ名の部分ごとに役目を教える（dir が空なら、教えた形の一覧だけ）
+void teachFolderUi(const std::wstring& dirIn) {
+    Db* db = uiDb();
+    if (!db) return;
+    std::wstring dir = dirIn;
+    while (dir.size() > 3 && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
+    const size_t sep = dir.find_last_of(L"\\/");
+    const std::wstring name = sep == std::wstring::npos ? dir : dir.substr(sep + 1);
+    const std::wstring parent = sep == std::wstring::npos ? L"" : dir.substr(0, sep);
+    const std::wstring parentName = parent.substr(parent.find_last_of(L"\\/") == std::wstring::npos ? 0 : parent.find_last_of(L"\\/") + 1);
+    const NameShape shape = name.empty() || (name.size() == 2 && name[1] == L':') ? NameShape{} : nameShape(narrow(name));
+    const size_t kMaxSlots = 8;
+    const size_t slots = std::min(shape.slots.size(), kMaxSlots);
+
+    enum { ID_SAVE = 100, ID_SCOPE_HERE, ID_SCOPE_ANY, ID_RULES, ID_DELETE, ID_ROLE0 = 200 };
+    struct State {
+        bool done = false;
+        int command = 0;
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDOK) st->done = true;
+                else if (LOWORD(wp) >= ID_ROLE0 && LOWORD(wp) < ID_ROLE0 + 16) {
+                    if (HIWORD(wp) == CBN_SELCHANGE) st->command = LOWORD(wp);
+                } else if (LOWORD(wp) == ID_RULES) {
+                    if (HIWORD(wp) == LBN_SELCHANGE) st->command = ID_RULES;
+                } else st->command = LOWORD(wp);
+                return 0;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeTeachFolder";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(660), m = px(12), rowH = px(30);
+    const int slotsH = slots ? static_cast<int>(slots) * rowH : px(24);
+    const int h = m + px(20) + px(40) + px(22) + slotsH + px(8) + px(48) + px(22) + px(130) + px(10) + px(22) + px(100) + px(10) + px(30) + m;
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeTeachFolder", L"フォルダ名から作者などを読み取る形", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, std::max(0L, (owner.top + owner.bottom - fh) / 2), fw, fh, app.hwnd,
+                               nullptr, app.inst, nullptr);
+    if (!dlg) return;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    HWND tip = makeTooltip(dlg, px(360));
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cw, int ch, DWORD exs = 0) {
+        HWND c = CreateWindowExW(exs, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cw, ch, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    int y = m;
+    child(WC_STATICW, (L"フォルダ: " + (name.empty() ? std::wstring(L"（なし）") : name)).c_str(), SS_NOPREFIX | SS_ENDELLIPSIS, -1, m, y,
+          w - 2 * m, px(20));
+    y += px(20);
+    child(WC_STATICW,
+          slots ? L"名前を部分に分けました。部分ごとに何を表すか選んで「教える」を押すと、同じ形の名前のフォルダ（と中のフォルダ）の画像に、"
+                  L"作者・アカウントなどのタグを付けます（AI は使いません。ファイルには書きません）。"
+                : L"フォルダを右クリックして「このフォルダ名から作者などを読み取る形を教える」を選ぶと、ここで形を教えられます。",
+          SS_NOPREFIX, -1, m, y, w - 2 * m, px(40));
+    y += px(40);
+    child(WC_STATICW, (L"形: " + (slots ? humanShape(shape.key) : std::wstring(L"―"))).c_str(), SS_NOPREFIX, -1, m, y, w - 2 * m, px(20));
+    y += px(22);
+    std::vector<HWND> combos;
+    // 今の役目（教えた形があればそれ、無ければ名前だけで分かるもの）
+    std::vector<InferRule> rules;
+    try {
+        rules = loadInferRules(*db);
+    } catch (const std::exception&) {
+    }
+    std::vector<std::string> initial(slots);
+    {
+        const InferRule* found = nullptr;
+        for (const auto& r : rules)
+            if (r.shape == shape.key && r.roles.size() == shape.slots.size() && (r.scope.empty() || _wcsicmp(widen(r.scope).c_str(), parent.c_str()) == 0))
+                if (!found || !r.scope.empty()) found = &r;
+        if (found) {
+            for (size_t i = 0; i < slots; ++i) initial[i] = found->roles[i];
+        } else if (slots) {
+            const auto guess = inferFromName(narrow(name), "");
+            for (size_t i = 0; i < slots; ++i)
+                for (const auto& [role, label] : kTeachRoles) {
+                    if (!*role) continue;
+                    std::vector<std::string> one(shape.slots.size());
+                    one[i] = role;
+                    const auto t = applyRoles(shape, one, 1.0);
+                    for (const auto& g : guess)
+                        if (!t.empty() && g.kind == t[0].kind && g.tag == t[0].tag) initial[i] = role;
+                }
+        }
+    }
+    for (size_t i = 0; i < slots; ++i) {
+        const NameSlot& s = shape.slots[i];
+        const std::wstring kind = s.cls == 'D' ? L"数字" : s.cls == '@' ? L"@ 名前" : L"文字";
+        child(WC_STATICW, (L"「" + widen(s.value) + L"」（" + kind + L"）").c_str(), SS_NOPREFIX | SS_ENDELLIPSIS | SS_CENTERIMAGE, -1, m,
+              y + static_cast<int>(i) * rowH, px(360), px(26));
+        HWND cb = child(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, ID_ROLE0 + static_cast<int>(i), m + px(370),
+                        y + static_cast<int>(i) * rowH, w - 2 * m - px(370), px(400));
+        int sel = 0, k = 0;
+        for (const auto& [role, label] : kTeachRoles) {
+            ComboBox_AddString(cb, label);
+            if (initial[i] == role) sel = k;
+            ++k;
+        }
+        ComboBox_SetCurSel(cb, sel);
+        combos.push_back(cb);
+    }
+    if (shape.slots.size() > kMaxSlots)
+        child(WC_STATICW, L"（部分が多すぎるので、後ろの部分は使いません）", SS_NOPREFIX, -1, m, y + slotsH - px(4), w - 2 * m, px(20));
+    y += slotsH + px(8);
+    HWND here = child(WC_BUTTONW, (L"このフォルダと同じ場所（" + (parentName.empty() ? parent : parentName) + L"）の下の同じ形だけ").c_str(),
+                      WS_TABSTOP | BS_AUTORADIOBUTTON | WS_GROUP, ID_SCOPE_HERE, m, y, w - 2 * m, px(22));
+    HWND any = child(WC_BUTTONW, L"どこでも同じ形なら（「［文字］」だけの形には向きません）",
+                     WS_TABSTOP | BS_AUTORADIOBUTTON, ID_SCOPE_ANY, m, y + px(24), w - 2 * m, px(22));
+    Button_SetCheck(here, BST_CHECKED);
+    EnableWindow(here, slots > 0);
+    EnableWindow(any, slots > 0);
+    y += px(48);
+    HWND countText = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, y, w - 2 * m, px(20));
+    y += px(22);
+    HWND preview = child(WC_LISTBOXW, L"", WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOSEL, -1, m, y, w - 2 * m, px(130), WS_EX_CLIENTEDGE);
+    y += px(140);
+    child(WC_STATICW, L"教えた形（選んで「削除」で消せます）", SS_NOPREFIX, -1, m, y, w - 2 * m, px(20));
+    y += px(22);
+    const int delW = px(90);
+    HWND ruleList = child(WC_LISTBOXW, L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, ID_RULES, m, y,
+                          w - 2 * m - delW - px(8), px(100), WS_EX_CLIENTEDGE);
+    HWND delBtn = child(WC_BUTTONW, L"削除", WS_TABSTOP, ID_DELETE, w - m - delW, y, delW, px(28));
+    addTooltip(tip, delBtn, L"選んだ教えた形を消します（その形で付けたタグは、次の推し量りで外れます）");
+    y += px(110);
+    HWND status = child(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, -1, m, y + px(6), w - 2 * m - px(260), px(20));
+    HWND saveBtn = child(WC_BUTTONW, L"教える", WS_TABSTOP | BS_DEFPUSHBUTTON, ID_SAVE, w - m - px(250), y, px(120), px(30));
+    addTooltip(tip, saveBtn, L"この形を覚えて、同じ形のフォルダの画像にタグを付けます（バックグラウンドの解析が行います）");
+    EnableWindow(saveBtn, slots > 0);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDOK, w - m - px(120), y, px(120), px(30));
+
+    auto fillRules = [&] {
+        try {
+            rules = loadInferRules(*db);
+        } catch (const std::exception&) {
+            rules.clear();
+        }
+        ListBox_ResetContent(ruleList);
+        for (const auto& r : rules) {
+            std::wstring roles;
+            for (const auto& x : r.roles) roles += (roles.empty() ? L"" : L"・") + teachRoleLabel(x);
+            const std::wstring scope = r.scope.empty() ? L"どこでも" : widen(r.scope.substr(r.scope.find_last_of("\\/") + 1)) + L" の下";
+            ListBox_AddString(ruleList, (humanShape(r.shape) + L" → " + roles + L"（" + scope + L"、例: " + widen(r.example) + L"）　" +
+                                         (r.scope.empty() ? L"" : widen(r.scope)))
+                                            .c_str());
+        }
+        SendMessageW(ruleList, LB_SETHORIZONTALEXTENT, px(1600), 0);
+    };
+    fillRules();
+
+    // 同じ形のフォルダの名前（同じ場所の下・どこでも）。どこでもの分は初めて選んだ時に集める
+    std::vector<std::string> hereNames, anyNames;
+    bool anyLoaded = false;
+    auto collect = [&](const std::string& under, std::vector<std::string>& out) {
+        std::set<std::string> names;
+        try {
+            const std::string prefix = under.empty() ? std::string() : under + "\\";
+            Stmt q(db->handle(), under.empty() ? "SELECT path FROM images" : "SELECT path FROM images WHERE path > ? AND path < ?");
+            if (!under.empty()) q.bind(1, prefix).bind(2, prefix + "\xff");
+            while (q.step()) {
+                const std::string p = q.text(0);
+                if (under.empty()) {
+                    // どこでも: 全部のフォルダの名前
+                    size_t a = 0;
+                    const size_t last = p.find_last_of("\\/");
+                    while (last != std::string::npos && a < last) {
+                        size_t b = p.find_first_of("\\/", a);
+                        if (b == std::string::npos || b > last) b = last;
+                        if (b > a) names.insert(p.substr(a, b - a));
+                        a = b + 1;
+                    }
+                } else {
+                    const std::string rest = p.substr(prefix.size());
+                    const size_t b = rest.find_first_of("\\/");
+                    if (b != std::string::npos) names.insert(rest.substr(0, b));
+                }
+            }
+        } catch (const std::exception&) {
+        }
+        for (const auto& n : names)
+            if (nameShape(n).key == shape.key) out.push_back(n);
+    };
+    if (slots) collect(narrow(parent), hereNames);
+    auto currentRoles = [&] {
+        std::vector<std::string> roles(shape.slots.size());
+        for (size_t i = 0; i < combos.size(); ++i) {
+            const int k = ComboBox_GetCurSel(combos[i]);
+            if (k >= 0 && k < static_cast<int>(std::size(kTeachRoles))) roles[i] = kTeachRoles[k].first;
+        }
+        return roles;
+    };
+    auto updatePreview = [&] {
+        if (!slots) {
+            setText(countText, L"");
+            return;
+        }
+        const bool anywhere = Button_GetCheck(any) == BST_CHECKED;
+        if (anywhere && !anyLoaded) {
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            collect("", anyNames);
+            anyLoaded = true;
+        }
+        const auto& list = anywhere ? anyNames : hereNames;
+        const auto roles = currentRoles();
+        SendMessageW(preview, WM_SETREDRAW, FALSE, 0);
+        ListBox_ResetContent(preview);
+        size_t shown = 0;
+        for (const auto& n : list) {
+            if (shown++ >= 500) break;
+            ListBox_AddString(preview, (widen(n) + L"　→　" + inferredText(applyRoles(nameShape(n), roles, 1.0))).c_str());
+        }
+        SendMessageW(preview, WM_SETREDRAW, TRUE, 0);
+        setText(countText, L"同じ形のフォルダ: " + withCommas(list.size()) + L" 個" + (list.size() > 500 ? L"（初めの 500 個を出します）" : L"") +
+                               L"　どう付くか:");
+    };
+    updatePreview();
+
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(combos.empty() ? ruleList : combos[0]);
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!st.command) continue;
+        const int cmd = st.command;
+        st.command = 0;
+        try {
+            if (cmd == ID_SCOPE_HERE || cmd == ID_SCOPE_ANY || (cmd >= ID_ROLE0 && cmd < ID_ROLE0 + 16)) {
+                updatePreview();
+            } else if (cmd == ID_SAVE) {
+                InferRule r;
+                r.scope = Button_GetCheck(any) == BST_CHECKED ? std::string() : narrow(parent);
+                r.shape = shape.key;
+                r.roles = currentRoles();
+                r.example = narrow(name);
+                saveInferRule(*db, r);
+                std::string roles;
+                for (const auto& x : r.roles) roles += (roles.empty() ? "" : ",") + (x.empty() ? std::string("-") : x);
+                logs::info("フォルダ名の形を教えた: " + r.shape + " → " + roles + "（" + (r.scope.empty() ? std::string("どこでも") : r.scope) + "）");
+                fillRules();
+                indexer::requestInfer(app.dataDir);
+                if (!indexer::isRunning()) indexer::start();
+                setText(status, L"教えました。少し待つとタグが付きます");
+            } else if (cmd == ID_DELETE) {
+                const int i = ListBox_GetCurSel(ruleList);
+                if (i >= 0 && i < static_cast<int>(rules.size()) &&
+                    logBox(dlg, L"選んだ形を消しますか？（その形で付けたタグは外れます）", L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+                    deleteInferRule(*db, rules[i].id);
+                    logs::info("教えたフォルダ名の形を消した: " + rules[i].shape);
+                    fillRules();
+                    indexer::requestInfer(app.dataDir);
+                    if (!indexer::isRunning()) indexer::start();
+                    setText(status, L"消しました");
+                }
+            }
+        } catch (const std::exception& e) {
+            logBox(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        }
+    }
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    SetForegroundWindow(app.hwnd);
+}
+
 // 保存した条件の管理（削除・並べ替え・名前の変更・書き出し・読み込み）
 void manageSmartFoldersUi() {
     Db* db = uiDb();
@@ -2956,7 +3299,7 @@ constexpr UINT WM_STATS_DONE = WM_APP + 53;  // lParam: StatsData*
 
 struct StatsData {
     StatsSummary summary;
-    std::vector<StatRow> rows[9];  // タグ（kStatKinds の並び）・月・形式
+    std::vector<StatRow> rows[10];  // タグ（kStatKinds の並び）・月・形式
     std::wstring error;
 };
 
@@ -2969,10 +3312,11 @@ struct StatsWindow {
 } statsWin;
 
 enum { IDC_SS_VIEW = 400, IDC_SS_LIST };
-const wchar_t* const kStatViews[] = {L"作者別", L"サークル別", L"キャラ別", L"作品別", L"イベント別", L"タイトル別", L"行動・アイテム別",
+const wchar_t* const kStatViews[] = {L"作者別", L"サークル別", L"アカウント別", L"キャラ別", L"作品別", L"イベント別", L"タイトル別", L"行動・アイテム別",
                                      L"月ごとの増え方", L"形式別"};
-const std::vector<std::string> kStatKinds[] = {{"artist"}, {"circle"}, {"character"}, {"copyright"}, {"event"}, {"title"}, {"action", "item"}};
+const std::vector<std::string> kStatKinds[] = {{"artist"}, {"circle"}, {"account"}, {"character"}, {"copyright"}, {"event"}, {"title"}, {"action", "item"}};
 constexpr int kStatTagViews = static_cast<int>(std::size(kStatKinds));  // ここまではタグ。後ろに月・形式
+static_assert(std::size(kStatViews) == kStatTagViews + 2 && std::extent_v<decltype(StatsData::rows)> == std::size(kStatViews), "統計の表の数");
 
 std::wstring statsSummaryText(const StatsSummary& s) {
     std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
@@ -4177,6 +4521,7 @@ std::vector<std::pair<std::wstring, std::wstring>> ExplorerApp::ExplorerProperti
 }
 
 void ExplorerApp::ExplorerTagSelection() { bulkTagUi(); }
+void ExplorerApp::ExplorerTeachFolder(const std::wstring& dir) { teachFolderUi(dir); }
 
 void ExplorerApp::ExplorerRelookup(const std::wstring& path) {
     Db* db = uiDb();
@@ -5657,6 +6002,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
         case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べるフォルダの中から探して下に一覧にします（Ctrl+M）";
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
+        case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
         case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
@@ -5794,7 +6140,7 @@ void appendMainMenus(HMENU root) {
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, 0, CMD_ABOUT});
 }
 
@@ -6117,6 +6463,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case CMD_LINKS: showLinksWindow(); break;
                 case CMD_STATS: showStatsWindow(); break;
+                case CMD_INFER_RULES: teachFolderUi(L""); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
                     markSelected(LOWORD(wp) == CMD_TAG_YES);

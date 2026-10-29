@@ -17,6 +17,7 @@
 #include "search.hpp"
 #include "links.hpp"
 #include "names.hpp"
+#include "pathinfer.hpp"
 #include "log.hpp"
 #include "models.hpp"
 #include "tagger.hpp"
@@ -2803,6 +2804,99 @@ static void testTagNames() {
     CHECK(builtin.size() > 10000 && tags.size() == builtin.size() && jas.size() == builtin.size());
 }
 
+static bool hasInferred(const std::vector<InferredTag>& v, const std::string& kind, const std::string& tag) {
+    for (const auto& t : v)
+        if (t.kind == kind && t.tag == tag) return true;
+    return false;
+}
+
+static void testPathInfer() {
+    // 形
+    CHECK(nameShape("12345 yamada").key == "D S");
+    CHECK(nameShape("山田 太郎 (pixiv 12345)").key == "S ( pixiv D )");
+    const NameShape sh = nameShape("山田 太郎 (pixiv 12345)");
+    CHECK(sh.slots.size() == 2 && sh.slots[0].value == "山田 太郎" && sh.slots[1].value == "12345" && sh.slots[1].label == "pixiv");
+    CHECK(nameShape("taro_yamada").key == "S" && nameShape("pixiv_12345").key == "pixiv D" && nameShape("12345_taro").key == "D S");
+    CHECK(nameShape("山田【＠yamada_t】").key == "S [ @ ]" && nameShape("山田【＠yamada_t】").slots[1].value == "yamada_t");
+    CHECK(nameShape("（pixiv：１２３）").key == "( pixiv D )" && nameShape("（pixiv：１２３）").slots[0].label == "pixiv");
+    // 名前だけで
+    auto a = inferFromName("山田 太郎 (pixiv 12345)", "");
+    CHECK(hasInferred(a, "account", "pixiv:12345") && hasInferred(a, "artist", "山田 太郎") && a.size() == 2);
+    a = inferFromName("山田【@yamada_t】", "");
+    CHECK(hasInferred(a, "account", "x:@yamada_t") && hasInferred(a, "artist", "山田"));
+    a = inferFromName("12345 sakusha", "pixiv");  // gallery-dl の pixiv
+    CHECK(hasInferred(a, "account", "pixiv:12345") && hasInferred(a, "artist", "sakusha"));
+    a = inferFromName("some_account", "x");
+    CHECK(a.size() == 1 && hasInferred(a, "account", "x:@some_account"));
+    CHECK(inferFromName("夏休み 2024", "").empty() && inferFromName("[サークル(作者)]本", "").empty());
+    CHECK(inferFromName("12345", "").empty());  // 何の数字か分からない
+    CHECK(accountUrl("pixiv:12345") == "https://www.pixiv.net/users/12345" && accountUrl("x:@abc") == "https://x.com/abc");
+    CHECK(accountUrl("fanbox:abc") == "https://abc.fanbox.cc/" && accountUrl("foo") == "");
+
+    // 兄弟の形と中の画像から
+    InferInput in;
+    // D:\絵\<pixiv の ID> <名前>\ … 中の画像の作者の ID が 1 つ分かっている
+    for (const char* d : {"D:\\絵\\111 あ", "D:\\絵\\222 い", "D:\\絵\\333 う", "D:\\絵\\444 え"}) in.dirs[d].images = 3;
+    in.dirs["D:\\絵\\111 あ"].accounts.insert("pixiv:111");
+    // D:\作者\<名前>\ … 1 つの名前が json で分かった作者
+    for (const char* d : {"D:\\作者\\たろう", "D:\\作者\\はなこ", "D:\\作者\\じろう", "D:\\作者\\たろう\\作品A"}) in.dirs[d].images = 2;
+    in.dirs["D:\\作者\\はなこ"].artists.insert("はなこ");
+    in.knownArtists.insert("はなこ");
+    // 教えた形: D:\本\ の下の "名前 - 数字" は作者と fantia
+    for (const char* d : {"D:\\本\\あいう - 77", "D:\\本\\かき - 88"}) in.dirs[d].images = 1;
+    in.rules.push_back({0, "D:\\本", "S - D", {"artist", "fantia"}, "あいう - 77"});
+    // 作者の名前とアカウントの対応（json から）で、名前だけのフォルダにアカウントを足す
+    in.pairs.emplace_back("pixiv:999", "じろう");
+    const auto r = inferFolders(in);
+    CHECK(hasInferred(r.at("D:\\絵\\111 あ"), "account", "pixiv:111") && hasInferred(r.at("D:\\絵\\111 あ"), "artist", "あ"));
+    CHECK(hasInferred(r.at("D:\\絵\\444 え"), "account", "pixiv:444") && hasInferred(r.at("D:\\絵\\444 え"), "artist", "え"));
+    CHECK(hasInferred(r.at("D:\\作者\\たろう"), "artist", "たろう") && hasInferred(r.at("D:\\作者\\はなこ"), "artist", "はなこ"));
+    CHECK(hasInferred(r.at("D:\\作者\\たろう\\作品A"), "artist", "たろう"));  // 上のフォルダから受け継ぐ
+    CHECK(hasInferred(r.at("D:\\作者\\じろう"), "account", "pixiv:999"));
+    CHECK(hasInferred(r.at("D:\\本\\かき - 88"), "artist", "かき") && hasInferred(r.at("D:\\本\\かき - 88"), "account", "fantia:88"));
+    // 手がかりの無い名前だけのフォルダは何も付けない
+    InferInput none;
+    for (const char* d : {"D:\\x\\風景", "D:\\x\\猫", "D:\\x\\空"}) none.dirs[d].images = 1;
+    CHECK(inferFolders(none).empty());
+
+    // DB で: 書いて、変わっていなければ何もしない
+    const fs::path dbPath = fs::temp_directory_path() / "imgdupe-infer-test.db";
+    fs::remove(dbPath);
+    {
+        Db db;
+        CHECK(db.open(dbPath.string()));
+        for (const char* p : {"D:\\pixiv\\123 taro\\1_p0.jpg", "D:\\pixiv\\123 taro\\2_p0.jpg", "D:\\other\\a.jpg"}) {
+            Stmt st(db.handle(), "INSERT INTO images(path) VALUES(?)");
+            st.bind(1, std::string(p));
+            st.step();
+        }
+        InferSummary s1 = runFolderInference(db);
+        CHECK(!s1.skipped && s1.images == 2 && s1.tagged == 2);
+        const auto tags = tagsOf(db, 1);
+        bool acc = false, art = false;
+        for (const auto& t : tags) {
+            acc = acc || (t.kind == "account" && t.tag == "pixiv:123" && t.source == "infer");
+            art = art || (t.kind == "artist" && t.tag == "taro");
+        }
+        CHECK(acc && art);
+        CHECK(storedInferTags(db, "D:\\pixiv\\123 taro\\3_p0.jpg").size() == 2);
+        CHECK(runFolderInference(db).skipped);
+        // 教えた形を足すと、やり直す
+        InferRule rule{0, "", "S", {"artist"}, "other"};
+        CHECK(saveInferRule(db, rule) > 0 && loadInferRules(db).size() == 1);
+        InferSummary s2 = runFolderInference(db);
+        CHECK(!s2.skipped);
+        bool other = false;
+        for (const auto& t : tagsOf(db, 3)) other = other || (t.kind == "artist" && t.tag == "other");
+        CHECK(other);
+        deleteInferRule(db, loadInferRules(db)[0].id);
+        CHECK(loadInferRules(db).empty());
+        runFolderInference(db);
+        CHECK(tagsOf(db, 3).empty());
+    }
+    fs::remove(dbPath);
+}
+
 static void testLogs() {
     const std::string line = logs::formatLine(0, "解析", logs::Level::Warn, "a\nb");
     CHECK(line.find("[解析] 注意: a b") != std::string::npos && line.size() >= 2 && line.substr(line.size() - 2) == "\r\n");
@@ -2922,6 +3016,7 @@ int main() {
     testFreeSearch();
     testQueryStore();
     testLogs();
+    testPathInfer();
     testTagNames();
     testClusterResults();
     testExifOrientation();

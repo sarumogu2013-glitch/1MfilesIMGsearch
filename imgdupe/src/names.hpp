@@ -13,7 +13,8 @@
 
 namespace imgdupe {
 
-constexpr int kNamesVersion = 2;  // 2: サークル・作者・タイトル・イベント・原作を分け、本のページ（表紙・本文・背表紙）
+constexpr int kNamesVersion = 3;  // 2: サークル・作者・タイトル・イベント・原作を分け、本のページ（表紙・本文・背表紙）
+                                  // 3: 作者・アカウントを読み取れる形のフォルダ名は、名前そのものをタグにしない
 constexpr const char* kStageNames = "names";
 constexpr const char* kSourceMeta = "meta";
 constexpr const char* kSourceFolder = "folder";

@@ -86,6 +86,7 @@ class ExplorerHost {
   virtual std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) = 0;  // 画像のプロパティ（名前と値）
   virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
   virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
+  virtual void ExplorerTeachFolder(const std::wstring& dir) = 0;                   // フォルダ名から作者などを読み取る形を教える
 };
 
 // ファイルか URL（ブラウザーから）のドロップを受け取る IDropTarget（RegisterDragDrop に渡す。参照は 1 で返す）

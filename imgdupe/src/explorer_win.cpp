@@ -36,6 +36,7 @@
 
 #include "core.hpp"
 #include "image_win.hpp"
+#include "pathinfer.hpp"
 #include "win_util.hpp"
 
 namespace {
@@ -55,7 +56,7 @@ enum {
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
-       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_REMOVE };
+       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_REMOVE, MENU_TEACH, MENU_TAG_PAGE };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 
 const int kPresetSizes[3] = {96, 160, 256};
@@ -1332,6 +1333,7 @@ class ExplorerImpl {
       AppendMenuW(menu, MF_STRING, MENU_BULK_TAG, L"タグを付ける・外す(&T)...");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"この画像を解析する（最優先）(&I)");
+      AppendMenuW(menu, MF_STRING, MENU_TEACH, L"この画像のフォルダ名から作者などを読み取る形を教える(&N)...");
     } else if (it.Stack()) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"このまとまりの画像を解析する（最優先）(&I)");
@@ -1341,6 +1343,8 @@ class ExplorerImpl {
       AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, L"スキャンタスクに追加(&I)");
       AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"スキャンタスクの一番上に追加（最優先）(&P)");
       if (host->ExplorerIsRoot(it.path)) AppendMenuW(menu, MF_STRING, MENU_REMOVE_ROOT, L"調べるフォルダから外す(&X)...");
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, MENU_TEACH, L"このフォルダ名から作者などを読み取る形を教える(&N)...");
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -1362,6 +1366,9 @@ class ExplorerImpl {
       case MENU_REMOVE_ROOT:
         host->ExplorerRemoveRoot(path);
         RefreshStates();
+        break;
+      case MENU_TEACH:
+        host->ExplorerTeachFolder(it.dir ? path : path.substr(0, path.find_last_of(L"\\/")));
         break;
     }
   }
@@ -2366,6 +2373,7 @@ class ExplorerImpl {
     if (kind == L"title") return RGB(0, 125, 125);    // 本のタイトル
     if (kind == L"event") return RGB(140, 95, 30);    // イベント
     if (kind == L"page") return RGB(90, 90, 140);     // 表紙・本文・背表紙
+    if (kind == L"account") return RGB(200, 60, 120); // 作者のアカウント（pixiv の ID・X など）
     return RGB(110, 110, 110);
   }
 
@@ -2633,6 +2641,8 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, (L"コピー（" + shown + L"）(&C)").c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, MENU_TAG_RENAME, L"表示名を変える(&R)...");
+    const std::string page = t.kind == L"account" ? imgdupe::accountUrl(winutil::narrow(t.tag)) : std::string();
+    if (!page.empty()) AppendMenuW(menu, MF_STRING, MENU_TAG_PAGE, L"アカウントのページを開く(&W)");
     if (!previewTagsPath.empty()) {  // タグを出している画像
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_TAG_REMOVE, L"この画像からこのタグを外す(&X)");
@@ -2646,6 +2656,7 @@ class ExplorerImpl {
     if (cmd == MENU_TAG_COPY) CopyText(tag);
     if (cmd == MENU_TAG_RENAME) host->ExplorerRenameTag(tag);
     if (cmd == MENU_TAG_REMOVE) host->ExplorerRemoveTag(path, tag);
+    if (cmd == MENU_TAG_PAGE) ShellExecuteW(nullptr, L"open", winutil::widen(page).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   }
 
   // ---------------------------------------------------------------- 「同じ画像」

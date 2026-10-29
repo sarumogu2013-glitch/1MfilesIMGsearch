@@ -6,6 +6,7 @@
 #include <set>
 
 #include "json.hpp"
+#include "pathinfer.hpp"
 #include "platform.hpp"
 
 namespace imgdupe {
@@ -124,6 +125,7 @@ struct NamesPayload {
     bool haveSidecar = false;
     SidecarInfo sidecar;
     std::vector<TagRow> folder;
+    std::string path;
     std::string bookDir;  // 本の形のフォルダの直下の画像なら、そのフォルダ（ページの役目は store で同じフォルダの画像から決める）
 };
 
@@ -384,7 +386,9 @@ std::vector<TagRow> folderTags(const std::string& imagePath) {
     }
     // 画像のあるフォルダの名前そのもの（よくある名前・日付・数字だけのものは使わない）
     const std::string name = trim(parentName(imagePath), true);
-    if (!name.empty() && name[0] != '.' && name.size() <= 120 && !isStopName(name)) add(name, "general", kFolderTagConfidence);
+    // 作者・アカウントを読み取れる形（"名前 (pixiv 12345)" など）なら、名前そのものはタグにしない（推し量りの方で付く）
+    if (!name.empty() && name[0] != '.' && name.size() <= 120 && !isStopName(name) && inferFromName(name, "").empty())
+        add(name, "general", kFolderTagConfidence);
     return out;
 }
 
@@ -404,6 +408,7 @@ AnalyzerOutput NamesAnalyzer::analyze(const AnalyzerInput& in) {
             }
         }
     }
+    p->path = in.path;
     p->folder = folderTags(in.path);
     {
         DoujinName d;
@@ -434,6 +439,8 @@ bool NamesAnalyzer::store(Db& db, int64_t imageId, AnalyzerOutput& out) {
         if (!role.empty()) p->folder.push_back({role, "page", kSourceFolder, kDoujinTagConfidence, false});
     }
     replaceTags(db, imageId, kSourceFolder, p->folder);
+    // フォルダ名から推し量った作者・アカウント（仕上げで出した、このフォルダの前の結果。新しいフォルダは次の仕上げで付く）
+    replaceTags(db, imageId, kSourceInfer, storedInferTags(db, p->path));
     if (!p->haveSidecar) return true;
     const SidecarInfo& s = p->sidecar;
     if (!s.site.empty()) {

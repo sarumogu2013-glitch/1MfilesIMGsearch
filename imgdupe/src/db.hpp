@@ -15,7 +15,7 @@ struct sqlite3_stmt;
 namespace imgdupe {
 
 // 今のスキーマの版。テーブルを変えたら上げ、Db::open の移行処理に足す
-constexpr int kSchemaVersion = 10;
+constexpr int kSchemaVersion = 11;
 
 // 1 つの SQL 文（プリペアドステートメント）
 class Stmt {

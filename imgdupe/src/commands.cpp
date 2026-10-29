@@ -85,6 +85,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_MODELS, "AiComponents", L"AI 解析の部品(&M)...", ""},
     {CMD_RELEASES, "Releases", L"最新版のページを開く(&R)", ""},
     {CMD_HELP, "Help", L"使い方(&H)", "F1"},
+    {CMD_INFER_RULES, "InferRules", L"フォルダ名から読み取る形(&N)...", ""},
     {CMD_OPEN_LOGS, "OpenLogs", L"動作履歴（ログ）のフォルダを開く(&L)", ""},
     {CMD_ABOUT, "About", L"バージョン情報(&A)", ""},
 };

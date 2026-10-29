@@ -265,6 +265,24 @@ CREATE TABLE IF NOT EXISTS scan_tasks(
 );
 )SQL";
 
+// 版 11: フォルダ名から推し量る（pathinfer）。infer_rules: 画面で教えた形（roles はタブ区切り）。
+// infer_dirs: 画像のあるフォルダごとの結果（tags は "種類\tタグ\t確度" の行。新しい画像に段階 names で付ける）
+const char* const kSchemaV11 = R"SQL(
+CREATE TABLE IF NOT EXISTS infer_rules(
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    shape TEXT NOT NULL,
+    roles TEXT NOT NULL,
+    example TEXT,
+    created INTEGER,
+    UNIQUE(scope, shape)
+);
+CREATE TABLE IF NOT EXISTS infer_dirs(
+    dir TEXT PRIMARY KEY,
+    tags TEXT NOT NULL
+) WITHOUT ROWID;
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -383,7 +401,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         std::vector<const char*> columns;  // 無ければ足す列（ALTER TABLE は 2 回当てられないので確かめてから）
