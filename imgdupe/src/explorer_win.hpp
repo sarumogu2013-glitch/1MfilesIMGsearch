@@ -1,8 +1,8 @@
 // エクスプローラーの画面（mgview の browser.cpp「ファイルエクスプローラーモード」から移植。Windows 専用）。アプリの基本の画面。
 // 上に戻る・進む・上へ・アドレスバー・表示・並び順、その下に取り置いたタグ、左にフォルダ一覧、真ん中にサムネイル（か詳細）、
-// 右にプレビュー（画像の情報とタグ。タグをクリックで検索、ドラッグで取り置き）、下に結果の一覧（同じ画像・重複）。
+// 右にプレビュー（画像の情報とタグ。タグをクリックで検索、ドラッグで取り置き）、下にステータスバー。同じ画像・重複の結果も真ん中の一覧に出す。
 // サムネイルの右下の印で、インデックス（DB への登録）の状態を出す。
-// 右クリックの「同じ画像を探す」・画像や URL のドロップ・アドレスバーの URL で、同じ画像を探してもらう（ホストが探して SetSame で返す）。
+// 右クリックの「同じ画像を探す」・画像や URL のドロップ・アドレスバーの URL で、同じ画像を探してもらう（ホストが探して SetSame で返す。一覧に出す）。
 // 検索の結果は ShowList で真ん中に出す（「戻る」で元のフォルダへ）。
 #pragma once
 
@@ -33,6 +33,7 @@ struct ExplorerSettings {
   int previewMode = 1;      // 右のプレビュー: 0 = 画像だけ、1 = タグ、2 = プロパティ
   bool sortDesc = false;
   std::vector<std::wstring> tray;  // 取り置いたタグ
+  std::vector<std::pair<std::wstring, int>> frequent;  // よく行く場所（パスと開いた回数。起動した時に中身を先読みする）
 };
 
 // 画像のタグ（プレビューに出す）
@@ -111,15 +112,19 @@ class Explorer {
   std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）
   bool ShowingList() const;                         // 検索の結果を出している
   void RefreshStates();  // インデックスの状態を読み直す
+  void Refresh();        // 更新: 中身の控えとサムネイルを捨てて、今の場所を読み直す
+  std::vector<std::pair<std::wstring, int>> Frequent() const;  // よく行く場所（多い順。終わる時に保存する）
   void PreviewFile(const std::wstring& path);  // 一覧に無い画像をプレビューに出す（一覧で選び直すと戻る）
   void RefreshTags();    // タグの表示名が変わった
   // 真ん中に画像の一覧（検索の結果）を出す。「戻る」で前のフォルダへ。
   // entries: 1 つずつの項目。2 枚以上の束は「まとまり」（重なった絵で出し、開くと中の画像の一覧）。
   // select: 選ぶもの（entries の番号。-1 なら先頭）
   void ShowList(const std::wstring& title, std::vector<std::vector<std::wstring>> entries, int select = -1);
-  // 下の結果の一覧
+  // 下のステータスバーの文
   void SetSameStatus(const std::wstring& text);
-  void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches);
+  // 同じ画像（全部の調べたフォルダから）を真ん中の一覧に出す。original があれば先頭に置いて選ぶ
+  void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches, const std::wstring& original = L"");
+  // 重複のまとまりを真ん中の一覧に出す（まとまりは重なった絵）
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups);
   void AddTrayTag(const std::wstring& tag);
 

@@ -14,8 +14,8 @@ namespace imgdupe {
 
 enum class SortKey { Path, Created, Modified, Taken, Resolution, Size, Rating, Title, Confidence, Aesthetic, Effective, FileName, Relevance };
 
-// フリーワードの範囲: すべて（タグ・タイトルなどの文字・ファイル名）、タグに限る、タイトルに限る
-enum class FreeScope { All, Tags, Title };
+// フリーワードの範囲: すべて（タグ・タイトルなどの文字・ファイル名）、タグに限る、タイトルに限る、ファイル名に限る（フォルダは名前で別に探す）
+enum class FreeScope { All, Tags, Title, Name };
 // 日付で絞り込む時の日付
 enum class DateField { Taken, Modified, Created };
 
@@ -76,6 +76,11 @@ struct SearchResult {
 void parseTagQuery(const std::string& text, std::vector<std::string>& tags, std::vector<std::string>& exclude);
 
 SearchResult search(Db& db, const SearchQuery& q);
+
+// 画像のあるフォルダとその上のフォルダ全部（ドライブの直下は除く。区切りで終わらない。並びはパス順）
+std::vector<std::string> indexedFolders(Db& db);
+// 名前がフリーワードの語を全部含み、"-語" をどれも含まないフォルダ（大文字小文字を区別しない。名前の短い順、limit まで）
+std::vector<std::string> matchFolders(const std::vector<std::string>& folders, const std::string& freeText, size_t limit);
 
 // 一覧に出す 1 件分
 struct ImageInfo {

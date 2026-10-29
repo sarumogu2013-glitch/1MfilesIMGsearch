@@ -79,8 +79,9 @@ enum class IndexState { None = 0, Pending = 1, Indexed = 2, Partial = 3 };
 
 // フォルダ dir（区切りで終わらない）の直下のファイルの状態（名前 → Indexed（読めなかったものも）/ Pending。DB に無いものは入らない）。
 // roots と大文字小文字だけが違う時は、roots の書き方に直して探す
+// names を渡すと、その名前だけを 1 つずつ引く（ドライブの直下など、下に画像の多いフォルダで下の階層全部を読まないように）
 std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::string& dir, const std::vector<std::string>& roots,
-                                                            int hashVersion);
+                                                            int hashVersion, const std::vector<std::string>* names = nullptr);
 // フォルダの状態: roots の中なら Indexed、中に roots があれば Partial、どちらでもなければ None
 IndexState folderIndexState(const std::string& dir, const std::vector<std::string>& roots);
 // パスの画像の ID（無ければ 0）。roots と大文字小文字だけが違う・区切りが / と \ で違うものも探す

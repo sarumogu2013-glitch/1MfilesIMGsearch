@@ -157,7 +157,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
         // 語を含むタグの名前（そのまま合うもの・別名は除く。多すぎる時は 300 個まで）
         std::vector<std::string> tagNames;
         if (!words.empty() || !excludeWords.empty())
-            if (q.freeScope != FreeScope::Title) tagNames = allTagNames(db);
+            if (q.freeScope != FreeScope::Title && q.freeScope != FreeScope::Name) tagNames = allTagNames(db);
         auto partialTags = [&](const std::string& w) {
             std::vector<std::string> out;
             const auto exact = aliasesOf(db, w);
@@ -185,7 +185,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
         // 語 w に合う画像と点数の CTE を name で作る
         auto wordCte = [&](const std::string& name, const std::string& w) {
             std::vector<std::string> parts;
-            if (q.freeScope != FreeScope::Title) {
+            if (q.freeScope != FreeScope::Title && q.freeScope != FreeScope::Name) {
                 tagCte(name + "e", w);  // タグがそのまま合う（別名・確度の合成・手動の確定）
                 parts.push_back("SELECT image_id, conf AS s FROM " + name + "e");
                 // 語を含むタグ（miku → hatsune_miku）。手動で「違う」と確定したものは除く
@@ -207,7 +207,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
                     parts.push_back(sql + " GROUP BY image_id");
                 }
             }
-            if (q.freeScope != FreeScope::Tags) {
+            if (q.freeScope != FreeScope::Tags && q.freeScope != FreeScope::Name) {
                 if (charCount(w) >= 3) {
                     parts.push_back("SELECT rowid AS image_id, 1.0 AS s FROM meta_fts WHERE meta_fts MATCH ?");
                     withParams.emplace_back("title : " + ftsPhrase(w));
@@ -225,12 +225,12 @@ SearchResult search(Db& db, const SearchQuery& q) {
                         for (int k = 0; k < 4; ++k) withParams.emplace_back(w);
                     }
                 }
-                if (q.freeScope == FreeScope::All) {
-                    // ファイル名（フォルダの名前は含めない）
-                    parts.push_back("SELECT id AS image_id, 0.5 AS s FROM images WHERE instr(lower(substr(path, length(rtrim(path, "
-                                    "replace(replace(path, '\\', ''), '/', ''))) + 1)), ?)");
-                    withParams.emplace_back(lowerAscii(w));
-                }
+            }
+            if (q.freeScope == FreeScope::All || q.freeScope == FreeScope::Name) {
+                // ファイル名（フォルダの名前は含めない）
+                parts.push_back("SELECT id AS image_id, 0.5 AS s FROM images WHERE instr(lower(substr(path, length(rtrim(path, "
+                                "replace(replace(path, '\\', ''), '/', ''))) + 1)), ?)");
+                withParams.emplace_back(lowerAscii(w));
             }
             std::string u;
             for (const auto& p : parts) u += (u.empty() ? "" : " UNION ALL ") + p;
@@ -550,6 +550,52 @@ bool undoLastTagEdit(Db& db, std::string& description) {
     return true;
 }
 
+std::vector<std::string> indexedFolders(Db& db) {
+    std::set<std::string> dirs;
+    Stmt st(db.handle(), "SELECT path FROM images");
+    std::string last;
+    while (st.step()) {
+        const std::string p = st.text(0);
+        const size_t e = p.find_last_of("\\/");
+        if (e == std::string::npos) continue;
+        std::string d = p.substr(0, e);
+        if (d == last) continue;  // 同じフォルダの画像が続く
+        last = d;
+        // 上のフォルダもたどる（もうあれば、その上もある）
+        while (!d.empty() && !(d.size() == 2 && d[1] == ':') && dirs.insert(d).second) {
+            const size_t k = d.find_last_of("\\/");
+            if (k == std::string::npos || k == 0) break;
+            d = d.substr(0, k);
+            if (d.size() == 1 && (d[0] == '\\' || d[0] == '/')) break;
+        }
+    }
+    return {dirs.begin(), dirs.end()};
+}
+
+std::vector<std::string> matchFolders(const std::vector<std::string>& folders, const std::string& freeText, size_t limit) {
+    std::vector<std::string> words, exclude;
+    parseTagQuery(freeText, words, exclude);
+    for (auto& w : words) w = lowerAscii(w);
+    for (auto& w : exclude) w = lowerAscii(w);
+    std::vector<std::string> out;
+    if (words.empty()) return out;
+    for (const auto& f : folders) {
+        const size_t k = f.find_last_of("\\/");
+        const std::string name = lowerAscii(k == std::string::npos ? f : f.substr(k + 1));
+        bool ok = true;
+        for (const auto& w : words) ok = ok && name.find(w) != std::string::npos;
+        for (const auto& w : exclude) ok = ok && name.find(w) == std::string::npos;
+        if (ok) out.push_back(f);
+    }
+    // 名前が語に近い（短い）ものを先に
+    std::stable_sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        const size_t ka = a.find_last_of("\\/"), kb = b.find_last_of("\\/");
+        return a.size() - (ka == std::string::npos ? 0 : ka) < b.size() - (kb == std::string::npos ? 0 : kb);
+    });
+    if (out.size() > limit) out.resize(limit);
+    return out;
+}
+
 bool hasConditions(const SearchQuery& q) {
     return !q.freeText.empty() || !q.tags.empty() || !q.excludeTags.empty() || !q.sources.empty() || !q.excludeSources.empty() || !q.text.empty() ||
            q.minRating >= 0 || q.noRating || q.takenFrom || q.takenTo || q.noTaken || q.minWidth > 0 || q.minHeight > 0 ||
@@ -561,7 +607,7 @@ namespace {
 
 const char* const kSortNames[] = {"path", "created", "modified", "taken", "resolution", "size", "rating", "title", "confidence",
                                   "aesthetic", "effective", "filename", "relevance"};
-const char* const kScopeNames[] = {"all", "tags", "title"};
+const char* const kScopeNames[] = {"all", "tags", "title", "name"};
 const char* const kDateNames[] = {"taken", "modified", "created"};
 const char* const kQualityNames[] = {"", "good", "blurry", "soft", "lowres"};
 
@@ -658,10 +704,10 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     list("excludeSources", q.excludeSources);
     q.text = j.getString("text");
     q.freeText = j.getString("freeText");
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i)
         if (j.getString("freeScope") == kScopeNames[i]) q.freeScope = static_cast<FreeScope>(i);
+    for (int i = 0; i < 3; ++i)
         if (j.getString("dateField") == kDateNames[i]) q.dateField = static_cast<DateField>(i);
-    }
     num("minRating", q.minRating);
     flag("noRating", q.noRating);
     num("takenFrom", q.takenFrom);

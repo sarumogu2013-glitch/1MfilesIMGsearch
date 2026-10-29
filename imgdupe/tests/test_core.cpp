@@ -2660,6 +2660,12 @@ static void testSameImage() {
     CHECK(st.size() == 3 && st["1.jpg"] == IndexState::Indexed && st["7.jpg"] == IndexState::Pending && !st.count("3.png"));
     CHECK(fileIndexStates(db, "D:\\Pics\\b", roots, kHashVersion).size() == 2);  // sub の下は入らない
     CHECK(fileIndexStates(db, "D:\\Other", {}, kHashVersion).size() == 1);
+    {
+        // 名前を渡すと、その名前だけ引く（同じ結果）
+        const std::vector<std::string> names = {"1.jpg", "7.jpg", "3.png", "none.jpg"};
+        auto byName = fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion, &names);
+        CHECK(byName.size() == 2 && byName["1.jpg"] == IndexState::Indexed && byName["7.jpg"] == IndexState::Pending);
+    }
     CHECK(folderIndexState("d:\\pics\\b\\sub", roots) == IndexState::Indexed && folderIndexState("D:\\Pics", roots) == IndexState::Indexed &&
           folderIndexState("D:\\", roots) == IndexState::Partial && folderIndexState("D:\\Other", roots) == IndexState::None &&
           folderIndexState("D:\\Pictures", roots) == IndexState::None);
@@ -2747,6 +2753,20 @@ static void testFreeSearch() {
     CHECK(search(db, s).ids.size() == 2);
     SearchQuery s2;
     CHECK(queryFromJson(queryToJson(s), s2) && s2.ids == s.ids);
+    // ファイル名に限る（タグ・タイトルは見ない）
+    SearchQuery n;
+    n.freeText = "miku";
+    n.freeScope = FreeScope::Name;
+    CHECK(search(db, n).ids == std::vector<int64_t>({I("C:\\p\\miku_live.jpg")}));
+    SearchQuery n2;
+    CHECK(queryFromJson(queryToJson(n), n2) && n2.freeScope == FreeScope::Name);
+    // フォルダを名前で
+    const auto folders = indexedFolders(db);
+    CHECK(folders == std::vector<std::string>({"C:\\miku", "C:\\p"}));
+    CHECK(matchFolders(folders, "MIKU", 10) == std::vector<std::string>({"C:\\miku"}));
+    CHECK(matchFolders(folders, "miku -mi", 10).empty() && matchFolders(folders, "", 10).empty());
+    CHECK(matchFolders({"D:\\a\\ab", "D:\\a\\abcdef", "D:\\ab\\x"}, "ab", 10) ==
+          std::vector<std::string>({"D:\\a\\ab", "D:\\a\\abcdef"}));
 }
 
 static void testTagNames() {

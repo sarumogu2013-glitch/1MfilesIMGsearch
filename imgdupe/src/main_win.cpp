@@ -808,7 +808,7 @@ void showResult(Result&& r, bool query) {
     if (app.result.unreadable) s += L"　読めない画像 " + withCommas(app.result.unreadable) + L" 枚";
     if (app.result.flatSkipped) s += L"　単色に近いため比べなかった画像 " + withCommas(app.result.flatSkipped) + L" 枚";
     setText(app.status, s);
-    // 結果は、エクスプローラーの下の一覧にパスで出す（クリックでその画像を表示）
+    // 結果は、エクスプローラーの一覧に出す（まとまりは重なった絵。開くと中の画像）
     std::vector<ExplorerGroup> groups;
     for (size_t i = 0; i < app.result.groups.size(); ++i) {
         const Group& g = app.result.groups[i];
@@ -1402,7 +1402,29 @@ struct SearchDone {
     std::vector<float> scores;
     std::vector<std::wstring> paths;  // ids と同じ並び
     std::vector<std::vector<size_t>> clusters;  // 重複・差分のまとまり（ids の添字の束）
+    std::vector<std::wstring> folders;          // 名前がフリーワードに合うフォルダ（一覧の先頭に出す）
 };
+
+// インデックスのあるフォルダの一覧（フォルダを名前で探す時に使う。画像の数・一番新しい ID が変わったら作り直す）
+struct FolderNames {
+    std::mutex m;
+    std::string signature;
+    std::vector<std::string> folders;
+} folderNames;
+
+std::vector<std::string> currentFolders(Db& d) {
+    std::string sig;
+    {
+        Stmt st(d.handle(), "SELECT count(*), coalesce(max(id),0) FROM images");
+        if (st.step()) sig = std::to_string(st.i64(0)) + "/" + std::to_string(st.i64(1));
+    }
+    std::lock_guard<std::mutex> lock(folderNames.m);
+    if (folderNames.signature != sig) {
+        folderNames.folders = indexedFolders(d);
+        folderNames.signature = sig;
+    }
+    return folderNames.folders;
+}
 
 constexpr size_t kFirstResults = 2000;  // 内容（CLIP）で似ている順に出す数
 constexpr size_t kListResults = 20000;  // エクスプローラーに出す検索の結果の数（多い時は先頭だけ）
@@ -1744,9 +1766,10 @@ SearchQuery searchQueryFromUi() {
     const int scope = std::max(0, ComboBox_GetCurSel(app.s.scope));
     if (scope == 1 || scope == 3) parseTagQuery(free, q.tags, q.excludeTags);
     else q.freeText = free;
+    if (scope == 4) q.freeScope = FreeScope::Name;
     // ファイルのタグに限る（ファイルに書き込まれているタグだけ）。語が無ければ条件にしない
     if (scope == 3 && (!q.tags.empty() || !q.excludeTags.empty())) q.sources = {kSourceEmbedded};
-    q.freeScope = scope == 2 ? FreeScope::Title : FreeScope::All;
+    if (scope != 4) q.freeScope = scope == 2 ? FreeScope::Title : FreeScope::All;
     q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
     q.excludeSources.assign(app.uncheckedSources.begin(), app.uncheckedSources.end());
     q.dateField = static_cast<DateField>(std::clamp(ComboBox_GetCurSel(app.s.dateField), 0, 2));
@@ -1878,6 +1901,14 @@ void runSearch() {
             }
             // 重複・差分はまとめて出す（確認キューは 1 枚ずつ確かめるのでまとめない）
             if (!q.review) done->clusters = clusterResults(d, done->result.ids);
+            // フリーワードだけで探した時は、名前が合うフォルダも出す（すべて・ファイル名に限る）
+            SearchQuery rest = q;
+            rest.freeText.clear();
+            rest.excludeSources.clear();
+            rest.limit = 0;
+            if (!q.freeText.empty() && (q.freeScope == FreeScope::All || q.freeScope == FreeScope::Name) && !hasConditions(rest) &&
+                !done->clip && !q.review)
+                for (const auto& f : matchFolders(currentFolders(d), q.freeText, 200)) done->folders.push_back(widen(f));
         } catch (const std::exception& e) {
             done->error = widen(e.what());
         }
@@ -1913,6 +1944,8 @@ void onSearched(SearchDone* p) {
                 (app.searchTotal > app.searchIds.size() ? L"（先頭の " + withCommas(app.searchIds.size()) + L" 件を出しています）"
                  : review                               ? L"（迷っている順）"
                                                         : L"");
+    if (!done->folders.empty())
+        count = L"フォルダ " + withCommas(done->folders.size()) + L" 個・画像 " + (app.searchTotal ? count : L"0 件");
     const std::wstring from =
         app.idsFilter.empty() ? L"" : L"保存した " + withCommas(app.idsFilter.size()) + L" 枚（「条件をクリア」で外します）のうち ";
     setText(app.s.count, from + count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice));
@@ -1933,6 +1966,8 @@ void onSearched(SearchDone* p) {
         for (size_t i = 0; i < app.searchPaths.size(); ++i) clusters.push_back({i});
     std::vector<std::vector<std::wstring>> entries;
     int select = -1;
+    // 名前が合うフォルダを先頭に
+    for (const auto& f : done->folders) entries.push_back({f});
     for (const auto& c : clusters) {
         std::vector<std::wstring> members;
         for (size_t i : c) {
@@ -2205,7 +2240,7 @@ void applyQueryToUi(const SearchQuery& q) {
         ComboBox_SetCurSel(app.s.scope, fileTagsOnly ? 3 : 1);
     } else {
         SetWindowTextW(app.s.free, widen(!q.freeText.empty() ? q.freeText : q.text).c_str());
-        ComboBox_SetCurSel(app.s.scope, q.freeScope == FreeScope::Title ? 2 : 0);
+        ComboBox_SetCurSel(app.s.scope, q.freeScope == FreeScope::Title ? 2 : q.freeScope == FreeScope::Name ? 4 : 0);
     }
     const int conf = std::clamp(static_cast<int>(q.minConfidence * 100 + 0.5), 0, 100);
     SendMessageW(app.s.conf, TBM_SETPOS, TRUE, conf);
@@ -3296,6 +3331,7 @@ void markSelected(bool correct) {
 void switchTab(int t);
 
 constexpr UINT WM_STATS_DONE = WM_APP + 53;  // lParam: StatsData*
+constexpr UINT WM_STATS_PROGRESS = WM_APP + 55;  // wParam: 済んだ数、lParam: std::wstring*（今数えているもの）
 
 struct StatsData {
     StatsSummary summary;
@@ -3304,7 +3340,7 @@ struct StatsData {
 };
 
 struct StatsWindow {
-    HWND wnd = nullptr, summary = nullptr, view = nullptr, list = nullptr, note = nullptr;
+    HWND wnd = nullptr, summary = nullptr, view = nullptr, list = nullptr, note = nullptr, progress = nullptr, status = nullptr;
     std::unique_ptr<StatsData> data;
     bool done = false;
     std::wstring searchTag;  // 閉じた後に検索するタグ
@@ -3377,17 +3413,30 @@ void loadStats() {
     HWND wnd = statsWin.wnd;
     const std::wstring db = dbPath();
     std::thread([wnd, db] {
+        const ULONGLONG t0 = GetTickCount64();
         auto* p = new StatsData;
+        // 進み具合（済んだ数と、これから数えるもの）を窓に送る
+        auto step = [wnd](int done, const std::wstring& what) {
+            auto* t = new std::wstring(what);
+            if (!PostMessageW(wnd, WM_STATS_PROGRESS, static_cast<WPARAM>(done), reinterpret_cast<LPARAM>(t))) delete t;
+        };
         try {
             Db d;
             if (!d.open(narrow(db))) throw std::runtime_error(d.error());
+            step(0, L"全体の数");
             p->summary = statsSummary(d);
-            for (int i = 0; i < kStatTagViews; ++i) p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
+            for (int i = 0; i < kStatTagViews; ++i) {
+                step(i + 1, kStatViews[i]);
+                p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
+            }
+            step(kStatTagViews + 1, kStatViews[kStatTagViews]);
             p->rows[kStatTagViews] = monthlyCounts(d);
+            step(kStatTagViews + 2, kStatViews[kStatTagViews + 1]);
             p->rows[kStatTagViews + 1] = formatCounts(d);
         } catch (const std::exception& e) {
             p->error = L"集計できませんでした: " + widen(e.what());
         }
+        logs::info("統計を集計した（" + std::to_string((GetTickCount64() - t0) / 1000) + " 秒）" + (p->error.empty() ? "" : "・" + narrow(p->error)));
         if (!PostMessageW(wnd, WM_STATS_DONE, 0, reinterpret_cast<LPARAM>(p))) delete p;
     }).detach();
 }
@@ -3405,9 +3454,22 @@ void showStatsWindow() {
                     if (LOWORD(wp) == IDC_SS_VIEW && HIWORD(wp) == CBN_SELCHANGE) fillStatsList();
                     return 0;
                 case WM_CLOSE: statsWin.done = true; return 0;
+                case WM_STATS_PROGRESS: {
+                    std::unique_ptr<std::wstring> what(reinterpret_cast<std::wstring*>(lp));
+                    if (h != statsWin.wnd) return 0;
+                    const int total = kStatTagViews + 3;
+                    const int pct = static_cast<int>(wp) * 100 / total;
+                    SendMessageW(statsWin.progress, PBM_SETPOS, pct, 0);
+                    setText(statsWin.status, L"集計しています " + std::to_wstring(pct) + L"%（" + *what + L"を数えています　" +
+                                                 std::to_wstring(wp + 1) + L" / " + std::to_wstring(total) + L"）");
+                    return 0;
+                }
                 case WM_STATS_DONE: {
                     std::unique_ptr<StatsData> p(reinterpret_cast<StatsData*>(lp));
                     if (h != statsWin.wnd) return 0;  // 閉じた後に届いた
+                    SendMessageW(statsWin.progress, PBM_SETPOS, 100, 0);
+                    ShowWindow(statsWin.progress, SW_HIDE);
+                    setText(statsWin.status, p->error.empty() ? L"集計しました" : L"");
                     setText(statsWin.summary, p->error.empty() ? statsSummaryText(p->summary) : p->error);
                     statsWin.data = std::move(p);
                     fillStatsList();
@@ -3504,6 +3566,11 @@ void showStatsWindow() {
     }
     w.note = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, y + listH + px(4), cw - 2 * m, noteH);
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, cw - m - bw, ch - m - bh, bw, bh);
+    // 集計の進み具合（済んだら棒は隠す）
+    w.progress = child(PROGRESS_CLASSW, L"", PBS_SMOOTH, -1, m, ch - m - bh + px(6), px(200), bh - px(12));
+    SendMessageW(w.progress, PBM_SETRANGE32, 0, 100);
+    w.status = child(WC_STATICW, L"集計しています 0%", SS_NOPREFIX | SS_ENDELLIPSIS | SS_CENTERIMAGE, -1, m + px(210), ch - m - bh,
+                     cw - 2 * m - bw - px(220), bh);
     loadStats();
 
     EnableWindow(app.hwnd, FALSE);
@@ -4265,6 +4332,7 @@ constexpr UINT WM_SAME_DONE = WM_APP + 54;  // lParam: SameDone*
 struct SameDone {
     unsigned gen = 0;
     std::wstring title, error;
+    std::wstring original;  // 探した元の画像（一覧の先頭に出す。一時ファイルなら空）
     std::vector<ExplorerMatch> matches;
 };
 
@@ -4286,6 +4354,7 @@ void findSameAsync(const std::wstring& path, const std::wstring& title, bool sel
         auto* r = new SameDone;
         r->gen = gen;
         r->title = title;
+        if (!deleteAfter) r->original = path;
         try {
             SameQuery q;
             q.f = imgwin::decodeFeatures(path);
@@ -4331,7 +4400,7 @@ void onSameDone(SameDone* p) {
     std::unique_ptr<SameDone> r(p);
     if (r->gen != ex.gen || !ex.view) return;  // もう別の画像を探している
     if (!r->error.empty()) ex.view->SetSameStatus(r->title + L"　" + r->error);
-    else ex.view->SetSame(r->title, std::move(r->matches));
+    else ex.view->SetSame(r->title, std::move(r->matches), r->original);
 }
 
 void ExplorerApp::ExplorerOpen(const std::wstring& path) { openPath(path); }
@@ -4452,8 +4521,8 @@ void ExplorerApp::ExplorerDropTag(const std::wstring& tag, POINT screen) {
     while (!text.empty() && text.back() == L' ') text.pop_back();
     text += (text.empty() ? L"" : L" ") + tag;
     SetWindowTextW(app.s.free, text.c_str());
-    // 「タイトルに限る」ではタグに合わないので、「すべて」にする
-    if (ComboBox_GetCurSel(app.s.scope) == 2) ComboBox_SetCurSel(app.s.scope, 0);
+    // 「タイトルに限る」「ファイル名・フォルダ名に限る」ではタグに合わないので、「すべて」にする
+    if (ComboBox_GetCurSel(app.s.scope) == 2 || ComboBox_GetCurSel(app.s.scope) == 4) ComboBox_SetCurSel(app.s.scope, 0);
     SetFocus(app.s.free);
     SendMessageW(app.s.free, EM_SETSEL, text.size(), text.size());
 }
@@ -4667,12 +4736,21 @@ ExplorerSettings loadExplorerSettings() {
     s.sortKey = get(L"sortKey", s.sortKey);
     s.sortDesc = get(L"sortDesc", 0) != 0;
     s.previewMode = std::clamp(get(L"previewMode", s.previewMode), 0, 2);
-    std::string tray;
+    std::string tray, frequent;
     if (Db* db = uiDb()) {
         try {
             tray = db->setting("explorer:tray");
+            frequent = db->setting("explorer:frequent");
         } catch (const std::exception&) {
         }
+    }
+    for (size_t a = 0; a < frequent.size();) {
+        size_t b = frequent.find('\n', a);
+        if (b == std::string::npos) b = frequent.size();
+        const std::string line = frequent.substr(a, b - a);
+        const size_t t = line.find('\t');
+        if (t != std::string::npos) s.frequent.emplace_back(widen(line.substr(t + 1)), std::atoi(line.c_str()));
+        a = b + 1;
     }
     for (size_t a = 0; a < tray.size();) {
         size_t b = tray.find('\t', a);
@@ -4692,7 +4770,11 @@ std::vector<int> ExplorerApp::ExplorerStates(const std::wstring& dir, const std:
     std::unordered_map<std::string, IndexState> files;
     if (Db* db = uiDb()) {
         try {
-            files = fileIndexStates(*db, d, roots, kHashVersion);
+            // 画像が少なければ名前で 1 つずつ引く（ドライブの直下などで、下の階層の全部の画像を読まない）
+            std::vector<std::string> names;
+            for (const auto& [name, isDir] : items)
+                if (!isDir && imgdupe::isImageExt(narrow(name))) names.push_back(narrow(name));
+            files = fileIndexStates(*db, d, roots, kHashVersion, names.size() <= 5000 ? &names : nullptr);
         } catch (const std::exception&) {
         }
     }
@@ -4718,8 +4800,28 @@ std::vector<int> ExplorerApp::ExplorerStates(const std::wstring& dir, const std:
     return out;
 }
 
+// 更新: 画面の控えを捨てて今の場所を読み直す（DB の接続・画像の情報・タグの表示名も読み直す）。バックグラウンドの解析はしない
+void refreshView() {
+    app.infoCache.clear();
+    app.uiDb.reset();  // 次に使う時に開き直す
+    loadTagLabels();
+    if (ex.view) ex.view->Refresh();
+    if (ex.view) ex.view->SetSameStatus(L"更新しました（バックグラウンドの解析はしていません。新しいファイルのインデックスは、タスクトレイの解析が作ります）");
+    logs::info("更新した");
+}
+
 void saveExplorerDir() {
     if (ex.view && !ex.view->Dir().empty()) WritePrivateProfileStringW(L"Explorer", L"dir", ex.view->Dir().c_str(), iniPath().c_str());
+    // よく行く場所（"回数\tパス" の行）。ini はシステムの文字コードなので DB に持つ
+    if (ex.view)
+        if (Db* db = uiDb()) {
+            std::string text;
+            for (const auto& [d, n] : ex.view->Frequent()) text += std::to_string(n) + "\t" + narrow(d) + "\n";
+            try {
+                db->setSetting("explorer:frequent", text);
+            } catch (const std::exception&) {
+            }
+        }
 }
 
 // 最初に開くフォルダ: 前回のフォルダ、無ければ調べるフォルダの 1 つ目、無ければピクチャ
@@ -4795,7 +4897,7 @@ void layoutSearch(int y, int W) {
     };
     const int freeW = std::clamp(W / 3, px(240), px(560));
     put(app.s.free, freeW);
-    put(app.s.scope, px(120), px(200));
+    put(app.s.scope, px(170), px(200));
     put(app.s.go, px(64));
     x += px(10);
     lbl(app.s.lSort, px(58));
@@ -4900,7 +5002,7 @@ void createSearchControls() {
     // 1 段目: フリーワード・範囲・検索・並べ替え・詳細検索・クリア
     app.s.free = edit(IDC_S_FREE, sp);
     SendMessageW(app.s.free, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"フリーワード（空白で区切る。-語 で除く）"));
-    app.s.scope = combo(IDC_S_SCOPE, sp, {L"すべて", L"タグに限る", L"タイトルに限る", L"ファイルのタグに限る"});
+    app.s.scope = combo(IDC_S_SCOPE, sp, {L"すべて", L"タグに限る", L"タイトルに限る", L"ファイルのタグに限る", L"ファイル名・フォルダ名に限る"});
     app.s.go = button(L"検索", IDC_S_GO, sp, BS_DEFPUSHBUTTON);
     app.s.lSort = label(L"並べ替え", sp);
     app.s.sort = combo(IDC_S_SORT, sp, {L"関連度", L"ファイル名", L"パス", L"更新日時", L"作成日時", L"撮影日時", L"解像度", L"ファイルサイズ",
@@ -4990,8 +5092,9 @@ void createSearchControls() {
     const std::pair<HWND, const wchar_t*> tips[] = {
         {app.s.free, L"タグ・タイトル・ファイル名などから探す語。空白で区切るとすべてを含むもの、-語 でその語を含むものを除きます"},
         {app.s.scope,
-         L"フリーワードで探す所（すべて / タグだけ / タイトルだけ / ファイルのタグだけ）。"
-         L"「ファイルのタグに限る」は、画像のファイルに書き込まれているタグ（Windows のエクスプローラーのタグなど）だけで探します"},
+         L"フリーワードで探す所（すべて / タグだけ / タイトルだけ / ファイルのタグだけ / ファイル名とフォルダ名だけ）。"
+         L"「ファイルのタグに限る」は、画像のファイルに書き込まれているタグ（Windows のエクスプローラーのタグなど）だけで探します。"
+         L"「すべて」と「ファイル名・フォルダ名に限る」では、名前が合うフォルダも結果の先頭に出します（開くとそのフォルダへ）"},
         {app.s.go, L"今の条件で探して、結果をエクスプローラーに出します（Enter）"},
         {app.s.sort, L"結果の並べ方"},
         {app.s.desc, L"チェックすると逆の順（大きい・新しいものから）に並べます"},
@@ -5191,7 +5294,7 @@ void loadSearchSettings() {
     wchar_t buf[4096];
     GetPrivateProfileStringW(L"Search", L"free", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.free, buf);
-    ComboBox_SetCurSel(app.s.scope, std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"scope", 0, iniPath().c_str())), 0, 3));
+    ComboBox_SetCurSel(app.s.scope, std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"scope", 0, iniPath().c_str())), 0, 4));
     GetPrivateProfileStringW(L"Search", L"clip", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.clip, buf);
     const int conf = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"confidence", 50, iniPath().c_str())), 0, 100);
@@ -5540,7 +5643,7 @@ std::wstring querySelected() {
 
 void querySame() {
     const std::wstring p = querySelected();
-    if (!p.empty()) ex.ExplorerFindSameFile(p);  // 結果は下の「同じ画像」の一覧
+    if (!p.empty()) ex.ExplorerFindSameFile(p);  // 結果はエクスプローラーの一覧に出す
 }
 
 struct QueryVector {
@@ -5841,6 +5944,7 @@ const ToolButton kToolButtons[] = {
     {CMD_OPEN, 0xE8E5, L"開", L"開く", false},
     {CMD_EXPLORER, 0xE838, L"場", L"場所を表示", false},
     {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
+    {CMD_REFRESH, 0xE72C, L"新", L"更新", true},
     {0, 0, nullptr, nullptr, false},
     {CMD_FIND_SAME, 0xE71E, L"同", L"同じ画像を探す", true},
     {0, 0, nullptr, nullptr, false},
@@ -5968,7 +6072,7 @@ void createControls() {
     resetView(kDupView, 0);
 
     app.info = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_INFO);
-    // 結果は下の一覧（重複）とエクスプローラーに出すので、前の画面の一覧と情報欄は使わない
+    // 結果はエクスプローラーの一覧に出すので、前の画面の一覧と情報欄は使わない
     for (HWND h : {app.groups, app.thumbs, app.info}) ShowWindow(h, SW_HIDE);
     // 調べるフォルダの一覧は見せない（中身の入れ物としてだけ使う。足す・外すはホームとファイルのメニュー）
     for (HWND h : {app.foldersLabel, app.folders}) ShowWindow(h, SW_HIDE);
@@ -6000,7 +6104,9 @@ const wchar_t* commandHelp(int id) {
         case CMD_OPEN: return L"選んだ画像・ファイルを、関連付けられたアプリで開きます（Enter）";
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
-        case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べるフォルダの中から探して下に一覧にします（Ctrl+M）";
+        case CMD_REFRESH: return L"画面の控え（フォルダの中身・サムネイル・画像の情報）を捨てて、今の場所を読み直します。移動したファイルが残っている時など（Ctrl+F5）。"
+                                 L"バックグラウンドの解析はしません（要る時はタスクトレイの解析から）";
+        case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、今いるフォルダに関係なく調べた全部のフォルダから探して一覧に出します（Ctrl+M）";
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
         case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
         case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
@@ -6015,7 +6121,7 @@ const wchar_t* commandHelp(int id) {
             return L"クリップボードの画像（スクリーンショット・ブラウザーでコピーした画像）、コピーした画像のファイル、画像の URL を足します（Ctrl+Shift+V）";
         case CMD_QUERY_OPEN: return L"画像のファイルを選んで足します";
         case CMD_QUERY_URL: return L"画像の URL を入れて、ダウンロードして足します";
-        case CMD_QUERY_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べるフォルダの中から探して下に一覧にします";
+        case CMD_QUERY_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べた全部のフォルダから探してエクスプローラーの一覧に出します";
         case CMD_QUERY_SIMILAR:
             return L"選んだ画像に似た画像を AI（CLIP）で探して、エクスプローラーに似ている順に出します（検索のリボンの条件も使います）";
         case CMD_QUERY_TAGS: return L"選んだ画像に AI（WD14 タガー）でタグを付けて、右に出します（ファイルにも DB にも書きません）";
@@ -6135,7 +6241,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
+    popup(L"表示(&V)", {CMD_REFRESH, 0, CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
@@ -6463,6 +6569,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case CMD_LINKS: showLinksWindow(); break;
                 case CMD_STATS: showStatsWindow(); break;
+                case CMD_REFRESH: refreshView(); break;
                 case CMD_INFER_RULES: teachFolderUi(L""); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
@@ -6930,6 +7037,31 @@ int runIndexCli(int argc, wchar_t** argv) {
 
 }  // namespace
 
+// タブの見出しの上でホイールを回したら、タブを移る（上へ回すと左、下へ回すと右。端で止まる）。
+// タブの下のリボンの部分では移らない。移ったら true
+bool wheelOnTabs(POINT screen, int delta) {
+    if (!app.tabs || !delta || !IsWindowVisible(app.tabs)) return false;
+    const HWND under = WindowFromPoint(screen);
+    if (under != app.tabs && under != app.hwnd) return false;  // 見出しの右の空いた所は親の窓のこともある
+    POINT pt = screen;
+    ScreenToClient(app.tabs, &pt);
+    RECT client;
+    GetClientRect(app.tabs, &client);
+    // 見出しの帯（どの見出しの四角とも同じ高さ。見出しの右の空いた所も含める）
+    RECT item{};
+    if (!TabCtrl_GetItemRect(app.tabs, 0, &item)) return false;
+    if (pt.x < client.left || pt.y < 0 || pt.y >= item.bottom) return false;  // 右は窓の端まで（見出しの右の空いた所も）
+    static int rest = 0;  // 細かく回すマウス（高精度のホイール）の分を貯める
+    rest += delta;
+    if (std::abs(rest) < WHEEL_DELTA) return true;
+    const int steps = rest / WHEEL_DELTA;
+    rest -= steps * WHEEL_DELTA;
+    const int count = static_cast<int>(std::size(kTabOrder));
+    const int pos = std::clamp(tabPos(app.tab) - steps, 0, count - 1);
+    if (kTabOrder[pos] != app.tab) switchTab(kTabOrder[pos]);
+    return true;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     app.inst = inst;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -7049,6 +7181,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         // ホイールは、カーソルの下の日付の欄に送る（Windows の設定によってはフォーカスのある部品に行くので）
         if (msg.message == WM_MOUSEWHEEL) {
             POINT pt{GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam)};
+            if (wheelOnTabs(pt, GET_WHEEL_DELTA_WPARAM(msg.wParam))) continue;
             HWND under = WindowFromPoint(pt);
             if (under && (under == app.s.from || under == app.s.to) && under != msg.hwnd) {
                 SendMessageW(under, WM_MOUSEWHEEL, msg.wParam, msg.lParam);

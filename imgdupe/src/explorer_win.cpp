@@ -49,6 +49,7 @@ constexpr wchar_t kViewBarClass[] = L"imgdupe_explorer_viewbar";
 constexpr wchar_t kCrumbClass[] = L"imgdupe_explorer_crumbs";
 const wchar_t kListMarker[] = L"\x01list";  // 戻るの履歴で「検索の結果」を表す
 constexpr UINT WM_THUMB_DONE = WM_APP + 41;  // lParam = ThumbResult*
+constexpr UINT WM_PREFETCHED = WM_APP + 42;  // よく行く場所の中身を先読みした
 constexpr UINT_PTR kStateTimer = 1;
 enum {
   ID_UP = 1, ID_PATH, ID_SIZE, ID_SLIDER, ID_FOLDER, ID_SIZE_LABEL, ID_FOLDER_LABEL,
@@ -112,7 +113,8 @@ struct ThumbJob {
   int bucket = 0;
   int style = 0;
   unsigned gen = 0;
-  bool preview = false;  // プレビュー用 (大きい)
+  bool preview = false;   // プレビュー用 (大きい)
+  bool prefetch = false;  // よく行く場所の先読み (見えているものより後に)
 };
 
 // 読んだ画素 (32bpp PBGRA、向きは直してある)
@@ -167,6 +169,19 @@ void ListDir(const std::wstring& dir, std::vector<std::wstring>* subdirs, std::v
   FindClose(h);
   if (subdirs) std::sort(subdirs->begin(), subdirs->end(), NaturalLess);
   if (images) std::sort(images->begin(), images->end(), NaturalLess);
+}
+
+// フォルダの更新日時（中のファイルを足す・消す・名前を変えると変わる）。読めなければ 0
+uint64_t DirStamp(const std::wstring& dir) {
+  WIN32_FILE_ATTRIBUTE_DATA a = {};
+  if (!GetFileAttributesExW(dir.c_str(), GetFileExInfoStandard, &a)) return 0;
+  return (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+}
+
+std::wstring DirKey(std::wstring d) {
+  while (d.size() > 3 && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+  if (!d.empty()) CharLowerBuffW(&d[0], DWORD(d.size()));
+  return d;
 }
 
 // フォルダのサムネイルにする画像: そのフォルダの画像。無ければ下の階層を名前順に探して最初に見つかったフォルダのもの
@@ -427,7 +442,7 @@ class ExplorerImpl {
   HWND backBtn = nullptr, forwardBtn = nullptr, treeBtn = nullptr, previewBtn = nullptr;
   HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
-  HWND sameText = nullptr, sameView = nullptr, sameList = nullptr;
+  HWND sameText = nullptr;  // 下のステータスバー（同じ画像を探した結果の数などを出す）
   DropTarget* drop = nullptr;
   // 戻る・進むの履歴 (フォルダと、そこで選んでいたもの)
   std::vector<std::pair<std::wstring, std::wstring>> backStack, forwardStack;
@@ -469,23 +484,6 @@ class ExplorerImpl {
   int scrollY = 0;
   bool tracking = false;
 
-  // 「同じ画像」
-  std::wstring sameTitle;
-  std::vector<ExplorerMatch> same;
-  struct SameFolderRow {
-    std::wstring folder;
-    int exact = 0, similar = 0;
-    std::wstring first;  // 最初の一致
-  };
-  std::vector<SameFolderRow> sameFolders;
-  // 重複のまとまり (下の一覧の行: 見出しか、パス)
-  int resultsMode = 0;  // 0 = 同じ画像、1 = 重複
-  struct GroupRow {
-    bool header = false;
-    std::wstring text, path;
-  };
-  std::vector<GroupRow> groupRows;
-  bool fillingList = false;
 
   // サムネイル
   std::map<std::wstring, Thumb> cache;
@@ -500,7 +498,21 @@ class ExplorerImpl {
   bool quit = false;
   std::atomic<unsigned> gen{1};
 
+  // フォルダの中身の控え（よく行く場所・最近の場所）。フォルダの更新日時が同じで 30 分以内なら読み直さない
+  struct Listing {
+    uint64_t stamp = 0;
+    ULONGLONG at = 0;
+    std::vector<Item> items;
+  };
+  std::mutex listingMu;
+  std::map<std::wstring, Listing> listings;  // DirKey → 中身
+  std::map<std::wstring, std::pair<std::wstring, int>> visits;  // DirKey → (パス, 開いた回数)
+  std::thread prefetcher;
+  std::atomic<bool> prefetchQuit{false};
+
   ~ExplorerImpl() {
+    prefetchQuit = true;
+    if (prefetcher.joinable()) prefetcher.join();
     {
       std::lock_guard<std::mutex> lk(mu);
       quit = true;
@@ -650,10 +662,7 @@ class ExplorerImpl {
     banding = false;
     scrollY = 0;
     gen++;
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      queue.clear();
-    }
+    DropQueued();
     auto addItem = [&](const std::vector<std::wstring>& members, int entry) {
       const std::wstring& p = members.front();
       Item it;
@@ -663,12 +672,18 @@ class ExplorerImpl {
       it.order = items.size();
       it.entry = entry;
       if (members.size() > 1) it.members = members;
+      it.state = kStateIndexed;  // 検索の結果は DB の画像
       WIN32_FILE_ATTRIBUTE_DATA a = {};
       if (GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) {
         it.mtime = (uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
         it.size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+        if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {  // 名前で見つかったフォルダ（開くとそのフォルダへ）
+          it.dir = true;
+          it.image = false;
+          it.size = 0;
+          it.state = kStateNoBadge;
+        }
       }
-      it.state = kStateIndexed;  // 検索の結果は DB の画像
       items.push_back(std::move(it));
     };
     if (stackIndex >= 0 && stackIndex < int(listEntries.size())) {
@@ -676,6 +691,11 @@ class ExplorerImpl {
     } else {
       stackIndex = -1;
       for (size_t e = 0; e < listEntries.size(); e++) addItem(listEntries[e], int(e));
+    }
+    if (sameText) {
+      std::wstring t = listTitle;
+      if (stackIndex >= 0) t += L"　（まとまりの中: " + std::to_wstring(items.size()) + L" 枚）";
+      SetWindowTextW(sameText, t.c_str());
     }
     SortItems();
     // 選ぶもの: そのパスの項目。まとまりの中にあれば、そのまとまり
@@ -726,6 +746,181 @@ class ExplorerImpl {
     LoadList(std::wstring());
   }
 
+  // 下のステータスバーに、今のフォルダの中の数
+  void ShowCounts() {
+    if (!sameText) return;
+    size_t dirs = 0, images = 0;
+    for (const auto& it : items) {
+      if (it.dir) ++dirs;
+      else if (it.image) ++images;
+    }
+    const size_t others = items.size() - dirs - images;
+    std::wstring t = L"フォルダ " + std::to_wstring(dirs) + L" 個・画像 " + std::to_wstring(images) + L" 枚";
+    if (others) t += L"・ほかのファイル " + std::to_wstring(others) + L" 個";
+    t += L"　　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部";
+    SetWindowTextW(sameText, t.c_str());
+  }
+
+  // 頼んであるサムネイルを捨てる（よく行く場所の先読みは残す）
+  void DropQueued() {
+    std::lock_guard<std::mutex> lk(mu);
+    queue.erase(std::remove_if(queue.begin(), queue.end(), [](const ThumbJob& q) { return !q.prefetch; }), queue.end());
+  }
+
+  // フォルダの中身を読む（隠しファイルは除く。並びは読んだ順）
+  static void ReadDir(const std::wstring& d, std::vector<Item>& out) {
+    out.clear();
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(Join(d, L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+      if (IsHidden(fd)) continue;
+      Item it;
+      it.name = fd.cFileName;
+      it.path = Join(d, it.name);
+      it.dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      it.image = !it.dir && IsSupportedImage(it.name);
+      it.mtime = (uint64_t(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+      it.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+      it.order = out.size();
+      out.push_back(std::move(it));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+
+  bool CachedListing(const std::wstring& d, std::vector<Item>& out) {
+    const uint64_t stamp = DirStamp(d);
+    if (!stamp) return false;
+    std::lock_guard<std::mutex> lk(listingMu);
+    auto it = listings.find(DirKey(d));
+    if (it == listings.end() || it->second.stamp != stamp || GetTickCount64() - it->second.at > 30ull * 60 * 1000) return false;
+    out = it->second.items;
+    for (auto& x : out) x.picked = false;
+    return true;
+  }
+
+  void StoreListing(const std::wstring& d, const std::vector<Item>& v, uint64_t stamp) {
+    if (!stamp) return;
+    std::lock_guard<std::mutex> lk(listingMu);
+    Listing& l = listings[DirKey(d)];
+    l.stamp = stamp;
+    l.at = GetTickCount64();
+    l.items = v;
+    // 多すぎたら古く読んだものから捨てる
+    while (listings.size() > 48) {
+      auto oldest = listings.begin();
+      for (auto it = listings.begin(); it != listings.end(); ++it)
+        if (it->second.at < oldest->second.at) oldest = it;
+      listings.erase(oldest);
+    }
+  }
+
+  void CountVisit(const std::wstring& d) {
+    auto& v = visits[DirKey(d)];
+    v.first = d;
+    v.second++;
+  }
+
+  // よく行く場所（開いた回数の多い順）
+  std::vector<std::pair<std::wstring, int>> Frequent(size_t n) const {
+    std::vector<std::pair<std::wstring, int>> out;
+    for (const auto& [k, v] : visits) out.push_back(v);
+    std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (out.size() > n) out.resize(n);
+    return out;
+  }
+
+  // 起動した時に、よく行く場所とそのドライブの直下の中身を先に読んでおく（別のスレッドで。済んだらサムネイルも少し先に作る）
+  void StartPrefetch() {
+    std::vector<std::wstring> targets;
+    auto add = [&](const std::wstring& d) {
+      for (const auto& t : targets)
+        if (DirKey(t) == DirKey(d)) return;
+      targets.push_back(d);
+    };
+    const auto freq = Frequent(12);
+    for (const auto& [d, n] : freq)
+      if (d.size() >= 3 && d[1] == L':') add(d.substr(0, 3));  // ドライブの直下
+    for (const auto& [d, n] : freq) add(d);
+    if (targets.empty()) return;
+    prefetcher = std::thread([this, targets] {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+      for (const auto& d : targets) {
+        if (prefetchQuit) return;
+        const uint64_t stamp = DirStamp(d);
+        if (!stamp) continue;
+        std::vector<Item> v;
+        ReadDir(d, v);
+        StoreListing(d, v, stamp);
+      }
+      if (!prefetchQuit) PostMessageW(hwnd, WM_PREFETCHED, 0, 0);
+    });
+  }
+
+  // 先読みしたフォルダの項目のサムネイルを、見えているものの後に頼む（少しだけ）
+  void QueuePrefetchThumbs() {
+    if (!grid) return;
+    const int bucket = BucketFor(ThumbSize());
+    std::vector<ThumbJob> jobs;
+    {
+      std::lock_guard<std::mutex> lk(listingMu);
+      size_t dirs = 0;
+      for (const auto& [d, n] : Frequent(12)) {
+        std::wstring key = DirKey(d);
+        std::wstring root = d.size() >= 3 && d[1] == L':' ? DirKey(d.substr(0, 3)) : key;
+        for (const std::wstring& k : {root, key}) {
+          auto it = listings.find(k);
+          if (it == listings.end()) continue;
+          for (const auto& item : it->second.items) {
+            if (!item.Thumbable() || jobs.size() >= 300) break;
+            if (cache.count(item.path)) continue;
+            ThumbJob j{item.path, item.dir, bucket, settings.folderStyle, gen.load()};
+            j.prefetch = true;
+            jobs.push_back(j);
+          }
+        }
+        if (++dirs >= 4) break;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      for (auto& j : jobs)
+        if (!inflight.count(JobKey(j))) queue.push_back(j);
+    }
+    cv.notify_all();
+  }
+
+  // 更新: 中身の控え・サムネイルを捨てて、今の場所を読み直す（検索の結果なら、無くなったファイルを除く）。バックグラウンドの解析はしない
+  void Refresh() {
+    {
+      std::lock_guard<std::mutex> lk(listingMu);
+      listings.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      queue.clear();
+    }
+    for (auto& kv : cache) kv.second.Free();
+    cache.clear();
+    lru.clear();
+    cacheBytes = 0;
+    const std::wstring select = SelectedPath();
+    const int keepScroll = scrollY;
+    if (listMode) {
+      for (auto& e : listEntries)
+        e.erase(std::remove_if(e.begin(), e.end(), [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES; }),
+                e.end());
+      listEntries.erase(std::remove_if(listEntries.begin(), listEntries.end(), [](const auto& e) { return e.empty(); }), listEntries.end());
+      if (stackIndex >= int(listEntries.size())) stackIndex = -1;
+      LoadList(select);
+    } else if (!dir.empty()) {
+      Load(dir, select);
+    }
+    ScrollTo(keepScroll);
+    EnsureVisible(sel);
+    UpdatePreview(true);
+  }
+
   void Load(const std::wstring& d, const std::wstring& select) {
     if (d.compare(0, wcslen(kListMarker), kListMarker) == 0) {
       // 結果の一覧か、その中のまとまり (印の後ろに番号)
@@ -745,28 +940,14 @@ class ExplorerImpl {
     banding = false;
     scrollY = 0;
     gen++;
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      queue.clear();
+    DropQueued();
+    if (!CachedListing(dir, items)) {
+      const uint64_t stamp = DirStamp(dir);  // 読む前の日時（読んでいる間に変われば、次は読み直す）
+      ReadDir(dir, items);
+      StoreListing(dir, items, stamp);
     }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW(Join(dir, L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
-                                FIND_FIRST_EX_LARGE_FETCH);
-    if (h != INVALID_HANDLE_VALUE) {
-      do {
-        if (IsHidden(fd)) continue;
-        Item it;
-        it.name = fd.cFileName;
-        it.path = Join(dir, it.name);
-        it.dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        it.image = !it.dir && IsSupportedImage(it.name);
-        it.mtime = (uint64_t(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
-        it.size = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
-        it.order = items.size();
-        items.push_back(std::move(it));
-      } while (FindNextFileW(h, &fd));
-      FindClose(h);
-    }
+    CountVisit(dir);
+    ShowCounts();
     SortItems();
     for (int i = 0; i < int(items.size()); i++) {
       if (!select.empty() && _wcsicmp(items[i].path.c_str(), select.c_str()) == 0) sel = i;
@@ -1559,11 +1740,12 @@ class ExplorerImpl {
     }
     {
       std::lock_guard<std::mutex> lk(mu);
-      // 見えなくなったものは後回し (また見えたら頼む)。プレビューは残す
-      queue.erase(std::remove_if(queue.begin(), queue.end(), [](const ThumbJob& q) { return !q.preview; }), queue.end());
+      // 見えなくなったものは後回し (また見えたら頼む)。プレビューと先読みは残し、見えているものは先読みより前に
+      queue.erase(std::remove_if(queue.begin(), queue.end(), [](const ThumbJob& q) { return !q.preview && !q.prefetch; }), queue.end());
+      auto at = std::find_if(queue.begin(), queue.end(), [](const ThumbJob& q) { return q.prefetch; });
       for (auto& j : jobs) {
         if (inflight.count(JobKey(j))) continue;
-        queue.push_back(j);
+        at = queue.insert(at, j) + 1;
       }
     }
     cv.notify_all();
@@ -2659,168 +2841,60 @@ class ExplorerImpl {
     if (cmd == MENU_TAG_PAGE) ShellExecuteW(nullptr, L"open", winutil::widen(page).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   }
 
-  // ---------------------------------------------------------------- 「同じ画像」
+  // ---------------------------------------------------------------- 「同じ画像」・重複の結果（真ん中の一覧に出す）
 
-  void FillSameList() {
-    fillingList = true;
-    ShowWindow(sameView, resultsMode == 0 ? SW_SHOW : SW_HIDE);
-    SendMessageW(sameList, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(sameList);
-    while (Header_GetItemCount(ListView_GetHeader(sameList)) > 0) ListView_DeleteColumn(sameList, 0);
-    auto column = [&](int i, const wchar_t* title, int width, int fmt) {
-      LVCOLUMNW c = {};
-      c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
-      c.fmt = fmt;
-      c.cx = Px(width);
-      c.pszText = const_cast<wchar_t*>(title);
-      ListView_InsertColumn(sameList, i, &c);
-    };
-    auto add = [&](int row, std::initializer_list<std::wstring> cells) {
-      int col = 0;
-      for (const auto& s : cells) {
-        std::wstring text = s;
-        if (col == 0) {
-          LVITEMW li = {};
-          li.mask = LVIF_TEXT;
-          li.iItem = row;
-          li.pszText = text.data();
-          ListView_InsertItem(sameList, &li);
-        } else {
-          ListView_SetItemText(sameList, row, col, text.data());
-        }
-        col++;
-      }
-    };
-    if (resultsMode == 1) {
-      column(0, L"重複（パスをクリックすると、エクスプローラーで表示します）", 900, LVCFMT_LEFT);
-      for (size_t i = 0; i < groupRows.size(); i++)
-        add(int(i), {groupRows[i].header ? L"■ " + groupRows[i].text : L"　　" + groupRows[i].path});
-    } else if (settings.resultsView == 1) {
-      column(0, L"フォルダ", 520, LVCFMT_LEFT);
-      column(1, L"完全一致", 80, LVCFMT_RIGHT);
-      column(2, L"見た目一致", 90, LVCFMT_RIGHT);
-      for (size_t i = 0; i < sameFolders.size(); i++) {
-        const auto& f = sameFolders[i];
-        add(int(i), {f.folder, std::to_wstring(f.exact), std::to_wstring(f.similar)});
-      }
-    } else {
-      column(0, L"一致", 110, LVCFMT_LEFT);
-      column(1, L"名前", 220, LVCFMT_LEFT);
-      column(2, L"フォルダ", 360, LVCFMT_LEFT);
-      column(3, L"大きさ", 80, LVCFMT_RIGHT);
-      column(4, L"解像度", 100, LVCFMT_RIGHT);
-      for (size_t i = 0; i < same.size(); i++) {
-        const auto& m = same[i];
-        std::wstring kind = m.exact ? L"完全一致" : L"見た目 (距離 " + std::to_wstring(m.distance) + L")";
-        std::wstring res = m.width > 0 ? std::to_wstring(m.width) + L" × " + std::to_wstring(m.height) : L"";
-        add(int(i), {kind, NameOf(m.path), FolderOf(m.path), FormatBytes(m.size), res});
-      }
-    }
-    SendMessageW(sameList, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(sameList, nullptr, TRUE);
-    fillingList = false;
-  }
-
+  // 重複のまとまりを一覧に（まとまりは重なった絵で出し、開くと中の画像）。まとまりが 1 つなら中の画像をそのまま並べる
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups) {
-    resultsMode = 1;
-    groupRows.clear();
     size_t paths = 0;
+    std::vector<std::vector<std::wstring>> entries;
     for (auto& g : groups) {
-      groupRows.push_back({true, g.title, L""});
-      for (auto& p : g.paths) groupRows.push_back({false, L"", p});
       paths += g.paths.size();
+      if (g.paths.empty()) continue;
+      if (groups.size() == 1)
+        for (auto& p : g.paths) entries.push_back({p});
+      else
+        entries.push_back(g.paths);
     }
-    SetWindowTextW(sameText, (title + L"　" + std::to_wstring(groups.size()) + L" グループ・" + std::to_wstring(paths) + L" 枚").c_str());
-    FillSameList();
+    const std::wstring text = title + L"　" + std::to_wstring(groups.size()) + L" グループ・" + std::to_wstring(paths) + L" 枚";
+    SetWindowTextW(sameText, text.c_str());
+    if (!entries.empty()) ShowList(text, std::move(entries));
   }
 
-  void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches) {
-    resultsMode = 0;
-    same = std::move(matches);
-    sameFolders.clear();
-    std::map<std::wstring, size_t> index;
-    for (const auto& m : same) {
-      std::wstring folder = FolderOf(m.path), key = folder;
-      CharLowerBuffW(&key[0], DWORD(key.size()));
-      auto it = index.find(key);
-      if (it == index.end()) {
-        it = index.emplace(key, sameFolders.size()).first;
-        sameFolders.push_back({folder, 0, 0, m.path});
-      }
-      (m.exact ? sameFolders[it->second].exact : sameFolders[it->second].similar)++;
-    }
-    std::stable_sort(sameFolders.begin(), sameFolders.end(), [](const SameFolderRow& a, const SameFolderRow& b) {
-      if (a.exact != b.exact) return a.exact > b.exact;
-      return a.exact + a.similar > b.exact + b.similar;
+  // 同じ画像を一覧に（元の画像を先頭にして選ぶ。完全一致、見た目の近い順）。全部の調べたフォルダから探した結果
+  void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches, const std::wstring& original) {
+    std::stable_sort(matches.begin(), matches.end(), [](const ExplorerMatch& a, const ExplorerMatch& b) {
+      if (a.exact != b.exact) return a.exact;
+      return a.distance < b.distance;
     });
     int exact = 0;
-    for (const auto& m : same) exact += m.exact ? 1 : 0;
-    sameTitle = title;
+    std::set<std::wstring> folders;
+    for (const auto& m : matches) {
+      exact += m.exact ? 1 : 0;
+      std::wstring f = FolderOf(m.path);
+      CharLowerBuffW(&f[0], DWORD(f.size()));
+      folders.insert(f);
+    }
     std::wstring text = title + L"　";
-    if (same.empty()) {
+    if (matches.empty()) {
       text += L"同じ画像は見つかりませんでした（インデックスを作ったフォルダの中だけを探します）";
-    } else {
-      text += std::to_wstring(same.size()) + L" 枚（完全一致 " + std::to_wstring(exact) + L"・見た目一致 " +
-              std::to_wstring(same.size() - exact) + L"）、" + std::to_wstring(sameFolders.size()) + L" フォルダ";
+      SetWindowTextW(sameText, text.c_str());
+      return;
     }
+    text += std::to_wstring(matches.size()) + L" 枚（完全一致 " + std::to_wstring(exact) + L"・見た目一致 " +
+            std::to_wstring(matches.size() - exact) + L"）、" + std::to_wstring(folders.size()) + L" フォルダ";
     SetWindowTextW(sameText, text.c_str());
-    FillSameList();
-  }
-
-  // 一覧の i 番目へ移る (そのフォルダを開いて選ぶ)
-  void GoToSame(int i) {
-    if (i < 0) return;
-    std::wstring target;
-    if (resultsMode == 1) {
-      if (i < int(groupRows.size())) {
-        // 見出しなら、そのまとまりの最初の画像
-        size_t k = size_t(i);
-        while (k < groupRows.size() && groupRows[k].header) k++;
-        if (k < groupRows.size()) target = groupRows[k].path;
-      }
-    } else if (settings.resultsView == 1) {
-      if (i < int(sameFolders.size())) target = sameFolders[size_t(i)].first;
-    } else if (i < int(same.size())) {
-      target = same[size_t(i)].path;
-    }
-    if (target.empty()) return;
-    Navigate(FolderOf(target), target);
-  }
-
-  void SameContextMenu(int i, POINT screen) {
-    if (i < 0) return;
-    std::wstring target;
-    if (resultsMode == 1) {
-      if (i < int(groupRows.size()) && !groupRows[size_t(i)].header) target = groupRows[size_t(i)].path;
-    } else {
-      target = settings.resultsView == 1 ? (i < int(sameFolders.size()) ? sameFolders[size_t(i)].folder : L"")
-                                         : (i < int(same.size()) ? same[size_t(i)].path : L"");
-    }
-    if (target.empty()) return;
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, MENU_OPEN, L"ここへ移る(&G)");
-    bool folderRow = resultsMode == 0 && settings.resultsView == 1;
-    if (!folderRow) AppendMenuW(menu, MF_STRING, MENU_SAME, L"開く(&O)");
-    AppendMenuW(menu, MF_STRING, MENU_SHOW, L"エクスプローラーで表示(&E)");
-    AppendMenuW(menu, MF_STRING, MENU_COPY, L"パスをコピー(&C)");
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
-    DestroyMenu(menu);
-    switch (cmd) {
-      case MENU_OPEN: GoToSame(i); break;
-      case MENU_SAME: host->ExplorerOpen(target); break;
-      case MENU_SHOW:
-        if (folderRow) ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        else ShowInShell(target);
-        break;
-      case MENU_COPY: CopyText(target); break;
-    }
+    std::vector<std::vector<std::wstring>> entries;
+    const bool haveOriginal = !original.empty() && GetFileAttributesW(original.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (haveOriginal) entries.push_back({original});
+    for (const auto& m : matches)
+      if (!haveOriginal || _wcsicmp(m.path.c_str(), original.c_str()) != 0) entries.push_back({m.path});
+    ShowList(L"同じ画像: " + text, std::move(entries), 0);
   }
 
   // ---------------------------------------------------------------- 操作のバー
 
   int BarH() const { return Px(34); }
   int SplitW() const { return Px(5); }
-  int SameHeaderH() const { return Px(28); }
   int TrayH() const { return Px(30); }
 
   // パネルの幅 (窓が狭い時はサムネイルの一覧に Px(160) は残す)
@@ -2835,10 +2909,8 @@ class ExplorerImpl {
     }
   }
 
-  // 下の「同じ画像」の高さ (窓が低い時は上に Px(160) は残す)
-  int ResultsH(int total) const {
-    return std::max(SameHeaderH() + Px(40), std::min(Px(settings.resultsHeight), total - BarH() - TrayH() - Px(160)));
-  }
+  // 下のステータスバーの高さ
+  int ResultsH(int) const { return Px(24); }
 
   void LayoutBar() {
     RECT rc;
@@ -2861,7 +2933,7 @@ class ExplorerImpl {
     h += TrayH();
 
     int resultsH = ResultsH(rc.bottom);
-    int top = h, bodyH = std::max(0, int(rc.bottom - h - resultsH - SplitW()));
+    int top = h, bodyH = std::max(0, int(rc.bottom - h - resultsH));
     int tw, pw;
     PanelWidths(rc.right, &tw, &pw);
     int gx = 0, gr = rc.right;
@@ -2876,12 +2948,9 @@ class ExplorerImpl {
       gr = rc.right - pw - SplitW();
     }
     MoveWindow(grid, gx, top, std::max(0, gr - gx), bodyH, TRUE);
-    // 「同じ画像」
-    int sy = top + bodyH + SplitW();
-    int sameViewW = Px(120);
-    MoveWindow(sameText, m, sy + Px(5), std::max(0, int(rc.right - sameViewW - m * 3)), SameHeaderH() - Px(6), TRUE);
-    MoveWindow(sameView, rc.right - m - sameViewW, sy + Px(2), sameViewW, Px(200), TRUE);
-    MoveWindow(sameList, 0, sy + SameHeaderH(), rc.right, std::max(0, int(rc.bottom - sy - SameHeaderH())), TRUE);
+    // ステータスバー
+    int sy = top + bodyH;
+    MoveWindow(sameText, m, sy + Px(4), std::max(0, int(rc.right - m * 2)), resultsH - Px(6), TRUE);
     InvalidateRect(hwnd, nullptr, TRUE);
   }
 
@@ -2890,10 +2959,7 @@ class ExplorerImpl {
     RECT rc;
     GetClientRect(hwnd, &rc);
     if (pt.y < BarH() + TrayH()) return 0;
-    int resultsH = ResultsH(rc.bottom);
-    int splitY = rc.bottom - resultsH - SplitW();
-    if (pt.y >= splitY && pt.y < splitY + SplitW()) return 3;
-    if (pt.y > splitY) return 0;
+    if (pt.y >= rc.bottom - ResultsH(rc.bottom)) return 0;
     int tw, pw;
     PanelWidths(rc.right, &tw, &pw);
     if (settings.showTree && pt.x >= tw && pt.x < tw + SplitW()) return 1;
@@ -3199,6 +3265,9 @@ class ExplorerImpl {
       case WM_SIZE:
         self->LayoutBar();
         return 0;
+      case WM_PREFETCHED:
+        self->QueuePrefetchThumbs();
+        return 0;
       case WM_TIMER:
         if (wp == kStateTimer && IsWindowVisible(hwnd)) self->RefreshStates();
         return 0;
@@ -3222,14 +3291,10 @@ class ExplorerImpl {
           RECT rc;
           GetClientRect(hwnd, &rc);
           int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-          if (self->dragSplit == 3) {
-            int logical = MulDiv(int(rc.bottom) - y - self->SplitW() / 2, 96, self->dpi);
-            self->settings.resultsHeight = std::max(80, std::min(1200, logical));
-          } else {
-            int logical = self->dragSplit == 1 ? MulDiv(x, 96, self->dpi) : MulDiv(int(rc.right) - x - self->SplitW() / 2, 96, self->dpi);
-            logical = std::max(120, std::min(800, logical));
-            (self->dragSplit == 1 ? self->settings.treeWidth : self->settings.previewWidth) = logical;
-          }
+          (void)y;
+          int logical = self->dragSplit == 1 ? MulDiv(x, 96, self->dpi) : MulDiv(int(rc.right) - x - self->SplitW() / 2, 96, self->dpi);
+          logical = std::max(120, std::min(800, logical));
+          (self->dragSplit == 1 ? self->settings.treeWidth : self->settings.previewWidth) = logical;
           self->LayoutBar();
           UpdateWindow(hwnd);
         }
@@ -3246,29 +3311,6 @@ class ExplorerImpl {
       case WM_NOTIFY: {
         auto* nm = reinterpret_cast<NMHDR*>(lp);
         if (nm->hwndFrom == self->tree) return self->TreeNotify(nm);
-        if (nm->hwndFrom == self->sameList) {
-          // 行を選んだら (クリック・矢印キー)、エクスプローラーでその画像を表示する
-          if (nm->code == LVN_ITEMCHANGED && !self->fillingList) {
-            auto* lv = reinterpret_cast<NMLISTVIEW*>(lp);
-            if ((lv->uChanged & LVIF_STATE) && (lv->uNewState & LVIS_SELECTED) && !(lv->uOldState & LVIS_SELECTED)) self->GoToSame(lv->iItem);
-          }
-          if (nm->code == NM_DBLCLK || nm->code == NM_RETURN) {
-            int i = ListView_GetNextItem(self->sameList, -1, LVNI_SELECTED);
-            self->GoToSame(i);
-            if (self->resultsMode == 1 || self->settings.resultsView == 0) {
-              // ダブルクリックは開く
-              std::wstring t = self->resultsMode == 1 ? (i >= 0 && i < int(self->groupRows.size()) ? self->groupRows[size_t(i)].path : L"")
-                                                      : (i >= 0 && i < int(self->same.size()) ? self->same[size_t(i)].path : L"");
-              if (!t.empty()) self->host->ExplorerOpen(t);
-            }
-          }
-          if (nm->code == NM_RCLICK) {
-            POINT pt;
-            GetCursorPos(&pt);
-            self->SameContextMenu(ListView_GetNextItem(self->sameList, -1, LVNI_SELECTED), pt);
-          }
-          return 0;
-        }
         break;
       }
       case WM_COMMAND:
@@ -3329,13 +3371,6 @@ class ExplorerImpl {
           case ID_SORT_DIR:
             self->SetSort(self->SortKey(), !self->settings.sortDesc);
             SetFocus(self->grid);
-            return 0;
-          case ID_SAME_VIEW:
-            if (HIWORD(wp) == CBN_SELCHANGE) {
-              self->settings.resultsView = int(SendMessageW(self->sameView, CB_GETCURSEL, 0, 0));
-              self->host->ExplorerSettingsChanged(self->settings);
-              self->FillSameList();
-            }
             return 0;
         }
         break;
@@ -3905,14 +3940,11 @@ class ExplorerImpl {
     CreateWindowExW(0, kPreviewClass, nullptr, WS_CHILD, 0, 0, 10, 10, hwnd, nullptr, inst, this);
     CreateWindowExW(0, kTrayClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
     for (const auto& t : settings.tray) tray.push_back({t, true});
-    // 「同じ画像」
-    sameText = make(L"STATIC", L"画像を選ぶか、画像のファイル・URL をここにドロップすると、同じ画像（インデックスを作ったフォルダの中）を探します。"
+    for (const auto& [d, n] : settings.frequent) visits[DirKey(d)] = {d, n};
+    // 下のステータスバー
+    sameText = make(L"STATIC", L"画像を右クリック →「同じ画像を探す」か、画像のファイル・URL をここにドロップすると、同じ画像（インデックスを作った全部のフォルダの中）を一覧に出します。"
                                L"　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部",
                     SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS, ID_SAME_TEXT);
-    sameView = make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_SAME_VIEW);
-    for (const wchar_t* t : {L"画像ごと", L"フォルダごと"}) SendMessageW(sameView, CB_ADDSTRING, 0, LPARAM(t));
-    settings.resultsView = std::max(0, std::min(1, settings.resultsView));
-    SendMessageW(sameView, CB_SETCURSEL, settings.resultsView, 0);
     // マウスを乗せた時の説明
     {
       HWND tip = winutil::makeTooltip(hwnd, Px(360));
@@ -3929,19 +3961,11 @@ class ExplorerImpl {
           {sizeBox, L"サムネイルの大きさ（可変ならスライダーで変えられます）"},
           {slider, L"サムネイルの大きさ（「可変」の時）"},
           {folderBox, L"フォルダの表紙に、中のどの画像を出すか"},
-          {sameView, L"同じ画像の一覧を、画像ごとに並べるか、フォルダごとにまとめるか"},
       };
       for (const auto& [h, text] : tips) winutil::addTooltip(tip, h, text);
     }
-    sameList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
-                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, 0, 10, 10,
-                               hwnd, HMENU(INT_PTR(ID_SAME_LIST)), inst, nullptr);
-    SendMessageW(sameList, WM_SETFONT, WPARAM(font), TRUE);
-    ListView_SetExtendedListViewStyle(sameList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-    FillSameList();
     settings.treeWidth = std::max(120, std::min(800, settings.treeWidth));
     settings.previewWidth = std::max(120, std::min(800, settings.previewWidth));
-    settings.resultsHeight = std::max(80, std::min(1200, settings.resultsHeight));
     settings.sizeMode = std::max(0, std::min(3, settings.sizeMode));
     settings.customSize = std::max(kMinSize, std::min(kMaxSize, settings.customSize));
     SendMessageW(sizeBox, CB_SETCURSEL, settings.sizeMode, 0);
@@ -3952,9 +3976,9 @@ class ExplorerImpl {
     drop = new DropTarget([this](const std::vector<std::wstring>& files, const std::wstring& url) { Dropped(files, url); });
     RegisterDragDrop(hwnd, drop);
     RegisterDragDrop(grid, drop);
-    RegisterDragDrop(sameList, drop);
     SetTimer(hwnd, kStateTimer, 5000, nullptr);
     StartWorkers();
+    StartPrefetch();
     return true;
   }
 };
@@ -3963,7 +3987,6 @@ Explorer::Explorer() : impl_(new ExplorerImpl) {}
 Explorer::~Explorer() {
   if (impl_->hwnd) {
     RevokeDragDrop(impl_->grid);
-    RevokeDragDrop(impl_->sameList);
     RevokeDragDrop(impl_->hwnd);
     DestroyWindow(impl_->hwnd);
   }
@@ -4015,13 +4038,17 @@ std::vector<std::wstring> Explorer::SelectedPaths() const { return impl_->Select
 bool Explorer::ShowingList() const { return impl_->listMode; }
 
 void Explorer::RefreshStates() { impl_->RefreshStates(); }
+void Explorer::Refresh() { impl_->Refresh(); }
+std::vector<std::pair<std::wstring, int>> Explorer::Frequent() const { return impl_->Frequent(30); }
 
 void Explorer::RefreshTags() { impl_->RefreshTags(); }
 void Explorer::PreviewFile(const std::wstring& path) { impl_->PreviewFile(path); }
 
 void Explorer::SetSameStatus(const std::wstring& text) { SetWindowTextW(impl_->sameText, text.c_str()); }
 
-void Explorer::SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches) { impl_->SetSame(title, std::move(matches)); }
+void Explorer::SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches, const std::wstring& original) {
+  impl_->SetSame(title, std::move(matches), original);
+}
 
 void Explorer::ShowList(const std::wstring& title, std::vector<std::vector<std::wstring>> entries, int select) {
   impl_->ShowList(title, std::move(entries), select);

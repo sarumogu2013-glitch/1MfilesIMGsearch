@@ -167,7 +167,7 @@ std::vector<SameFolder> groupSameByFolder(const std::vector<SameMatch>& matches)
 }
 
 std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::string& dir, const std::vector<std::string>& roots,
-                                                            int hashVersion) {
+                                                            int hashVersion, const std::vector<std::string>* names) {
     std::unordered_map<std::string, IndexState> out;
     // DB のパスは roots の書き方で始まるので、roots の中なら頭をそろえる
     std::string prefix = trimSep(dir);
@@ -179,6 +179,23 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
             best = nr.size();
             prefix = trimSep(r) + trimSep(dir).substr(trimSep(r).size());
         }
+    }
+    if (names) {
+        // 名前ごとに引く（パスの索引で 1 件ずつ）
+        Stmt st(db.handle(),
+                "SELECT coalesce(s.state, 0) FROM images i "
+                "LEFT JOIN stages s ON s.image_id=i.id AND s.stage='hash' AND s.version=? WHERE i.path=?");
+        for (const auto& name : *names)
+            for (const char sep : {'\\', '/'}) {
+                std::string p = prefix;
+                std::replace(p.begin(), p.end(), sep == '/' ? '\\' : '/', sep);
+                st.bind(1, static_cast<int64_t>(hashVersion)).bind(2, p + sep + name);
+                const bool found = st.step();
+                if (found) out[name] = st.i64(0) != 0 ? IndexState::Indexed : IndexState::Pending;
+                st.reset();
+                if (found) break;
+            }
+        return out;
     }
     for (const char sep : {'\\', '/'}) {
         std::string p = prefix;
