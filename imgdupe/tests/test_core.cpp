@@ -17,6 +17,7 @@
 #include "search.hpp"
 #include "links.hpp"
 #include "names.hpp"
+#include "log.hpp"
 #include "models.hpp"
 #include "tagger.hpp"
 #include "vectors.hpp"
@@ -2802,6 +2803,22 @@ static void testTagNames() {
     CHECK(builtin.size() > 10000 && tags.size() == builtin.size() && jas.size() == builtin.size());
 }
 
+static void testLogs() {
+    const std::string line = logs::formatLine(0, "解析", logs::Level::Warn, "a\nb");
+    CHECK(line.find("[解析] 注意: a b") != std::string::npos && line.size() >= 2 && line.substr(line.size() - 2) == "\r\n");
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-log-test";
+    fs::remove_all(dir);
+    logs::open(dir.string(), "t", "画面", 300, 2);  // 300 バイトで回し、2 つまで残す
+    for (int i = 0; i < 20; ++i) logs::info("行 " + std::to_string(i) + " " + std::string(30, 'x'));
+    logs::close();
+    CHECK(fs::exists(dir / "t.log") && fs::exists(dir / "t.1.log") && fs::exists(dir / "t.2.log") && !fs::exists(dir / "t.3.log"));
+    CHECK(fs::file_size(dir / "t.log") <= 300);
+    std::ifstream in(dir / "t.log");
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(all.find("行 19 ") != std::string::npos);  // 新しい行は今のファイルに
+    fs::remove_all(dir);
+}
+
 static void testQueryStore() {
     CHECK(queryImageName(1700000000, 3, ".bmp") == "q_1700000000_3.bmp");
     CHECK(queryImageTime("q_1700000000_3.bmp") == 1700000000 && queryImageTime("x.bmp") == 0 && queryImageTime("q_abc_1.png") == 0);
@@ -2904,6 +2921,7 @@ int main() {
     testSameImage();
     testFreeSearch();
     testQueryStore();
+    testLogs();
     testTagNames();
     testClusterResults();
     testExifOrientation();

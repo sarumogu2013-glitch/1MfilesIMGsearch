@@ -54,6 +54,8 @@
 #include "resource.h"
 #include "search.hpp"
 #include "links.hpp"
+#include "log.hpp"
+#include "log_win.hpp"
 #include "update_win.hpp"
 #include "version.hpp"
 #include "win_util.hpp"
@@ -66,6 +68,14 @@ using winutil::addTooltip;
 using winutil::makeTooltip;
 
 namespace {
+
+// 注意・エラーのダイアログは、出した内容を動作履歴にも残す
+int logBox(HWND owner, LPCWSTR text, LPCWSTR title, UINT flags) {
+    const UINT icon = flags & MB_ICONMASK;
+    if (icon == MB_ICONWARNING || icon == MB_ICONERROR)
+        logs::warn("ダイアログ「" + narrow(title ? title : L"") + "」: " + narrow(text ? text : L""));
+    return MessageBoxW(owner, text, title, flags);
+}
 
 // ---------------------------------------------------------------- 定数
 
@@ -545,6 +555,7 @@ void addScanTask(const std::vector<std::wstring>& paths, bool top) {
         label += L"（" + nameOf(list[0]) + L" など）";
     }
     indexer::addScanTask(app.dataDir, label, list, top);
+    logs::info("スキャンタスクを足した: " + narrow(label) + (top ? "（一番上）" : "") + (rootsChanged ? "・調べるフォルダにも足した" : ""));
     if (!indexer::isRunning()) indexer::start();
 }
 
@@ -829,7 +840,7 @@ void setRunning(bool on) {
 void startSearch(const std::wstring& queryPath) {
     const auto folders = folderList();
     if (folders.empty()) {
-        MessageBoxW(app.hwnd,
+        logBox(app.hwnd,
                     L"調べるフォルダがありません。ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、"
                     L"「ファイル → フォルダをスキャンタスクに追加」で足してください（ウィンドウにドラッグ＆ドロップしても足せます）。",
                     L"imgdupe", MB_ICONINFORMATION);
@@ -859,6 +870,8 @@ void startSearch(const std::wstring& queryPath) {
     app.prog.total = 0;
     app.runningQuery = query;
     setRunning(true);
+    logs::info(std::string(query ? "1 枚で重複を探し始めた" : "重複を探し始めた") + "（フォルダ " + std::to_string(opt.roots.size()) +
+               " 個・しきい値 " + std::to_string(opt.threshold) + (reuse ? "・読み込み済みを使う" : "") + "）");
 
     app.worker = std::thread([opt, queryPath, query, reuse, previous = std::move(previous)]() mutable {
         auto* out = new Outcome;
@@ -966,9 +979,14 @@ void onDone(Outcome* out) {
         SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
     }
     setRunning(false);
+    if (!o->error.empty()) logs::warn("重複探しが失敗した: " + narrow(o->error));
+    else if (o->result.cancelled) logs::info("重複探しを中止した");
+    else
+        logs::info("重複探しが終わった: 画像 " + std::to_string(o->result.files.size()) + " 枚・まとまり " +
+                   std::to_string(o->result.groups.size()) + " 個（" + std::to_string((GetTickCount64() - app.startTick) / 1000) + " 秒）");
     if (!o->error.empty()) {
         setText(app.status, o->error);
-        MessageBoxW(app.hwnd, o->error.c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, o->error.c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     if (o->result.cancelled) {
@@ -1009,7 +1027,7 @@ ModelsAsk modelsAsk = ModelsAsk::UpdatesOnly;
 
 void startModelsCheck(ModelsAsk ask) {
     if (app.modelsDownloading) {
-        MessageBoxW(app.hwnd, L"AI の部品をダウンロードしています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"AI の部品をダウンロードしています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     modelsAsk = ask;
@@ -1065,7 +1083,7 @@ void startModelsDownload(std::vector<const imgdupe::Component*> comps, imgdupe::
 void onModelsChecked(const models::ManifestResult& r) {
     if (!r.ok) {
         if (modelsAsk == ModelsAsk::Offer)
-            MessageBoxW(app.hwnd, r.error.c_str(), L"AI 解析の部品", MB_ICONWARNING);
+            logBox(app.hwnd, r.error.c_str(), L"AI 解析の部品", MB_ICONWARNING);
         return;  // アップデートの確認からなら、本体の結果を出した後なので何も言わない
     }
     const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
@@ -1073,7 +1091,7 @@ void onModelsChecked(const models::ManifestResult& r) {
     const auto updates = imgdupe::planUpdate(r.manifest, installed);
     if (!updates.empty()) {
         const std::wstring lines = componentLines(updates, total);
-        if (MessageBoxW(app.hwnd,
+        if (logBox(app.hwnd,
                         (L"AI 解析の部品に新しい版があります。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
                          L"。ダウンロードして入れ替えますか？")
                             .c_str(),
@@ -1096,11 +1114,11 @@ void onModelsChecked(const models::ManifestResult& r) {
         std::wstring lines;
         for (const auto& [id, c] : installed)
             if (const auto* m = r.manifest.find(id)) lines += L"・" + widen(m->name) + L"（" + widen(c.version) + L"）\r\n";
-        MessageBoxW(app.hwnd, (L"AI 解析の部品はすべて最新です。\r\n\r\n" + lines).c_str(), L"AI 解析の部品", MB_ICONINFORMATION);
+        logBox(app.hwnd, (L"AI 解析の部品はすべて最新です。\r\n\r\n" + lines).c_str(), L"AI 解析の部品", MB_ICONINFORMATION);
         return;
     }
     const std::wstring lines = componentLines(missing, total);
-    if (MessageBoxW(app.hwnd,
+    if (logBox(app.hwnd,
                     (L"次の部品を入れます。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
                      L"。ダウンロードしますか？\r\n（入れる場所: " + models::modelsDir(app.dataDir) + L"）")
                         .c_str(),
@@ -1118,20 +1136,23 @@ void onModelsDone(const std::wstring& err) {
         PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
         return;
     }
+    if (!err.empty()) logs::warn("AI 解析の部品を入れられなかった: " + narrow(err));
+    else logs::info("AI 解析の部品を入れた");
     if (!err.empty()) {
         setText(app.status, L"AI 解析の部品を入れられませんでした");
-        MessageBoxW(app.hwnd, (L"AI 解析の部品を入れられませんでした。\r\n\r\n" + err).c_str(), L"AI 解析の部品", MB_ICONWARNING);
+        logBox(app.hwnd, (L"AI 解析の部品を入れられませんでした。\r\n\r\n" + err).c_str(), L"AI 解析の部品", MB_ICONWARNING);
         return;
     }
     restartIndexerAfterUpdate();  // 新しいモデルで解析し直す
     setText(app.status, L"AI 解析の部品を入れました");
-    MessageBoxW(app.hwnd, L"AI 解析の部品を入れました。", L"AI 解析の部品", MB_ICONINFORMATION);
+    logBox(app.hwnd, L"AI 解析の部品を入れました。", L"AI 解析の部品", MB_ICONINFORMATION);
 }
 
 void startDownload(CheckMode mode, const imgdupe::ReleaseInfo& info) {
     app.updating = true;
     tbEnable(CMD_CHECK_UPDATE, false);
     setText(app.status, L"新しい版 " + widen(info.tag) + L" をダウンロードしています…");
+    logs::info("新しい版 " + info.tag + " のダウンロードを始めた");
     HWND hwnd = app.hwnd;
     std::thread([hwnd, mode, info] {
         auto* r = new upd::DownloadResult(upd::downloadAndReplace(info));
@@ -1151,13 +1172,15 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
     tbEnable(CMD_CHECK_UPDATE, true);
     const std::wstring err = r.error();
     const auto cmp = err.empty() ? compareVersion(IMGDUPE_VERSION, r.info.tag) : VersionCompare::Latest;
+    if (!err.empty()) logs::warn("アップデートを確認できなかった: " + narrow(err));
+    else logs::info("アップデートを確認した: 最新 " + r.info.tag + (cmp == VersionCompare::RemoteNewer ? "（新しい版あり）" : ""));
     const std::wstring cur = widen(IMGDUPE_VERSION);
     const std::wstring versions = L"新しい版: " + widen(r.info.tag) + L"\r\n今の版: " + cur;
     if (mode == kOnExit) {
         // 新しい版がある時だけ聞く。確認できなかった時は何も言わずに終わる
         KillTimer(app.hwnd, kExitTimer);
         if (err.empty() && cmp == VersionCompare::RemoteNewer &&
-            MessageBoxW(nullptr,
+            logBox(nullptr,
                         (L"新しい版があります。\r\n\r\n" + versions +
                          L"\r\n\r\n終了する前に更新しますか？\r\n（次に起動した時から新しい版になります。設定とキャッシュはそのまま使えます）")
                             .c_str(),
@@ -1169,18 +1192,18 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
         return;
     }
     if (!err.empty()) {
-        MessageBoxW(app.hwnd, (L"アップデートを確認できませんでした。\r\n\r\n" + err + L"\r\n\r\n今の版: " + cur).c_str(),
+        logBox(app.hwnd, (L"アップデートを確認できませんでした。\r\n\r\n" + err + L"\r\n\r\n今の版: " + cur).c_str(),
                     L"imgdupe のアップデート", MB_ICONWARNING);
         return;
     }
     if (cmp != VersionCompare::RemoteNewer) {
-        MessageBoxW(app.hwnd,
+        logBox(app.hwnd,
                     (L"最新の版です。\r\n\r\n今の版: " + cur + L"\r\n最新のリリース: " + widen(r.info.tag)).c_str(),
                     L"imgdupe のアップデート", MB_ICONINFORMATION);
         startModelsCheck(ModelsAsk::UpdatesOnly);  // 本体が最新なら、AI の部品の版も確かめる
         return;
     }
-    if (MessageBoxW(app.hwnd,
+    if (logBox(app.hwnd,
                     (L"新しい版があります。\r\n\r\n" + versions +
                      L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます。AI 解析の部品の更新は、"
                      L"再起動した後にもう一度「アップデートを確認」で確かめます）")
@@ -1199,17 +1222,19 @@ void restartIndexerAfterUpdate() {
 void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
     app.updating = false;
     tbEnable(CMD_CHECK_UPDATE, true);
+    if (r.ok) logs::info("新しい版をダウンロードして入れ替えた");
+    else logs::warn("更新できなかった: " + narrow(r.error));
     if (r.ok) restartIndexerAfterUpdate();
     if (mode == kOnExit) {
         if (!r.ok)
-            MessageBoxW(nullptr, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
+            logBox(nullptr, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
                         MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
         DestroyWindow(app.hwnd);
         return;
     }
     if (!r.ok) {
         setText(app.status, L"更新できませんでした");
-        MessageBoxW(app.hwnd, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
+        logBox(app.hwnd, (L"更新できませんでした。\r\n\r\n" + r.error).c_str(), L"imgdupe のアップデート",
                     MB_ICONWARNING);
         return;
     }
@@ -1222,7 +1247,7 @@ void onDownloaded(CheckMode mode, const upd::DownloadResult& r) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
-        MessageBoxW(app.hwnd, L"更新しました。次に起動した時から新しい版になります。", L"imgdupe のアップデート",
+        logBox(app.hwnd, L"更新しました。次に起動した時から新しい版になります。", L"imgdupe のアップデート",
                     MB_ICONINFORMATION);
     }
     DestroyWindow(app.hwnd);
@@ -1316,10 +1341,10 @@ void exportResult() {
     if (base.empty()) return;
     const bool ok = writeCsv(app.result, narrow(base + L".csv")) && writeHtml(app.result, narrow(base + L".html"));
     if (!ok) {
-        MessageBoxW(app.hwnd, L"保存できませんでした。", L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, L"保存できませんでした。", L"imgdupe", MB_ICONWARNING);
         return;
     }
-    if (MessageBoxW(app.hwnd,
+    if (logBox(app.hwnd,
                     (L"保存しました。\r\n" + base + L".csv\r\n" + base +
                      L".html\r\n\r\nHTML（サムネイル付きの一覧）をブラウザで開きますか？")
                         .c_str(),
@@ -1328,7 +1353,7 @@ void exportResult() {
 }
 
 void showHelp() {
-    MessageBoxW(app.hwnd,
+    logBox(app.hwnd,
                 L"1. ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、「ファイル → フォルダをスキャンタスクに追加」で調べるフォルダを足します（ウィンドウへのドラッグ＆ドロップでも足せます。複数可）。\r\n"
                 L"2. 「検索開始」を押すと、同じ画像のまとまり（グループ）を左に出します。\r\n"
                 L"　・完全一致: 中身がまったく同じファイル\r\n"
@@ -1383,7 +1408,10 @@ constexpr size_t kListResults = 20000;  // エクスプローラーに出す検�
 Db* uiDb() {
     if (!app.uiDb) {
         app.uiDb = std::make_unique<Db>();
-        if (!app.uiDb->open(narrow(dbPath()))) app.uiDb.reset();
+        if (!app.uiDb->open(narrow(dbPath()))) {
+            logs::error("データベースを開けなかった: " + narrow(dbPath()));
+            app.uiDb.reset();
+        }
     }
     return app.uiDb.get();
 }
@@ -1862,6 +1890,7 @@ void onSearched(SearchDone* p) {
     std::unique_ptr<SearchDone> done(p);
     if (done->gen != app.searchGen) return;  // 古い条件の結果
     if (!done->error.empty()) {
+        logs::warn("検索できなかった: " + narrow(done->error));
         setText(app.s.count, L"検索できませんでした: " + done->error);
         return;
     }
@@ -2241,13 +2270,13 @@ bool saveSmartFolderAs(const SearchQuery& q, const std::wstring& message, const 
     if (name->empty()) return false;
     for (const auto& f : app.smartList) {
         if (_wcsicmp(widen(f.name).c_str(), name->c_str()) == 0 &&
-            MessageBoxW(app.hwnd, (L"「" + *name + L"」を置き換えますか？").c_str(), L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+            logBox(app.hwnd, (L"「" + *name + L"」を置き換えますか？").c_str(), L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
             return false;
     }
     try {
         saveSmartFolder(*db, narrow(*name), q);
     } catch (const std::exception& e) {
-        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return false;
     }
     refreshSmartFolders(*name);
@@ -2259,7 +2288,7 @@ void saveSelectionSmartUi() {
     size_t missing = 0;
     const std::vector<int64_t> ids = selectedImageIds(&missing);
     if (ids.empty()) {
-        MessageBoxW(app.hwnd,
+        logBox(app.hwnd,
                     missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像だけ保存できます）。"
                             : L"保存する画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
                     L"imgdupe", MB_ICONINFORMATION);
@@ -2289,7 +2318,7 @@ void deleteSmartFolderUi() {
     const int i = ComboBox_GetCurSel(app.s.smart) - 1;
     if (!db || i < 0 || i >= static_cast<int>(app.smartList.size())) return;
     const std::wstring name = widen(app.smartList[i].name);
-    if (MessageBoxW(app.hwnd, (L"スマートフォルダ「" + name + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
+    if (logBox(app.hwnd, (L"スマートフォルダ「" + name + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
                     MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
         return;
     try {
@@ -2458,7 +2487,7 @@ void manageSmartFoldersUi() {
                         const auto name = promptText(L"名前を変える", L"新しい名前", widen(list[i].name));
                         if (name && !trimmed(*name).empty()) {
                             if (!renameSmartFolder(*db, list[i].id, narrow(trimmed(*name))))
-                                MessageBoxW(dlg, L"同じ名前の条件がもうあります。", L"imgdupe", MB_ICONINFORMATION);
+                                logBox(dlg, L"同じ名前の条件がもうあります。", L"imgdupe", MB_ICONINFORMATION);
                             fill(list[i].id);
                             changed = true;
                         }
@@ -2466,7 +2495,7 @@ void manageSmartFoldersUi() {
                     }
                     break;
                 case ID_DELETE:
-                    if (has && MessageBoxW(dlg, (L"「" + widen(list[i].name) + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
+                    if (has && logBox(dlg, (L"「" + widen(list[i].name) + L"」を削除しますか？（画像は消えません）").c_str(), L"imgdupe",
                                            MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
                         deleteSmartFolder(*db, list[i].id);
                         fill(i + 1 < static_cast<int>(list.size()) ? list[i + 1].id : i > 0 ? list[i - 1].id : 0);
@@ -2475,7 +2504,7 @@ void manageSmartFoldersUi() {
                     break;
                 case ID_EXPORT: {
                     if (list.empty()) {
-                        MessageBoxW(dlg, L"保存した条件がありません。", L"imgdupe", MB_ICONINFORMATION);
+                        logBox(dlg, L"保存した条件がありません。", L"imgdupe", MB_ICONINFORMATION);
                         break;
                     }
                     const std::wstring file = pickQueriesFile(true);
@@ -2484,7 +2513,7 @@ void manageSmartFoldersUi() {
                     FILE* f = _wfopen(file.c_str(), L"wb");
                     const bool ok = f && std::fwrite(text.data(), 1, text.size(), f) == text.size();
                     if (f) std::fclose(f);
-                    MessageBoxW(dlg, ok ? (std::to_wstring(list.size()) + L" 件を書き出しました。").c_str() : L"書き出せませんでした。",
+                    logBox(dlg, ok ? (std::to_wstring(list.size()) + L" 件を書き出しました。").c_str() : L"書き出せませんでした。",
                                 L"imgdupe", ok ? MB_ICONINFORMATION : MB_ICONWARNING);
                     break;
                 }
@@ -2500,20 +2529,20 @@ void manageSmartFoldersUi() {
                     }
                     std::vector<SmartFolder> got;
                     if (!importSmartFolders(text, got)) {
-                        MessageBoxW(dlg, L"保存した条件のファイルとして読めませんでした。", L"imgdupe", MB_ICONWARNING);
+                        logBox(dlg, L"保存した条件のファイルとして読めませんでした。", L"imgdupe", MB_ICONWARNING);
                         break;
                     }
                     int64_t last = 0;
                     for (const auto& g : got) last = saveSmartFolder(*db, g.name, g.query);
                     fill(last);
                     changed = true;
-                    MessageBoxW(dlg, (std::to_wstring(got.size()) + L" 件を読み込みました（同じ名前は上書き）。").c_str(), L"imgdupe",
+                    logBox(dlg, (std::to_wstring(got.size()) + L" 件を読み込みました（同じ名前は上書き）。").c_str(), L"imgdupe",
                                 MB_ICONINFORMATION);
                     break;
                 }
             }
         } catch (const std::exception& e) {
-            MessageBoxW(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+            logBox(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
         }
     }
     if (msg.message == WM_QUIT) PostQuitMessage(static_cast<int>(msg.wParam));
@@ -2553,11 +2582,11 @@ void cleanupTemporaryLinks() {
 
 void expandLinksUi() {
     if (app.expanding) {
-        MessageBoxW(app.hwnd, L"フォルダを作っています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"フォルダを作っています。終わるまでお待ちください。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     if (!app.searchTotal) {
-        MessageBoxW(app.hwnd, L"フォルダにする検索結果がありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"フォルダにする検索結果がありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     const int i = ComboBox_GetCurSel(app.s.smart) - 1;
@@ -2570,7 +2599,7 @@ void expandLinksUi() {
                        L"・このソフトを終了すると消えます（残す時は「展開したフォルダ」で固定にします）。\r\n" +
                        L"・同じ名前で前に展開したフォルダは、今の結果で作り直します。";
     if (app.searchTotal > 10000) msg += L"\r\n\r\n枚数が多いので、少し時間がかかります。";
-    if (MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return;
+    if (logBox(app.hwnd, msg.c_str(), L"フォルダに展開", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return;
 
     SearchQuery q = searchQueryFromUi();
     const std::string db = narrow(dbPath());
@@ -2601,7 +2630,7 @@ void onExpanded(ExpandDone* p) {
     EnableWindow(app.s.expand, TRUE);
     setText(app.s.count, withCommas(app.searchTotal) + L" 件");
     if (!done->error.empty()) {
-        MessageBoxW(app.hwnd, (L"展開できませんでした: " + done->error).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, (L"展開できませんでした: " + done->error).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     const ExpandResult& r = done->result;
@@ -2611,11 +2640,11 @@ void onExpanded(ExpandDone* p) {
         msg += L"\r\n\r\n作れなかった画像: " + withCommas(r.failed) +
                L" 枚（元の画像が無い、ネットワークや FAT32 / exFAT のドライブなど）\r\n例: " + widen(r.firstFailure);
     if (!r.created) {
-        MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_ICONWARNING);
+        logBox(app.hwnd, msg.c_str(), L"フォルダに展開", MB_ICONWARNING);
         return;
     }
     msg += L"\r\n\r\nフォルダを開きますか？";
-    if (MessageBoxW(app.hwnd, msg.c_str(), L"フォルダに展開", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+    if (logBox(app.hwnd, msg.c_str(), L"フォルダに展開", MB_YESNO | MB_ICONINFORMATION) == IDYES)
         for (const auto& f : r.folders) openPath(widen(f));
 }
 
@@ -2691,14 +2720,14 @@ void linksCommand(int id) {
         while (base.size() > 3 && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
         const std::wstring root = base + (base.back() == L'\\' ? L"" : L"\\") + widen(kVfolderDirName);
         const std::string drive = driveOf(narrow(base));
-        if (MessageBoxW(w.wnd, (widen(drive) + L" の画像は、これから\r\n" + root + L"\r\nの下に展開します。").c_str(), L"imgdupe",
+        if (logBox(w.wnd, (widen(drive) + L" の画像は、これから\r\n" + root + L"\r\nの下に展開します。").c_str(), L"imgdupe",
                         MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
             return;
         try {
             setVfolderRoot(*db, drive, narrow(root));
             imgwin::setScanExcludes(customVfolderRoots(*db));
         } catch (const std::exception& e) {
-            MessageBoxW(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+            logBox(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         }
         refreshLinksWindow();
         return;
@@ -2712,20 +2741,20 @@ void linksCommand(int id) {
             case IDC_L_KEEP: setFolderTemporary(*db, f.dir, false); break;
             case IDC_L_TEMP: setFolderTemporary(*db, f.dir, true); break;
             case IDC_L_DELETE: {
-                if (MessageBoxW(w.wnd, (L"「" + widen(f.dir) + L"」のリンク " + withCommas(f.count) + L" 個を削除しますか？\r\n（元の画像は消えません）").c_str(),
+                if (logBox(w.wnd, (L"「" + widen(f.dir) + L"」のリンク " + withCommas(f.count) + L" 個を削除しますか？\r\n（元の画像は消えません）").c_str(),
                                 L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
                     return;
                 const RemoveResult r = removeLinks(*db, f.dir, false);
                 std::wstring msg;
                 if (r.failed) msg += withCommas(r.failed) + L" 個は開かれていて消せませんでした（次に起動した時にまた消します）。\r\n";
                 if (r.kept) msg += withCommas(r.kept) + L" 個は元の画像が消えていて、データがリンクにしか無いので残しました。\r\n";
-                if (!msg.empty()) MessageBoxW(w.wnd, msg.c_str(), L"imgdupe", MB_ICONINFORMATION);
+                if (!msg.empty()) logBox(w.wnd, msg.c_str(), L"imgdupe", MB_ICONINFORMATION);
                 break;
             }
             default: return;
         }
     } catch (const std::exception& e) {
-        MessageBoxW(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(w.wnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
     }
     refreshLinksWindow();
     if (sel < ListView_GetItemCount(w.list)) ListView_SetItemState(w.list, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -2889,7 +2918,7 @@ void editSelectedTags(const std::vector<int64_t>& ids, const std::string& descri
             db->rollback();
         } catch (const std::exception&) {
         }
-        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     refreshSources(true);
@@ -2905,7 +2934,7 @@ void markSelected(bool correct) {
     std::vector<std::string> tags, exclude;
     parseTagQuery(narrow(editText(app.s.tags)), tags, exclude);
     if (tags.empty()) {
-        MessageBoxW(app.hwnd, L"「タグ」の欄に、確かめるタグを入れてください（1 つ目のタグを確定します）。", L"imgdupe",
+        logBox(app.hwnd, L"「タグ」の欄に、確かめるタグを入れてください（1 つ目のタグを確定します）。", L"imgdupe",
                     MB_ICONINFORMATION);
         return;
     }
@@ -3167,7 +3196,7 @@ void relookupImages(int64_t clicked) {
     if (std::find(ids.begin(), ids.end(), clicked) == ids.end()) ids.assign(1, clicked);
     const lookup::Settings ls = lookup::load(app.dataDir);
     if (!ls.idLookup && !(ls.reverse && !ls.sauceKey.empty())) {
-        MessageBoxW(app.hwnd, L"外部照会が切ってあります。「設定」の「外部照会」で、調べ方を選んでください。", L"imgdupe",
+        logBox(app.hwnd, L"外部照会が切ってあります。「設定」の「外部照会」で、調べ方を選んでください。", L"imgdupe",
                     MB_ICONINFORMATION);
         return;
     }
@@ -3177,11 +3206,11 @@ void relookupImages(int64_t clicked) {
         resetLookups(*db, ids);
         addCommand(*db, "rescan");
     } catch (const std::exception& e) {
-        MessageBoxW(app.hwnd, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, (L"できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     if (!indexer::isRunning()) indexer::start();
-    MessageBoxW(app.hwnd,
+    logBox(app.hwnd,
                 (withCommas(ids.size()) + L" 枚を、バックグラウンドの解析でもう一度調べます（1 秒に 1 件ずつ。SauceNAO は 1 日の上限まで）。")
                     .c_str(),
                 L"imgdupe", MB_ICONINFORMATION);
@@ -3191,7 +3220,7 @@ void bulkTagUi() {
     size_t missing = 0;
     const std::vector<int64_t> items = selectedImageIds(&missing);
     if (items.empty()) {
-        MessageBoxW(app.hwnd,
+        logBox(app.hwnd,
                     missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像にだけタグを付けられます）。"
                             : L"タグを付ける画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
                     L"imgdupe", MB_ICONINFORMATION);
@@ -3230,11 +3259,11 @@ void undoTagEdit() {
             db->rollback();
         } catch (const std::exception&) {
         }
-        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     if (!done) {
-        MessageBoxW(app.hwnd, L"元に戻せるタグの操作はありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"元に戻せるタグの操作はありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     app.searchNotice = L"元に戻しました: " + widen(desc);
@@ -3742,7 +3771,7 @@ void tagDictImport() {
         setText(w.status, L"中止しています…");
         return;
     }
-    if (MessageBoxW(w.wnd,
+    if (logBox(w.wnd,
                     L"Danbooru（danbooru.donmai.us）から、使われている別名と親子関係の一覧を取り込みます。\r\n"
                     L"相手の負担にならないよう 1 秒に 1 回ずつ取るので、数分かかります。取り込んだ分は前の分と入れ替えます。",
                     L"タグ辞書", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
@@ -4040,7 +4069,7 @@ void ExplorerApp::ExplorerFindSimilarAi(const std::wstring& path) {
     for (const auto& f : folderList()) roots.push_back(narrow(f));
     const int64_t id = findImageId(*db, narrow(path), roots);
     if (!id) {
-        MessageBoxW(app.hwnd, L"この画像はまだインデックスにありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"この画像はまだインデックスにありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     if (app.tab != 1) switchTab(1);
@@ -4060,7 +4089,7 @@ void ExplorerApp::ExplorerAddTag(const std::vector<std::wstring>& paths, const s
     for (const auto& p : paths)
         if (const int64_t id = findImageId(*db, narrow(p), roots)) ids.push_back(id);
     if (ids.empty()) {
-        MessageBoxW(app.hwnd, L"インデックスに無い画像にはタグを付けられません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"インデックスに無い画像にはタグを付けられません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     const std::string t = narrow(tag);
@@ -4116,7 +4145,7 @@ void ExplorerApp::ExplorerRenameTag(const std::wstring& tag) {
         setUserTagName(*db, narrow(tag), narrow(name));
         app.tagNames = loadTagNames(*db);
     } catch (const std::exception& e) {
-        MessageBoxW(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
         return;
     }
     refreshTagLabels();
@@ -4213,7 +4242,7 @@ bool ExplorerApp::ExplorerIsRoot(const std::wstring& dir) {
 
 void removeRoot(const std::wstring& dir) {
     const std::wstring d = stripTrailingSlash(dir);
-    if (MessageBoxW(app.hwnd,
+    if (logBox(app.hwnd,
                     (L"「" + d + L"」を調べるフォルダから外しますか？\n\nこれからは中の変化を見なくなります。"
                                L"作ったインデックス（タグなど）は残り、ファイルも消しません。")
                         .c_str(),
@@ -4234,7 +4263,7 @@ void ExplorerApp::ExplorerRemoveRoot(const std::wstring& dir) { removeRoot(dir);
 void removeRootMenu() {
     const auto f = folderList();
     if (f.empty()) {
-        MessageBoxW(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     HMENU menu = CreatePopupMenu();
@@ -5056,6 +5085,8 @@ bool writeBytes(const std::wstring& path, const void* data, size_t size) {
 
 void setQueryStatus(const std::wstring& text) {
     if (app.queryTags) SetWindowTextW(app.queryTags, text.c_str());
+    if (text.find(L"できませんでした") != std::wstring::npos || text.find(L"読めません") != std::wstring::npos)
+        logs::warn("画像で探す: " + narrow(text));
 }
 
 bool isUrlText(const std::wstring& s) { return _wcsnicmp(s.c_str(), L"http://", 7) == 0 || _wcsnicmp(s.c_str(), L"https://", 8) == 0; }
@@ -5630,6 +5661,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
         case CMD_HELP: return L"使い方の説明を出します（F1）";
+        case CMD_OPEN_LOGS: return L"動作履歴（ログ）のフォルダを開きます。おかしな動きをした時は、ここの .log を見せてください";
         case CMD_SEARCH: return L"調べるフォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
         case CMD_QUERY: return L"画像を 1 枚選んで、それと同じ・似た画像を探します（Ctrl+F）";
         case CMD_EXPORT: return L"重複の結果を CSV と、サムネイル付きの HTML に書き出します（Ctrl+S）";
@@ -5763,7 +5795,7 @@ void appendMainMenus(HMENU root) {
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
     popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
-    popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_ABOUT});
+    popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, 0, CMD_ABOUT});
 }
 
 void syncMenuChecks() {
@@ -5998,7 +6030,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_COPY_PATH: copyText(selectedPath()); break;
                 case CMD_CHECK_UPDATE:
                     if (app.running)
-                        MessageBoxW(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
+                        logBox(hwnd, L"検索が終わってから確認してください。", L"imgdupe", MB_ICONINFORMATION);
                     else
                         startCheck(kManual);
                     break;
@@ -6144,9 +6176,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_HELP: showHelp(); break;
+                case CMD_OPEN_LOGS: {
+                    const std::wstring dir = app.dataDir + L"\\logs";
+                    CreateDirectoryW(dir.c_str(), nullptr);
+                    ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
+                }
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_ABOUT:
-                    MessageBoxW(hwnd,
+                    logBox(hwnd,
                                 (L"imgdupe " + widen(IMGDUPE_VERSION) + L"\r\n重複画像検索\r\n\r\n"
                                  L"github.com/" APP_REPOSITORY L"\r\n\r\n"
                                  L"設定・キャッシュ: " + app.dataDir)
@@ -6269,11 +6307,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE:
             if (app.closing) return 0;
             if (app.updating) {
-                MessageBoxW(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
+                logBox(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
                 return 0;
             }
             if (app.modelsDownloading) {
-                if (MessageBoxW(hwnd, L"AI 解析の部品をダウンロードしています。中止して終了しますか？\r\n（入れ終わった部品はそのまま使えます）",
+                if (logBox(hwnd, L"AI 解析の部品をダウンロードしています。中止して終了しますか？\r\n（入れ終わった部品はそのまま使えます）",
                                 L"imgdupe", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     app.closeAfterModels = true;
                     app.modelsCancel = true;
@@ -6281,7 +6319,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (app.running &&
-                MessageBoxW(hwnd, L"検索中です。中止して終了しますか？\r\n（読み込んだ分はキャッシュに残します）", L"imgdupe",
+                logBox(hwnd, L"検索中です。中止して終了しますか？\r\n（読み込んだ分はキャッシュに残します）", L"imgdupe",
                             MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
             saveSettings();
@@ -6451,9 +6489,9 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
 // アンインストール（「アプリと機能」から imgdupe.exe --uninstall で呼ばれる）
 int runUninstall() {
     const wchar_t* title = L"imgdupe のアンインストール";
-    if (MessageBoxW(nullptr, L"imgdupe をアンインストールしますか？\r\n（画像は消えません）", title, MB_YESNO | MB_ICONQUESTION) != IDYES)
+    if (logBox(nullptr, L"imgdupe をアンインストールしますか？\r\n（画像は消えません）", title, MB_YESNO | MB_ICONQUESTION) != IDYES)
         return 1;
-    const int data = MessageBoxW(nullptr,
+    const int data = logBox(nullptr,
                                  L"設定と画像の情報（imgdupe.db・サムネイル・imgdupe.ini）も消しますか？\r\n"
                                  L"「いいえ」なら残します（入れ直した時にそのまま使えます）。",
                                  title, MB_YESNOCANCEL | MB_ICONQUESTION);
@@ -6489,7 +6527,7 @@ int runUninstall() {
         }
         if (app.dataDir != exeDir()) RemoveDirectoryW(app.dataDir.c_str());
     }
-    MessageBoxW(nullptr, L"imgdupe をアンインストールしました。", title, MB_ICONINFORMATION);
+    logBox(nullptr, L"imgdupe をアンインストールしました。", title, MB_ICONINFORMATION);
     // 動いている exe は自分では消せないので、終わってから cmd に消してもらう（消えるまで 1 秒ごとに最大 20 回。フォルダは空の時だけ消える）
     const std::wstring exe = upd::exePath(), dir = exeDir();
     std::wstring cmd = L"cmd.exe /c for /l %i in (1,1,20) do (if exist \"" + exe + L"\" (ping -n 2 127.0.0.1 >nul & del /f /q \"" +
@@ -6583,6 +6621,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         CoUninitialize();
         return code;
     }
+    logwin::start(app.dataDir, "imgdupe", "画面");
     // exe にフォルダをドロップして起動した時は、そのフォルダをすぐ検索する
     std::vector<std::wstring> argFolders;
     for (int i = 1; argv && i < argc; ++i) argFolders.emplace_back(argv[i]);
@@ -6613,7 +6652,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     const std::wstring title = L"imgdupe - 重複画像検索 " + widen(IMGDUPE_VERSION);
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                 px(1180), px(780), nullptr, nullptr, inst, nullptr);
-    if (!hwnd) return 1;
+    if (!hwnd) {
+        logs::error("ウィンドウを作れなかった（" + std::to_string(GetLastError()) + "）");
+        logwin::stop();
+        return 1;
+    }
 
     // 前回の設定（起動時にフォルダを渡されたら、そちらを使う）
     for (const auto& f : argFolders) addFolder(f);
@@ -6669,6 +6712,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    logwin::stop();
     CoUninitialize();
     return 0;
 }

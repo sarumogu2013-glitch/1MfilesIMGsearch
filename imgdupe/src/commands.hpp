@@ -63,6 +63,7 @@ enum Cmd : int {
     CMD_QUERY_SAME,       // 選んだ画像と同じ画像を探す
     CMD_QUERY_SIMILAR,    // 選んだ画像に似た画像を探す（AI）
     CMD_QUERY_TAGS,       // 選んだ画像のタグを生成（AI）
+    CMD_OPEN_LOGS,        // 動作履歴（ログ）のフォルダを開く
 };
 
 struct CmdInfo {

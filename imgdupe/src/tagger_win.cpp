@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "image_win.hpp"
+#include "log.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
 #include "onnx_win.hpp"
@@ -61,6 +62,7 @@ public:
             return true;
         if (n == 1) return false;
         // まとめて流せなかった（GPU のメモリが足りないなど）: これからは 1 枚ずつにして、今の分も 1 枚ずつやり直す
+        imgdupe::logs::warn("タグ付け: " + std::to_string(n) + " 枚まとめて GPU に流せなかったので、これからは 1 枚ずつにする（" + error + "）");
         batch_ = 1;
         const size_t one = input.size() / n;
         probs.clear();

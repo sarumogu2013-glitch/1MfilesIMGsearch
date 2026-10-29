@@ -13,6 +13,7 @@
 #include "quality.hpp"
 #include "tagrel.hpp"
 #include "image_win.hpp"
+#include "log.hpp"
 #include "models.hpp"
 #include "models_win.hpp"
 #include "onnx_win.hpp"
@@ -121,6 +122,7 @@ public:
             return true;
         if (n == 1) return false;
         // まとめて流せなかった: これからは 1 枚ずつ
+        imgdupe::logs::warn("CLIP: " + std::to_string(n) + " 枚まとめて GPU に流せなかったので、これからは 1 枚ずつにする（" + error + "）");
         batch_ = 1;
         const size_t one = pixels.size() / n;
         out.clear();

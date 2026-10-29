@@ -23,6 +23,8 @@
 #include "db.hpp"
 #include "image_win.hpp"
 #include "indexer.hpp"
+#include "log.hpp"
+#include "log_win.hpp"
 #include "meta.hpp"
 #include "names.hpp"
 #include "quality.hpp"
@@ -54,7 +56,7 @@ constexpr ULONGLONG kChangeQuietMs = 10 * 1000;       // フォルダが変わ�
 constexpr ULONGLONG kRescanMs = 30 * 60 * 1000;       // 変化が無くても、これだけたったら調べ直す
 constexpr DWORD kIdleMs = 60 * 1000;                  // これだけ操作が無ければ全力で処理する
 
-enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT, ID_TASKS, ID_LOAD0 = 100 };  // ID_LOAD0 + 負荷
+enum : UINT { ID_PAUSE = 1, ID_RESCAN, ID_OPEN_GUI, ID_QUIT, ID_TASKS, ID_LOGS, ID_LOAD0 = 100 };  // ID_LOAD0 + 負荷
 enum : UINT { ID_TASK_TOP = 1, ID_TASK_UP, ID_TASK_DOWN, ID_TASK_BOTTOM, ID_TASK_REMOVE };
 
 std::wstring exePath() {
@@ -178,6 +180,7 @@ void checkPreempt(Db& db) {
 
 // GUI からの指示
 void handleCommand(Db& db, const std::string& c) {
+    logs::info("画面からの指示: " + c);
     if (c == "quit") g->quit = true;
     else if (c == "rescan") g->dirty = true;
     else if (c == "pause") g->paused = true;
@@ -286,6 +289,7 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
         // 操作中は推論も 1 スレッドだけ（操作していなければ全部のコア）
         tagger::LoadResult r = tagger::load(g->dataDir, threadsForLoad(), cb.threadInit, cb.threadExit);
         error = narrow(r.error);
+        if (r.analyzer) logs::info("タグ付けのモデルを読んだ（" + narrow(r.device) + "）");
         if (r.analyzer) {
             std::lock_guard<std::mutex> lock(g->m);
             g->taggerDevice = r.device;
@@ -311,6 +315,7 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
     cb.makeClip = [&cb](std::string& error) {
         clip::LoadResult r = clip::loadAnalyzer(g->dataDir, threadsForLoad(), cb.threadInit, cb.threadExit);
         error = narrow(r.error);
+        if (r.analyzer) logs::info("CLIP のモデルを読んだ（" + narrow(r.device) + "）");
         if (r.analyzer) {
             std::lock_guard<std::mutex> lock(g->m);
             g->taggerDevice = r.device;
@@ -332,7 +337,10 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
                 } catch (const std::exception&) {
                 }
             }
-            if (g->paused || g->quit || !busyReason().empty()) g->cancelRun = true;
+            if (!g->cancelRun && (g->paused || g->quit || !busyReason().empty())) {
+                logs::info(std::string("処理を止める: ") + (g->quit ? "終了の指示" : g->paused ? "一時停止" : narrow(busyReason())));
+                g->cancelRun = true;
+            }
             Sleep(1000);
         }
     });
@@ -356,6 +364,7 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
             setStatus(&g->lastResult, t);
         }
     } catch (const std::exception& e) {
+        logs::error(std::string("解析の途中でエラー: ") + e.what());
         setStatus(&g->lastResult, L"エラー: " + widen(e.what()));
     }
     if (background) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
@@ -380,6 +389,7 @@ void workLoop() {
             for (const auto& c : takeCommands(db)) handleCommand(db, c);
             const std::vector<std::string> r = getRoots(db);
             if (r != rootsUtf8) {
+                logs::info("調べるフォルダ: " + std::to_string(r.size()) + " 個");
                 rootsUtf8 = r;
                 std::lock_guard<std::mutex> lock(g->m);
                 g->roots.clear();
@@ -412,6 +422,13 @@ void workLoop() {
         std::wstring reason = g->paused                         ? L"一時停止中"
                               : rootsUtf8.empty() && !haveTasks ? L"調べるフォルダがありません"
                                                                 : busyReason();
+        {
+            static std::wstring lastReason = L"-";
+            if (reason != lastReason) {
+                if (!reason.empty()) logs::info("待つ: " + narrow(reason));
+                lastReason = reason;
+            }
+        }
         setStatus(&g->waitReason, reason);
         if ((full || haveTasks) && reason.empty()) {
             if (full) g->dirty = false;
@@ -1093,6 +1110,7 @@ void showMenu() {
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"処理の負荷(&L)");
     }
     AppendMenuW(menu, MF_STRING, ID_OPEN_GUI, L"imgdupe を開く(&O)");
+    AppendMenuW(menu, MF_STRING, ID_LOGS, L"動作履歴（ログ）のフォルダを開く(&G)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_QUIT, L"バックグラウンドの解析を終了(&X)");
     POINT pt;
@@ -1101,14 +1119,22 @@ void showMenu() {
     const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g->hwnd, nullptr);
     DestroyMenu(menu);
     switch (cmd) {
-        case ID_PAUSE: g->paused = !g->paused; break;
+        case ID_PAUSE:
+            g->paused = !g->paused;
+            logs::info(g->paused ? "トレイから一時停止" : "トレイから再開");
+            break;
         case ID_RESCAN: g->dirty = true; break;
         case ID_OPEN_GUI: openGui(); break;
         case ID_TASKS: togglePopup(false, 2); break;
-        case ID_QUIT: g->quit = true; break;
+        case ID_QUIT:
+            logs::info("トレイから終了");
+            g->quit = true;
+            break;
+        case ID_LOGS: ShellExecuteW(nullptr, L"open", (g->dataDir + L"\\logs").c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
         default:
             if (cmd >= ID_LOAD0 + kLoadLight && cmd <= ID_LOAD0 + kLoadHeavy && static_cast<int>(cmd - ID_LOAD0) != g->load) {
                 setLoadLevel(g->dataDir, static_cast<int>(cmd - ID_LOAD0));
+                logs::info("処理の負荷を変えた: " + narrow(loadLevelName(static_cast<int>(cmd - ID_LOAD0))));
                 // 今の回を止めて、新しい負荷でやり直す
                 g->cancelRun = true;
                 g->dirty = true;
@@ -1133,7 +1159,15 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_TIMER:
-            if (wp == kTipTimer) updateTip();
+            if (wp == kTipTimer) {
+                updateTip();
+                // 10 分ごとに進み具合を書く（止まっていないかを後から確かめられるように）
+                static ULONGLONG lastLog = GetTickCount64();
+                if (g->running && GetTickCount64() - lastLog >= 10 * 60 * 1000) {
+                    lastLog = GetTickCount64();
+                    logs::info("進み具合: " + narrow(statusText()));
+                }
+            }
             return 0;
         case WM_SHOW_TASKS:
             togglePopup(false, 2);
@@ -1165,6 +1199,14 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
             CloseHandle(mutex);
             return 0;  // もう動いている
         }
+    }
+    logwin::start(dataDir, "indexer", "解析");
+    {
+        const std::wstring ini = dataDir + L"\\imgdupe.ini";
+        auto on = [&](const wchar_t* key, int def) { return GetPrivateProfileIntW(L"imgdupe", key, def, ini.c_str()) ? "あり" : "なし"; };
+        logs::info("設定: 負荷 " + narrow(loadLevelName(loadLevel(dataDir))) + "、タグ付け " + on(L"taggerEnabled", 1) + "、CLIP " +
+                   on(L"clipEnabled", 1) + "、品質 " + on(L"qualityEnabled", 1) + "、CPU だけ " + on(L"taggerCpu", 0) + "、出典の照会 " +
+                   on(L"lookupEnabled", 0));
     }
     // プロセスごと優先度を決める（ONNX Runtime が作るスレッドも含めて。控えめなら CPU とディスクの優先度を下げる）
     applyProcessPriority(loadLevel(dataDir));
@@ -1202,6 +1244,7 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
     if (r.worker.joinable()) r.worker.join();
     if (r.watcher.joinable()) r.watcher.join();
     g = nullptr;
+    logwin::stop();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     return 0;

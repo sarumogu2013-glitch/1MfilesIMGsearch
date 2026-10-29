@@ -1,12 +1,16 @@
 #include "indexer.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <exception>
+#include <functional>
 #include <thread>
 #include <cstring>
 #include <stdexcept>
 
 #include "clip.hpp"
+#include "log.hpp"
 #include "names.hpp"
 #include "quality.hpp"
 
@@ -105,13 +109,46 @@ Outcome combine(Outcome a, Outcome b) {
 }
 
 // 1 つの段階を流す。済んだら progress.doneMask に印を付ける
+const char* phaseLogName(IndexPhase p) {
+    switch (p) {
+        case IndexPhase::Scan: return "フォルダを調べる";
+        case IndexPhase::Hash: return "ハッシュ";
+        case IndexPhase::Thumb: return "サムネイル";
+        case IndexPhase::Meta: return "メタデータ";
+        case IndexPhase::Names: return "json・フォルダ名";
+        case IndexPhase::Tagger: return "タグ付け";
+        case IndexPhase::Clip: return "CLIP";
+        case IndexPhase::Variants: return "差分のまとまり";
+        case IndexPhase::Quality: return "品質";
+        case IndexPhase::Lookup: return "出典の照会";
+        case IndexPhase::Merge: return "仕上げ";
+        default: return "?";
+    }
+}
+
+double secondsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// 動作履歴: 「段階 タグ付け: 512 / 1400187 枚（失敗 0）・120.3 秒・4.3 枚/秒・譲った」
+void logStage(IndexPhase phase, const StageReport& sr, uint64_t total, double sec) {
+    if (!sr.processed && !total) return;  // する事が無かった段階は書かない
+    char t[256];
+    std::snprintf(t, sizeof t, "段階 %s: %zu / %llu 枚（失敗 %zu）・%.1f 秒・%.1f 枚/秒%s", phaseLogName(phase), sr.processed,
+                  static_cast<unsigned long long>(total), sr.failed, sec, sec > 0 ? double(sr.processed) / sec : 0.0,
+                  sr.yielded ? "・上のスキャンタスクに譲った" : sr.cancelled ? "・止めた" : "");
+    (sr.failed && sr.failed * 10 > sr.processed ? logs::warn : logs::info)(t);
+}
+
 Outcome runOne(Db& db, RunState& s, IndexPhase phase, Analyzer& a, const std::vector<int64_t>* within, unsigned threads,
                std::atomic<int>& phaseOut, Progress& prog, IndexReport& rep, size_t& counter, bool countFailed) {
     phaseOut = static_cast<int>(phase);
+    const auto t0 = std::chrono::steady_clock::now();
     // 1 スレッドだけの時（控えめで操作中）は前処理が遅く、GPU が数枚ごとに動いたり止まったりする。
     // まとめた数の 4 倍たまってから続けて流し、その間は休ませる（細かく波打つと、グラフィックカードから音が出やすい）
     const size_t burst = threads <= 1 && a.batchSize() ? a.batchSize() * 4 : 0;
     const StageReport sr = runStage(db, a, threads, s.cancel, &prog, 256, within, s.opt.preempt, burst);
+    logStage(phase, sr, prog.total, secondsSince(t0));
     counter += countFailed ? sr.processed : sr.processed - sr.failed;
     rep.failed += sr.failed;
     const Outcome o = outcomeOf(sr);
@@ -168,6 +205,7 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
         if (!s.taggerTried) {
             s.taggerTried = true;
             s.tagger = cb.makeTagger(rep.taggerError);
+            if (!s.tagger) logs::error("タグ付けのモデルを読めませんでした: " + rep.taggerError);
         }
         if (s.tagger && (o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged)) != Outcome::Done) return o;
     }
@@ -185,6 +223,7 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
             if (!s.clipTried) {
                 s.clipTried = true;
                 s.clip = cb.makeClip(rep.clipError);
+                if (!s.clip) logs::error("CLIP のモデルを読めませんでした: " + rep.clipError);
             }
             if (s.clip && (o = stage(IndexPhase::Clip, *s.clip, rep.clipped)) != Outcome::Done) return o;
         }
@@ -246,20 +285,27 @@ Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
 bool finish(Db& db, RunState& s, bool lookup) {
     const IndexCallbacks& cb = s.cb;
     IndexProgress& progress = s.progress;
+    // 時間がかかった時だけ書く（何も変わっていなければすぐ終わる）
+    auto timed = [&](IndexPhase phase, const std::function<void()>& f) {
+        progress.phase = static_cast<int>(phase);
+        const auto t0 = std::chrono::steady_clock::now();
+        f();
+        const double sec = secondsSince(t0);
+        if (sec >= 1.0) {
+            char t[128];
+            std::snprintf(t, sizeof t, "段階 %s: %.1f 秒%s", phaseLogName(phase), sec, s.cancel ? "・止めた" : "");
+            logs::info(t);
+        }
+    };
     if ((cb.clipVersion ? cb.clipVersion() : 0) && cb.makeClip && cb.afterClip) {
-        progress.phase = static_cast<int>(IndexPhase::Variants);
-        cb.afterClip(db, s.opt.threads, s.cancel, &progress.prog);
+        timed(IndexPhase::Variants, [&] { cb.afterClip(db, s.opt.threads, s.cancel, &progress.prog); });
         if (s.cancel) return false;
     }
     if (lookup && cb.lookup) {
-        progress.phase = static_cast<int>(IndexPhase::Lookup);
-        cb.lookup(db, s.cancel, &progress.prog);
+        timed(IndexPhase::Lookup, [&] { cb.lookup(db, s.cancel, &progress.prog); });
         if (s.cancel) return false;
     }
-    if (cb.merge) {
-        progress.phase = static_cast<int>(IndexPhase::Merge);
-        cb.merge(db);
-    }
+    if (cb.merge) timed(IndexPhase::Merge, [&] { cb.merge(db); });
     return true;
 }
 
@@ -285,6 +331,12 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
     const size_t removed = removeUnder.empty() ? 0 : removeMissing(db, removeUnder, ids);
     s.rep.removed += removed;
     s.rep.added += static_cast<size_t>(std::max<int64_t>(0, imageCount(db) - before + static_cast<int64_t>(removed)));
+    {
+        char t[160];
+        std::snprintf(t, sizeof t, "フォルダを調べた: 画像 %zu 枚（新しく %zu 枚・消えた %zu 枚）", files.size(),
+                      static_cast<size_t>(std::max<int64_t>(0, imageCount(db) - before + static_cast<int64_t>(removed))), removed);
+        logs::info(t);
+    }
     std::vector<int64_t> out;
     out.reserve(files.size());
     for (const auto& f : files) {
@@ -365,7 +417,19 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
     if (!db.open(opt.dbFile)) throw std::runtime_error("画像の情報（DB）を開けません: " + db.error());
     RunState s{opt, cb, progress, cancel, rep};
     bool scanned = false, tasksDone = false;
+    const auto runStart = std::chrono::steady_clock::now();
+    {
+        char t[160];
+        const std::string threads = opt.threads ? std::to_string(opt.threads) : std::string("自動");
+        std::snprintf(t, sizeof t, "回を始める（%s・スレッド %s・調べるフォルダ %zu 個・DB の画像 %lld 枚）",
+                      opt.fullPass ? "フォルダ全体" : "スキャンタスクだけ", threads.c_str(), opt.roots.size(),
+                      static_cast<long long>(imageCount(db)));
+        logs::info(t);
+    }
     auto stop = [&] {
+        char t[96];
+        std::snprintf(t, sizeof t, "回を途中で止めた（%.0f 秒）。続きは次の回で", secondsSince(runStart));
+        logs::info(t);
         rep.cancelled = true;
         progress.task = -1;
         progress.phase = static_cast<int>(IndexPhase::Done);
@@ -379,6 +443,8 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             // 一番上のスキャンタスク: そのフォルダ・ファイルだけを調べ、全部の段階を済ませる
             const ScanTask& t = tasks.front();
             progress.task = t.id;
+            logs::info("スキャンタスクを始める: 「" + t.label + "」（" + std::to_string(t.paths.size()) + " 個のパス、残りのタスク " +
+                       std::to_string(tasks.size()) + " 個）");
             // 調べるフォルダの中のパスは、調べるフォルダと同じ書き方にする（DB のパスは大文字・小文字や / と \ を区別するので、
             // 書き方が違うと同じ画像を別の画像としてもう一度登録してしまう）
             std::vector<std::string> paths;
@@ -390,7 +456,11 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             if (cancel) return stop();
             const Outcome o = runStages(db, s, &ids);
             if (o == Outcome::Cancelled) return stop();
-            if (o == Outcome::Yielded) continue;
+            if (o == Outcome::Yielded) {
+                logs::info("スキャンタスク「" + t.label + "」を中断して、上に来たタスクを先にする");
+                continue;
+            }
+            logs::info("スキャンタスクを終えた: 「" + t.label + "」（画像 " + std::to_string(ids.size()) + " 枚）");
             removeScanTask(db, t.id);
             ++rep.tasks;
             tasksDone = true;
@@ -408,7 +478,10 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             scanAndRegister(db, s, opt.roots, opt.roots);
             if (cancel) return stop();
             // 前の版のスキャンタスクで、書き方の違うパスで二重に登録した画像を消す
-            rep.removed += removeMisspelled(db, opt.roots);
+            if (const size_t n = removeMisspelled(db, opt.roots)) {
+                rep.removed += n;
+                logs::warn("書き方の違うパスで二重に登録されていた画像 " + std::to_string(n) + " 枚を消した");
+            }
             scanned = true;
         }
         const Outcome o = runStages(db, s, nullptr);
@@ -419,6 +492,12 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
     }
     progress.task = -1;
     progress.phase = static_cast<int>(IndexPhase::Done);
+    {
+        char t[200];
+        std::snprintf(t, sizeof t, "回を終えた（%.0f 秒。スキャンタスク %zu 個、ハッシュ %zu・タグ付け %zu・CLIP %zu・失敗 %zu）",
+                      secondsSince(runStart), rep.tasks, rep.hashed, rep.tagged, rep.clipped, rep.failed);
+        logs::info(t);
+    }
     return rep;
 }
 
