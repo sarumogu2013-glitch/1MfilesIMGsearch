@@ -66,6 +66,7 @@ enum Cmd : int {
     CMD_OPEN_LOGS,        // 動作履歴（ログ）のフォルダを開く
     CMD_INFER_RULES,      // フォルダ名から読み取る形（教えた形の一覧）
     CMD_REFRESH,          // 更新（画面の控えを捨てて読み直す）
+    CMD_COMPACT_DB,       // DB を詰めて小さくする
 };
 
 struct CmdInfo {

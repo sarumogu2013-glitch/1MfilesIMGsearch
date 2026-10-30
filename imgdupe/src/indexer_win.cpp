@@ -25,6 +25,7 @@
 #include "indexer.hpp"
 #include "log.hpp"
 #include "pathinfer.hpp"
+#include "tagstore.hpp"
 #include "log_win.hpp"
 #include "meta.hpp"
 #include "names.hpp"
@@ -87,6 +88,7 @@ struct Resident {
     std::atomic<bool> quit{false}, paused{false}, cancelRun{false}, running{false};
     std::atomic<bool> dirty{true};             // 調べ直しが要る（フォルダ全体）
     std::atomic<bool> inferDirty{false};       // フォルダ名からの推し量りだけやり直す（教えた形が変わった）
+    std::atomic<bool> compactDb{false};        // DB を詰める（画面の「DB を詰めて小さくする」）
     std::atomic<bool> tasksDirty{true};        // スキャンタスクが足された
     std::atomic<bool> preempt{false};          // 今のタスクより上に別のタスクが来た（indexOnce が切れ目で譲る）
     std::atomic<ULONGLONG> changeTick{0};      // フォルダの変化に気づいた時刻（0 = なし）
@@ -186,6 +188,7 @@ void handleCommand(Db& db, const std::string& c) {
     if (c == "quit") g->quit = true;
     else if (c == "rescan") g->dirty = true;
     else if (c == "infer") g->inferDirty = true;
+    else if (c == "compact") g->compactDb = true;
     else if (c == "pause") g->paused = true;
     else if (c == "resume") g->paused = false;
     else if (c == "tasks") {
@@ -447,6 +450,27 @@ void workLoop() {
             lastRun = GetTickCount64();
             continue;
         }
+        if (g->compactDb && !g->paused) {
+            // DB を詰める（終わるまで解析はしない）
+            g->compactDb = false;
+            setStatus(&g->waitReason, L"DB を詰めています（数分かかることがあります。終わるまで解析は止まります）");
+            const DbSpace before = dbSpace(db);
+            const auto t0 = GetTickCount64();
+            std::string error;
+            if (compactDb(db, error)) {
+                const DbSpace after = dbSpace(db);
+                char t[160];
+                std::snprintf(t, sizeof t, "DB を詰めた: %.0f MB → %.0f MB（%llu 秒）", before.fileBytes / 1048576.0,
+                              after.fileBytes / 1048576.0, static_cast<unsigned long long>((GetTickCount64() - t0) / 1000));
+                logs::info(t);
+                setStatus(&g->lastResult, widen(t));
+            } else {
+                logs::error("DB を詰められなかった: " + error);
+                setStatus(&g->lastResult, L"DB を詰められませんでした: " + widen(error));
+            }
+            setStatus(&g->waitReason, L"");
+            continue;
+        }
         if (g->inferDirty && !g->paused) {
             // 教えた形が変わった: フォルダ名からの推し量りだけやり直す（走査はしない）
             g->inferDirty = false;
@@ -514,6 +538,7 @@ const wchar_t* phaseName(IndexPhase p) {
         case IndexPhase::Quality: return L"品質";
         case IndexPhase::Lookup: return L"出典の照会";
         case IndexPhase::Merge: return L"仕上げ（辞書・親子関係）";
+        case IndexPhase::Convert: return L"DB の変換（タグの置き場所を新しい形に。初回だけ）";
         default: return L"";
     }
 }
@@ -1294,6 +1319,11 @@ void requestQuit(const std::wstring& dataDir) {
 void requestRescan(const std::wstring& dataDir) {
     Db db;
     if (db.open(dbFileOf(dataDir))) addCommand(db, "rescan");
+}
+
+void requestCompact(const std::wstring& dataDir) {
+    Db db;
+    if (db.open(dbFileOf(dataDir))) addCommand(db, "compact");
 }
 
 void requestInfer(const std::wstring& dataDir) {

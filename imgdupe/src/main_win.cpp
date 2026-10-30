@@ -54,6 +54,8 @@
 #include "resource.h"
 #include "search.hpp"
 #include "links.hpp"
+#include "sqlite3.h"
+#include "tagstore.hpp"
 #include "pathinfer.hpp"
 #include "log.hpp"
 #include "log_win.hpp"
@@ -92,6 +94,7 @@ constexpr UINT WM_APP_MODELS_DONE = WM_APP + 9;     // lParam: std::wstring*（�
 constexpr UINT WM_APP_QUERY_FILE = WM_APP + 11;  // lParam: QueryFetched*（URL の画像をダウンロードした）
 constexpr UINT WM_APP_QUERY_VEC = WM_APP + 12;   // lParam: QueryVector*（似た画像を探す画像のベクトル）
 constexpr UINT WM_APP_QUERY_TAGS = WM_APP + 13;  // lParam: QueryTagsDone*（生成したタグ）
+constexpr UINT WM_APP_CONVERT = WM_APP + 14;     // lParam: std::wstring*（DB の変換の様子。空なら済んだ）
 constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
@@ -3337,21 +3340,25 @@ struct StatsData {
     StatsSummary summary;
     std::vector<StatRow> rows[10];  // タグ（kStatKinds の並び）・月・形式
     std::wstring error;
+    int64_t at = 0;      // 集計した時刻
+    bool saved = false;  // 前に集計して残したもの
 };
 
 struct StatsWindow {
-    HWND wnd = nullptr, summary = nullptr, view = nullptr, list = nullptr, note = nullptr, progress = nullptr, status = nullptr;
+    HWND wnd = nullptr, summary = nullptr, view = nullptr, list = nullptr, note = nullptr, progress = nullptr, status = nullptr,
+         recount = nullptr;
     std::unique_ptr<StatsData> data;
     bool done = false;
     std::wstring searchTag;  // 閉じた後に検索するタグ
     int64_t most = 1;        // 棒の長さの基準（一番多い数）
 } statsWin;
 
-enum { IDC_SS_VIEW = 400, IDC_SS_LIST };
+enum { IDC_SS_VIEW = 400, IDC_SS_LIST, IDC_SS_RECOUNT };
 const wchar_t* const kStatViews[] = {L"作者別", L"サークル別", L"アカウント別", L"キャラ別", L"作品別", L"イベント別", L"タイトル別", L"行動・アイテム別",
                                      L"月ごとの増え方", L"形式別"};
 const std::vector<std::string> kStatKinds[] = {{"artist"}, {"circle"}, {"account"}, {"character"}, {"copyright"}, {"event"}, {"title"}, {"action", "item"}};
 constexpr int kStatTagViews = static_cast<int>(std::size(kStatKinds));  // ここまではタグ。後ろに月・形式
+// kStatKinds は stats.cpp の statTagKinds と同じ並び（集計して残すのは stats.cpp）
 static_assert(std::size(kStatViews) == kStatTagViews + 2 && std::extent_v<decltype(StatsData::rows)> == std::size(kStatViews), "統計の表の数");
 
 std::wstring statsSummaryText(const StatsSummary& s) {
@@ -3409,34 +3416,40 @@ void fillStatsList() {
     setText(w.note, note);
 }
 
-void loadStats() {
+// 統計: 前に集計した結果（バックグラウンドの解析が 6 時間ごとに残す）があればすぐ出す。recount なら今集計し直して残す
+void loadStats(bool recount) {
     HWND wnd = statsWin.wnd;
     const std::wstring db = dbPath();
-    std::thread([wnd, db] {
+    if (statsWin.recount) EnableWindow(statsWin.recount, FALSE);
+    std::thread([wnd, db, recount] {
         const ULONGLONG t0 = GetTickCount64();
         auto* p = new StatsData;
-        // 進み具合（済んだ数と、これから数えるもの）を窓に送る
-        auto step = [wnd](int done, const std::wstring& what) {
-            auto* t = new std::wstring(what);
-            if (!PostMessageW(wnd, WM_STATS_PROGRESS, static_cast<WPARAM>(done), reinterpret_cast<LPARAM>(t))) delete t;
+        auto fill = [p](const StatsSnapshot& snap) {
+            p->summary = snap.summary;
+            for (size_t i = 0; i < snap.views.size() && i < std::size(p->rows); ++i) p->rows[i] = snap.views[i];
+            p->at = snap.at;
         };
         try {
             Db d;
             if (!d.open(narrow(db))) throw std::runtime_error(d.error());
-            step(0, L"全体の数");
-            p->summary = statsSummary(d);
-            for (int i = 0; i < kStatTagViews; ++i) {
-                step(i + 1, kStatViews[i]);
-                p->rows[i] = tagCounts(d, kStatKinds[i], 0.5, 500);
+            StatsSnapshot snap;
+            if (!recount && loadStatsSnapshot(d, snap)) {
+                fill(snap);
+                p->saved = true;
+            } else {
+                // 進み具合（済んだ数と、今数えているもの）を窓に送る
+                snap = computeStats(d, [wnd](int done, int total, const std::string& what) {
+                    auto* t = new std::wstring(widen(what));
+                    if (!PostMessageW(wnd, WM_STATS_PROGRESS, MAKEWPARAM(done, total), reinterpret_cast<LPARAM>(t))) delete t;
+                });
+                saveStatsSnapshot(d, snap);
+                fill(snap);
+                logs::info("統計を集計した（" + std::to_string((GetTickCount64() - t0) / 1000) + " 秒）");
             }
-            step(kStatTagViews + 1, kStatViews[kStatTagViews]);
-            p->rows[kStatTagViews] = monthlyCounts(d);
-            step(kStatTagViews + 2, kStatViews[kStatTagViews + 1]);
-            p->rows[kStatTagViews + 1] = formatCounts(d);
         } catch (const std::exception& e) {
             p->error = L"集計できませんでした: " + widen(e.what());
+            logs::warn("統計を集計できなかった: " + narrow(p->error));
         }
-        logs::info("統計を集計した（" + std::to_string((GetTickCount64() - t0) / 1000) + " 秒）" + (p->error.empty() ? "" : "・" + narrow(p->error)));
         if (!PostMessageW(wnd, WM_STATS_DONE, 0, reinterpret_cast<LPARAM>(p))) delete p;
     }).detach();
 }
@@ -3452,16 +3465,23 @@ void showStatsWindow() {
                 case WM_COMMAND:
                     if (LOWORD(wp) == IDCANCEL) statsWin.done = true;
                     if (LOWORD(wp) == IDC_SS_VIEW && HIWORD(wp) == CBN_SELCHANGE) fillStatsList();
+                    if (LOWORD(wp) == IDC_SS_RECOUNT) {
+                        ShowWindow(statsWin.progress, SW_SHOW);
+                        SendMessageW(statsWin.progress, PBM_SETPOS, 0, 0);
+                        setText(statsWin.status, L"集計しています 0%");
+                        loadStats(true);
+                    }
                     return 0;
                 case WM_CLOSE: statsWin.done = true; return 0;
                 case WM_STATS_PROGRESS: {
                     std::unique_ptr<std::wstring> what(reinterpret_cast<std::wstring*>(lp));
                     if (h != statsWin.wnd) return 0;
-                    const int total = kStatTagViews + 3;
-                    const int pct = static_cast<int>(wp) * 100 / total;
+                    const int done = LOWORD(wp), total = std::max(1, static_cast<int>(HIWORD(wp)));
+                    ShowWindow(statsWin.progress, SW_SHOW);
+                    const int pct = done * 100 / total;
                     SendMessageW(statsWin.progress, PBM_SETPOS, pct, 0);
                     setText(statsWin.status, L"集計しています " + std::to_wstring(pct) + L"%（" + *what + L"を数えています　" +
-                                                 std::to_wstring(wp + 1) + L" / " + std::to_wstring(total) + L"）");
+                                                 std::to_wstring(done + 1) + L" / " + std::to_wstring(total) + L"）");
                     return 0;
                 }
                 case WM_STATS_DONE: {
@@ -3469,7 +3489,18 @@ void showStatsWindow() {
                     if (h != statsWin.wnd) return 0;  // 閉じた後に届いた
                     SendMessageW(statsWin.progress, PBM_SETPOS, 100, 0);
                     ShowWindow(statsWin.progress, SW_HIDE);
-                    setText(statsWin.status, p->error.empty() ? L"集計しました" : L"");
+                    EnableWindow(statsWin.recount, TRUE);
+                    if (!p->error.empty()) {
+                        setText(statsWin.status, L"");
+                    } else {
+                        const time_t at = static_cast<time_t>(p->at);
+                        tm lt{};
+                        localtime_s(&lt, &at);
+                        wchar_t when[64];
+                        swprintf(when, 64, L"%d/%d %02d:%02d", lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+                        setText(statsWin.status, std::wstring(when) + (p->saved ? L" 時点の集計（解析が 6 時間ごとに更新）"
+                                                                                   : L" に集計しました"));
+                    }
                     setText(statsWin.summary, p->error.empty() ? statsSummaryText(p->summary) : p->error);
                     statsWin.data = std::move(p);
                     fillStatsList();
@@ -3566,12 +3597,13 @@ void showStatsWindow() {
     }
     w.note = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, y + listH + px(4), cw - 2 * m, noteH);
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDCANCEL, cw - m - bw, ch - m - bh, bw, bh);
+    w.recount = child(WC_BUTTONW, L"集計し直す", WS_TABSTOP, IDC_SS_RECOUNT, cw - m - bw * 2 - px(8), ch - m - bh, bw, bh);
     // 集計の進み具合（済んだら棒は隠す）
     w.progress = child(PROGRESS_CLASSW, L"", PBS_SMOOTH, -1, m, ch - m - bh + px(6), px(200), bh - px(12));
     SendMessageW(w.progress, PBM_SETRANGE32, 0, 100);
     w.status = child(WC_STATICW, L"集計しています 0%", SS_NOPREFIX | SS_ENDELLIPSIS | SS_CENTERIMAGE, -1, m + px(210), ch - m - bh,
-                     cw - 2 * m - bw - px(220), bh);
-    loadStats();
+                     cw - 2 * m - bw * 2 - px(228), bh);
+    loadStats(false);
 
     EnableWindow(app.hwnd, FALSE);
     ShowWindow(w.wnd, SW_SHOW);
@@ -4808,6 +4840,57 @@ void refreshView() {
     if (ex.view) ex.view->Refresh();
     if (ex.view) ex.view->SetSameStatus(L"更新しました（バックグラウンドの解析はしていません。新しいファイルのインデックスは、タスクトレイの解析が作ります）");
     logs::info("更新した");
+}
+
+// DB を詰めて小さくする: 大きさと空き容量を見せて確かめてから、バックグラウンドの解析に頼む
+void compactDbUi() {
+    Db* db = uiDb();
+    if (!db) return;
+    DbSpace sp;
+    bool pending = false;
+    try {
+        sp = dbSpace(*db);
+        pending = tagConversionState(*db).pending;
+    } catch (const std::exception& e) {
+        logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
+        return;
+    }
+    if (pending) {
+        logBox(app.hwnd, L"DB を新しい形に変換している途中です。変換が済んでから詰めてください（進み具合は下のステータスバーかタスクトレイの窓に出ます）。",
+               L"DB を詰める", MB_ICONINFORMATION);
+        return;
+    }
+    auto gb = [](int64_t b) { return sizeText(static_cast<uint64_t>(std::max<int64_t>(0, b))); };
+    ULARGE_INTEGER freeBytes{};
+    GetDiskFreeSpaceExW(app.dataDir.c_str(), &freeBytes, nullptr, nullptr);
+    const int64_t after = sp.fileBytes - sp.freeBytes;
+    const int64_t need = after * 2 + after / 10;  // 詰めた後の大きさの一時ファイルと、書き込みの記録（-wal）の分と少し
+    std::wstring msg = L"DB（imgdupe.db）: " + gb(sp.fileBytes) + L"\r\n使っていない所: " + gb(sp.freeBytes) + L"\r\n詰めた後: 約 " + gb(after) +
+                       L"\r\n\r\n詰めている間は、バックグラウンドの解析が止まり、検索のタグの変更などが少し待たされます（数分〜数十分）。"
+                       L"\r\n空き容量が約 " + gb(need) + L" 要ります（今の空き: " + gb(static_cast<int64_t>(freeBytes.QuadPart)) + L"）。";
+    if (static_cast<int64_t>(freeBytes.QuadPart) < need) {
+        logBox(app.hwnd, (msg + L"\r\n\r\n空き容量が足りないので、詰められません。").c_str(), L"DB を詰める", MB_ICONWARNING);
+        return;
+    }
+    if (sp.freeBytes < sp.fileBytes / 20) msg += L"\r\n\r\n使っていない所が少ないので、あまり小さくなりません。";
+    if (logBox(app.hwnd, (msg + L"\r\n\r\n詰めますか？").c_str(), L"DB を詰める", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    indexer::requestCompact(app.dataDir);
+    if (!indexer::isRunning()) indexer::start();
+    logs::info("DB を詰めるよう頼んだ（" + narrow(gb(sp.fileBytes)) + "、使っていない所 " + narrow(gb(sp.freeBytes)) + "）");
+    if (ex.view) ex.view->SetSameStatus(L"DB を詰めるよう、バックグラウンドの解析に頼みました（進み具合と結果はタスクトレイの窓に出ます）");
+}
+
+// DB を変換した後（前の表の分が空いたまま）、一度だけ「詰める」をすすめる
+void suggestCompact() {
+    Db* db = uiDb();
+    if (!db) return;
+    try {
+        if (db->setting("maintain:suggestCompact") != "1") return;
+        db->setSetting("maintain:suggestCompact", "0");
+    } catch (const std::exception&) {
+        return;
+    }
+    compactDbUi();
 }
 
 void saveExplorerDir() {
@@ -6104,6 +6187,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_OPEN: return L"選んだ画像・ファイルを、関連付けられたアプリで開きます（Enter）";
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
+        case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（バックグラウンドの解析が行います）";
         case CMD_REFRESH: return L"画面の控え（フォルダの中身・サムネイル・画像の情報）を捨てて、今の場所を読み直します。移動したファイルが残っている時など（Ctrl+F5）。"
                                  L"バックグラウンドの解析はしません（要る時はタスクトレイの解析から）";
         case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、今いるフォルダに関係なく調べた全部のフォルダから探して一覧に出します（Ctrl+M）";
@@ -6246,7 +6330,7 @@ void appendMainMenus(HMENU root) {
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, CMD_COMPACT_DB, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, 0, CMD_ABOUT});
 }
 
@@ -6570,6 +6654,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_LINKS: showLinksWindow(); break;
                 case CMD_STATS: showStatsWindow(); break;
                 case CMD_REFRESH: refreshView(); break;
+                case CMD_COMPACT_DB: compactDbUi(); break;
                 case CMD_INFER_RULES: teachFolderUi(L""); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
@@ -6678,6 +6763,22 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_QUERY_TAGS:
             onQueryTags(reinterpret_cast<QueryTagsDone*>(lp));
             return 0;
+        case WM_APP_CONVERT: {
+            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
+            if (wp == 1) {
+                suggestCompact();
+                return 0;
+            }
+            if (!ex.view) return 0;
+            if (text->empty()) {
+                app.sourcesStale = true;
+                PostMessageW(hwnd, WM_APP_CONVERT, 1, reinterpret_cast<LPARAM>(new std::wstring(L"?")));  // 詰めるのをすすめる
+                ex.view->SetSameStatus(L"DB を新しい形に変換しました（検索・統計が速くなります。「その他 → DB を詰めて小さくする」でファイルも小さくできます）");
+            } else {
+                ex.view->SetSameStatus(*text);
+            }
+            return 0;
+        }
         case WM_APP_SOURCES: {
             std::unique_ptr<std::vector<std::pair<std::string, int64_t>>> counts(
                 reinterpret_cast<std::vector<std::pair<std::string, int64_t>>*>(lp));
@@ -7037,6 +7138,68 @@ int runIndexCli(int argc, wchar_t** argv) {
 
 }  // namespace
 
+// 前の版の DB のタグの変換（バックグラウンドの解析が動いていない時だけ、画面の側で少しずつ。解析が動き出したら任せる）
+struct TagConversionRunner {
+    std::thread thread;
+    std::atomic<bool> stop{false};
+    std::atomic<sqlite3*> handle{nullptr};  // 終わる時に止める（sqlite3_interrupt）
+} tagConv;
+
+void startTagConversion() {
+    {
+        Db* db = uiDb();
+        if (!db) return;
+        try {
+            if (!tagConversionState(*db).pending) return;
+        } catch (const std::exception&) {
+            return;
+        }
+    }
+    HWND hwnd = app.hwnd;
+    const std::string path = narrow(dbPath());
+    tagConv.thread = std::thread([hwnd, path] {
+        auto post = [hwnd](const std::wstring& text) {
+            auto* t = new std::wstring(text);
+            if (!PostMessageW(hwnd, WM_APP_CONVERT, 0, reinterpret_cast<LPARAM>(t))) delete t;
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        Db db;
+        if (!db.open(path)) return;
+        tagConv.handle = db.handle();
+        logs::info("タグの置き場所の変換を、画面の側で始める（バックグラウンドの解析が動いていないので）");
+        std::string step;
+        bool finished = false;
+        while (!tagConv.stop) {
+            if (indexer::isRunning()) {  // 解析が動いている: そちらに任せる
+                post(L"DB の変換は、バックグラウンドの解析が続けます");
+                break;
+            }
+            try {
+                finished = convertTagsStep(db, 5000, &step);
+            } catch (const std::exception& e) {
+                if (!tagConv.stop) logs::warn(std::string("タグの変換を中断した（次に起動した時に続きから）: ") + e.what());
+                break;
+            }
+            if (finished) break;
+            const TagConversionState st = tagConversionState(db);
+            const int pct = st.total ? static_cast<int>(st.done * 100 / st.total) : 100;
+            post(L"DB を新しい形に変換しています " + std::to_wstring(std::min(pct, 99)) + L"%（初回だけ。" + widen(step) +
+                 L"。使いながら待てます。終わると検索・統計が速くなります）");
+        }
+        tagConv.handle = nullptr;
+        if (finished) {
+            logs::info("タグの置き場所を新しい形にした（画面の側で）");
+            post(L"");
+        }
+    });
+}
+
+void stopTagConversion() {
+    tagConv.stop = true;
+    if (sqlite3* h = tagConv.handle.load()) sqlite3_interrupt(h);  // 索引を作っている途中でもすぐ止める（続きは次に）
+    if (tagConv.thread.joinable()) tagConv.thread.join();
+}
+
 // タブの見出しの上でホイールを回したら、タブを移る（上へ回すと左、下へ回すと右。端で止まる）。
 // タブの下のリボンの部分では移らない。移ったら true
 bool wheelOnTabs(POINT screen, int delta) {
@@ -7173,6 +7336,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     switchTab(std::clamp(iniInt(L"tab", 2), 0, 3));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
+    // 前の版の DB なら、タグの置き場所を変換する（解析が動いていればそちらで）。変換が済んでいれば、一度だけ詰めるのをすすめる
+    suggestCompact();
+    if (!indexer::isRunning()) startTagConversion();
+    else if (Db* db = uiDb()) {
+        try {
+            if (tagConversionState(*db).pending)
+                ex.view->SetSameStatus(L"DB を新しい形に変換しています（初回だけ。バックグラウンドの解析が行います。進み具合はタスクトレイの窓に出ます）");
+        } catch (const std::exception&) {
+        }
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -7192,6 +7365,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    stopTagConversion();
     logwin::stop();
     CoUninitialize();
     return 0;

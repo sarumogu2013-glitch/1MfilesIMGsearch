@@ -58,7 +58,7 @@ struct IndexCallbacks {
     std::function<void(Db&)> merge;
 };
 
-enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Quality, Lookup, Merge, Done };
+enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Quality, Lookup, Merge, Convert, Done };
 
 // 「総合」の進み具合（タスクトレイの状況の窓）: DB の画像の数と、段階ごとにその版で済んだ数
 struct StageCount {

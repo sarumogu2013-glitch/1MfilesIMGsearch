@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "sqlite3.h"
+#include "tagstore.hpp"
 
 namespace imgdupe {
 
@@ -186,7 +187,6 @@ END;
 
 // 版 4: 検索と並べ替えのための索引（タグは大文字小文字を区別せずに引く）
 const char* const kSchemaV4 = R"SQL(
-CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag COLLATE NOCASE, image_id);
 CREATE INDEX IF NOT EXISTS images_mtime ON images(mtime);
 CREATE INDEX IF NOT EXISTS file_meta_created ON file_meta(created);
 CREATE INDEX IF NOT EXISTS tag_dict_alias ON tag_dict(alias_of COLLATE NOCASE);
@@ -283,6 +283,43 @@ CREATE TABLE IF NOT EXISTS infer_dirs(
 ) WITHOUT ROWID;
 )SQL";
 
+// 版 12: タグを番号で持つ（tag_keys: タグの名前と種類 → 番号、tag_sources: 出どころ → 番号と行の数、tag_rows: 画像ごとのタグ）。
+// 前の tags の表は、tagstore の変換が少しずつ tag_rows に移し、済んだら消して同じ名前のビューにする（読む側はそのまま使える）。
+// 変換の間に tags が書き換わった画像は tags_conv_dirty に覚え、入れ替える前に移し直す
+const char* const kSchemaV12 = R"SQL(
+CREATE TABLE IF NOT EXISTS tag_keys(
+    id INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    UNIQUE(tag, kind)
+);
+CREATE INDEX IF NOT EXISTS tag_keys_name ON tag_keys(tag COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS tag_keys_kind ON tag_keys(kind);
+CREATE TABLE IF NOT EXISTS tag_sources(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    rows INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tag_rows(
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL,
+    source_id INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    manual INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(image_id, tag_id, source_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS tags_conv_dirty(image_id INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS tags_conv_ins AFTER INSERT ON tags BEGIN
+    INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(NEW.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS tags_conv_upd AFTER UPDATE ON tags BEGIN
+    INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(NEW.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS tags_conv_del AFTER DELETE ON tags BEGIN
+    INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(OLD.image_id);
+END;
+)SQL";
+
 std::string driveOf(const std::string& path) {
     if (path.size() >= 2 && path[1] == ':') return path.substr(0, 2);
     if (path.size() >= 2 && (path[0] == '\\' || path[0] == '/') && path[0] == path[1]) {
@@ -376,6 +413,7 @@ bool Db::open(const std::string& path) {
 void Db::close() {
     if (db_) sqlite3_close_v2(db_);
     db_ = nullptr;
+    tagIds_.clear();
 }
 
 bool Db::exec(const char* sql) {
@@ -401,7 +439,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11, kSchemaV12};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         std::vector<const char*> columns;  // 無ければ足す列（ALTER TABLE は 2 回当てられないので確かめてから）
@@ -421,10 +459,21 @@ bool Db::migrate() {
                 return false;
             }
         }
+        // 版 4 のタグの索引・版 12 の変換の準備は、tags が前の形（表）の時だけ（版を下げて開き直した時は、もう新しい形のことがある）
+        if (i == 3 && !newTagFormat(*this) && !exec("CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag COLLATE NOCASE, image_id)")) {
+            exec("ROLLBACK");
+            return false;
+        }
+        if (i == 11 && newTagFormat(*this)) continue;
         if (!exec(steps[i])) {
             exec("ROLLBACK");
             return false;
         }
+    }
+    // 新しく作った DB は、タグの変換が要らないので、すぐ新しい形にする
+    if (v == 0 && !finishNewTagFormat(*this)) {
+        exec("ROLLBACK");
+        return false;
     }
     if (!exec(("PRAGMA user_version=" + std::to_string(kSchemaVersion)).c_str()) || !exec("COMMIT")) {
         exec("ROLLBACK");
@@ -439,7 +488,10 @@ void Db::begin() {
 void Db::commit() {
     if (!exec("COMMIT")) throw std::runtime_error("書き込めません: " + error_);
 }
-void Db::rollback() { exec("ROLLBACK"); }
+void Db::rollback() {
+    exec("ROLLBACK");
+    tagIds_.clear();  // 巻き戻した中で作った番号を使わないように
+}
 
 int Db::changes() { return sqlite3_changes(db_); }
 
@@ -715,22 +767,6 @@ void replaceDuplicateGroups(Db& db, const Result& r, const std::vector<int64_t>&
 }
 
 // ---------------------------------------------------------------- タグ
-
-void replaceTags(Db& db, int64_t imageId, const std::string& source, const std::vector<TagRow>& tags) {
-    Stmt del(db.handle(), "DELETE FROM tags WHERE image_id=? AND source=? AND manual=0");
-    del.bind(1, imageId).bind(2, source);
-    del.step();
-    Stmt ins(db.handle(),
-             "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,?,?) "
-             "ON CONFLICT(image_id,kind,tag,source) DO UPDATE SET confidence=excluded.confidence "
-             "WHERE tags.manual=0");
-    for (const auto& t : tags) {
-        ins.bind(1, imageId).bind(2, t.tag).bind(3, t.kind).bind(4, t.confidence).bind(5, source);
-        ins.bind(6, static_cast<int64_t>(t.manual ? 1 : 0));
-        ins.step();
-        ins.reset();
-    }
-}
 
 std::vector<TagRow> tagsOf(Db& db, int64_t imageId) {
     std::vector<TagRow> out;

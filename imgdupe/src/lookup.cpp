@@ -1,4 +1,5 @@
 #include "lookup.hpp"
+#include "tagstore.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -71,14 +72,8 @@ std::string urlEncode(const std::string& s) {
 const char* const kKnownSourcesSql = "('meta','id_lookup','reverse')";
 
 void insertTags(Db& db, int64_t imageId, const std::vector<TagRow>& tags, const char* source, double conf) {
-    Stmt ins(db.handle(),
-             "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,?,0) "
-             "ON CONFLICT(image_id,kind,tag,source) DO UPDATE SET confidence=max(confidence, excluded.confidence) WHERE manual=0");
-    for (const auto& t : tags) {
-        ins.bind(1, imageId).bind(2, t.tag).bind(3, t.kind).bind(4, conf).bind(5, std::string(source));
-        ins.step();
-        ins.reset();
-    }
+    TagWriter w(db, TagConflict::KeepHigher);
+    for (const auto& t : tags) w.put(imageId, t.tag, t.kind, conf, source, false);
 }
 
 void insertSource(Db& db, int64_t imageId, const std::string& site, const std::string& postId, const std::string& authorId,
@@ -352,11 +347,11 @@ void storeReverseLookup(Db& db, int64_t imageId, const SauceResult& r, const std
 void resetLookups(Db& db, const std::vector<int64_t>& ids) {
     db.begin();
     try {
-        Stmt delTags(db.handle(), "DELETE FROM tags WHERE image_id=? AND source IN ('id_lookup','reverse') AND manual=0");
         Stmt delSrc(db.handle(), "DELETE FROM sources WHERE image_id=? AND (site='saucenao' OR (site='danbooru' AND checked IS NOT NULL))");
         Stmt up(db.handle(), "UPDATE sources SET checked=NULL WHERE image_id=? AND site IN ('pixiv','md5')");
         for (int64_t id : ids) {
-            for (Stmt* s : {&delTags, &delSrc, &up}) {
+            deleteImageTags(db, id, {"id_lookup", "reverse"});
+            for (Stmt* s : {&delSrc, &up}) {
                 s->bind(1, id);
                 s->step();
                 s->reset();

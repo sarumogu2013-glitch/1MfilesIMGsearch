@@ -24,6 +24,8 @@ void requestQuit(const std::wstring& dataDir);
 void requestRescan(const std::wstring& dataDir);
 // フォルダ名からの推し量りだけやり直す（教えた形を変えた時）
 void requestInfer(const std::wstring& dataDir);
+// DB を詰めて小さくする（バックグラウンドの解析が、手が空いた時に）
+void requestCompact(const std::wstring& dataDir);
 // GUI から: 調べるフォルダを DB に書く（indexer はこれを見る）
 void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& roots);
 // GUI から: スキャンタスクを足す（paths はフォルダかファイル。top なら一番上 = 今のタスクを止めてでも先に）。

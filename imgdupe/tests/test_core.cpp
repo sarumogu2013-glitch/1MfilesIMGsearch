@@ -18,6 +18,7 @@
 #include "links.hpp"
 #include "names.hpp"
 #include "pathinfer.hpp"
+#include "tagstore.hpp"
 #include "log.hpp"
 #include "models.hpp"
 #include "tagger.hpp"
@@ -454,8 +455,8 @@ static void testDb() {
     CHECK(db.open(path));
     CHECK(db.schemaVersion() == kSchemaVersion);
     for (const char* t : {"images", "stages", "tags", "tag_dict", "embeddings", "groups", "group_members", "sources",
-                          "links", "history", "commands", "settings", "file_meta", "thumbs"}) {
-        Stmt st(db.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?");
+                          "links", "history", "commands", "settings", "file_meta", "thumbs", "tag_rows", "tag_keys", "tag_sources"}) {
+        Stmt st(db.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name=?");
         st.bind(1, std::string(t));
         CHECK(st.step() && st.i64(0) == 1);
     }
@@ -622,16 +623,16 @@ static void testPack() {
     CHECK(big.get(db, ids["/p/3.jpg"], got) && std::string(got.bytes.begin(), got.bytes.end()) == "/p/3.jpg");
     db.close();
 
-    // 版 1 の DB を開くと、版 2（thumbs テーブル）へ移行する
+    // 版 9 の DB を開くと、版 10（scan_tasks テーブル）から移行する
     {
         Db d;
         CHECK(d.open((dir / "old.db").string()));
-        d.exec("DROP TABLE thumbs; PRAGMA user_version=1;");
+        d.exec("DROP TABLE scan_tasks; PRAGMA user_version=9;");
     }
     Db d2;
     CHECK(d2.open((dir / "old.db").string()));
     CHECK(d2.schemaVersion() == kSchemaVersion);
-    Stmt st(d2.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE name='thumbs'");
+    Stmt st(d2.handle(), "SELECT COUNT(*) FROM sqlite_master WHERE name='scan_tasks'");
     CHECK(st.step() && st.i64(0) == 1);
     fs::remove_all(dir);
 }
@@ -2353,6 +2354,19 @@ static void testStats() {
     auto artists = tagCounts(db, {"artist"}, 0.5, 10);
     CHECK(artists.size() == 1 && artists[0].key == "someone" && artists[0].count == 1);
     CHECK(tagCounts(db, {"character", "artist"}, 0.2, 10).size() == 3);
+    // 一度に数えても同じ（新しい形では、タグの行を 1 回だけ読む）
+    {
+        auto many = tagCountsMany(db, {{"character"}, {"artist"}, {"character", "artist"}}, 0.5, 10);
+        CHECK(many.size() == 3 && many[0].size() == 1 && many[0][0].key == "miku" && many[0][0].count == 3 && many[0][0].bytes == 700);
+        CHECK(many[1].size() == 1 && many[1][0].key == "someone" && many[2].size() == 2);
+        CHECK(tagCountsMany(db, {{"character", "artist"}}, 0.2, 10)[0].size() == 3);
+        // 集計を残して読み戻す
+        const StatsSnapshot snap = computeStats(db);
+        saveStatsSnapshot(db, snap);
+        StatsSnapshot back;
+        CHECK(loadStatsSnapshot(db, back) && back.views.size() == statTagKinds().size() + 2 && back.at == snap.at &&
+              back.views[3].size() == 1 && back.views[3][0].key == "miku" && back.summary.images == snap.summary.images);
+    }
 
     // 概要
     {
@@ -2917,6 +2931,122 @@ static void testPathInfer() {
     fs::remove(dbPath);
 }
 
+// 前の版（タグが表）の DB を作る: 新しい形を崩して、版 11 の tags の表と変換の準備にする
+static void makeLegacyTags(Db& db) {
+    CHECK(db.exec("DROP VIEW tags; DROP TRIGGER tag_rows_count_ins; DROP TRIGGER tag_rows_count_del; DROP INDEX tag_rows_tag; "
+                  "DELETE FROM tag_rows; DELETE FROM tag_keys; DELETE FROM tag_sources;"));
+    CHECK(db.exec(R"SQL(
+CREATE TABLE tags(image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE, tag TEXT NOT NULL, kind TEXT NOT NULL,
+    confidence REAL NOT NULL, source TEXT NOT NULL, manual INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(image_id, kind, tag, source)) WITHOUT ROWID;
+CREATE INDEX tags_search ON tags(kind, tag, confidence);
+CREATE INDEX tags_image ON tags(image_id, kind, confidence);
+CREATE INDEX tags_tag ON tags(tag COLLATE NOCASE, image_id);
+CREATE TABLE tags_conv_dirty(image_id INTEGER PRIMARY KEY);
+CREATE TRIGGER tags_conv_ins AFTER INSERT ON tags BEGIN INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(NEW.image_id); END;
+CREATE TRIGGER tags_conv_upd AFTER UPDATE ON tags BEGIN INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(NEW.image_id); END;
+CREATE TRIGGER tags_conv_del AFTER DELETE ON tags BEGIN INSERT OR IGNORE INTO tags_conv_dirty(image_id) VALUES(OLD.image_id); END;
+)SQL"));
+}
+
+static std::string queryPlan(Db& db, const std::string& sql) {
+    Stmt st(db.handle(), ("EXPLAIN QUERY PLAN " + sql).c_str());
+    std::string out;
+    while (st.step()) out += st.text(3) + "\n";
+    return out;
+}
+
+static void testTagStore() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-tagstore-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    CHECK(newTagFormat(db));  // 新しく作った DB は初めから新しい形
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 40; ++i) files.push_back({"C:\\p\\" + std::to_string(i) + ".jpg", 1, static_cast<uint64_t>(i)});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) { return ids["C:\\p\\" + std::to_string(n) + ".jpg"]; };
+
+    // 前の形にして、タグを書く（前の形の書き方で）
+    makeLegacyTags(db);
+    CHECK(!newTagFormat(db) && tagConversionState(db).pending);
+    for (int i = 1; i <= 40; ++i)
+        replaceTags(db, I(i), "tagger", {TagRow{"long_hair", "general", "tagger", 0.5 + i / 100.0, false},
+                                         TagRow{i % 2 ? "Miku" : "miku", "character", "tagger", 0.9, false}});
+    setManualTag(db, I(3), "smile", true);
+    CHECK(tagRowCount(db, "tagger") == 80 && tagNames(db).size() == 3);
+
+    // 少しずつ移す。途中で、移した画像と、まだの画像を書き換える
+    std::string step;
+    CHECK(!convertTagsStep(db, 10, &step));
+    CHECK(tagConversionState(db).pending && tagConversionState(db).done >= 10);
+    replaceTags(db, I(2), "tagger", {TagRow{"short_hair", "general", "tagger", 0.7, false}});  // 移した後に書き換わった
+    replaceTags(db, I(30), "meta", {TagRow{"作者さん", "artist", "meta", 0.95, false}});       // まだ移していない
+    int steps = 0;
+    while (!convertTagsStep(db, 10, &step) && steps < 20) ++steps;
+    CHECK(newTagFormat(db) && !tagConversionState(db).pending);
+
+    // 中身が同じか
+    auto has = [&](int64_t id, const std::string& tag, const std::string& source) {
+        for (const auto& t : tagsOf(db, id))
+            if (t.tag == tag && t.source == source) return true;
+        return false;
+    };
+    CHECK(has(I(1), "long_hair", "tagger") && has(I(1), "Miku", "tagger") && has(I(2), "short_hair", "tagger") && !has(I(2), "long_hair", "tagger"));
+    CHECK(has(I(30), "作者さん", "meta") && has(I(3), "smile", "manual") && tagsOf(db, I(3)).size() == 3);
+    CHECK(tagRowCount(db, "tagger") == 79 && tagRowCount(db, "meta") == 1 && tagRowCountExcept(db, "tagger") == 2);
+    {
+        Stmt st(db.handle(), "SELECT count(*) FROM sqlite_master WHERE name IN ('tags_conv_dirty','tags_search','tags_tag')");
+        CHECK(st.step() && st.i64(0) == 0);
+    }
+
+    // 新しい形で書く・消す・数える
+    setManualTag(db, I(4), "smile", false);
+    clearManualTag(db, I(3), "SMILE");
+    CHECK(!has(I(3), "smile", "manual") && has(I(4), "smile", "manual"));
+    deleteSourceTags(db, "meta");
+    CHECK(!has(I(30), "作者さん", "meta") && tagRowCount(db, "meta") == 0);
+    {
+        TagWriter w(db, TagConflict::KeepHigher);
+        w.put(I(5), "long_hair", "general", 0.1, "tagger", false);  // 低い方は書かない
+    }
+    {
+        Stmt st(db.handle(), "SELECT confidence FROM tags WHERE image_id=? AND tag='long_hair'");
+        st.bind(1, I(5));
+        CHECK(st.step() && std::abs(st.f64(0) - 0.55) < 1e-9);
+    }
+    // ビューへの書き込み（前の形の SQL）もそのまま使える
+    {
+        Stmt st(db.handle(), "INSERT INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,'x','general',0.9,'tagger',0)");
+        st.bind(1, I(6));
+        st.step();
+        CHECK(has(I(6), "x", "tagger") && tagRowCount(db, "tagger") == 80);
+        Stmt del(db.handle(), "DELETE FROM tags WHERE image_id=? AND tag='x'");
+        del.bind(1, I(6));
+        del.step();
+        CHECK(!has(I(6), "x", "tagger") && tagRowCount(db, "tagger") == 79);
+    }
+    // 画像を消すとタグも消え、数も減る
+    {
+        Stmt st(db.handle(), "DELETE FROM images WHERE id=?");
+        st.bind(1, I(7));
+        st.step();
+        CHECK(tagsOf(db, I(7)).empty() && tagRowCount(db, "tagger") == 77);
+    }
+    // 検索で、索引を使う（表を頭から全部読まない）
+    const std::string byTag = queryPlan(db, "SELECT image_id FROM tags WHERE tag COLLATE NOCASE IN ('miku','x') AND confidence >= 0.5");
+    CHECK(byTag.find("tag_keys_name") != std::string::npos && byTag.find("tag_rows_tag") != std::string::npos);
+    const std::string byImage = queryPlan(db, "SELECT tag FROM tags WHERE image_id=5");
+    CHECK(byImage.find("SCAN r") == std::string::npos);
+    const std::string byKind = queryPlan(db, "SELECT image_id FROM tags WHERE kind IN ('artist','circle')");
+    CHECK(byKind.find("tag_keys_kind") != std::string::npos && byKind.find("SCAN r") == std::string::npos);
+    SearchQuery q;
+    q.tags = {"MIKU"};
+    CHECK(search(db, q).ids.size() == 38);  // 40 枚 − 消した 7 − タガーのタグを置き換えた 2
+    CHECK(tagNames(db).size() >= 3);
+    fs::remove_all(dir);
+}
+
 static void testLogs() {
     const std::string line = logs::formatLine(0, "解析", logs::Level::Warn, "a\nb");
     CHECK(line.find("[解析] 注意: a b") != std::string::npos && line.size() >= 2 && line.substr(line.size() - 2) == "\r\n");
@@ -3037,6 +3167,7 @@ int main() {
     testQueryStore();
     testLogs();
     testPathInfer();
+    testTagStore();
     testTagNames();
     testClusterResults();
     testExifOrientation();

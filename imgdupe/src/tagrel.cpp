@@ -1,4 +1,5 @@
 #include "tagrel.hpp"
+#include "tagstore.hpp"
 
 #include "json.hpp"
 
@@ -104,26 +105,43 @@ bool parseDanbooruPairs(const std::string& json, std::vector<std::pair<std::stri
 size_t applyParents(Db& db, int depth) {
     db.begin();
     try {
-        db.exec("DELETE FROM tags WHERE source='parent' AND manual=0");
+        deleteSourceTags(db, "parent");
+        const bool nf = newTagFormat(db);
         // 子のタグ（別名ならその元の名前で）に親子関係があれば、親のタグを付ける。手動で「違う」と確定したものは子にしない
-        const char* sql =
+        const char* legacySql =
             "INSERT OR REPLACE INTO tags(image_id, tag, kind, confidence, source, manual) "
             "SELECT t.image_id, r.other, 'general', max(t.confidence), 'parent', 0 "
             "FROM tags t LEFT JOIN tag_dict d ON d.tag = t.tag COLLATE NOCASE "
             "JOIN tag_relations r ON r.kind='parent' AND r.tag = COALESCE(d.alias_of, t.tag) COLLATE NOCASE "
             "WHERE t.confidence >= 0.2 AND NOT (t.manual=1 AND t.confidence < 0.5) AND (t.source<>'parent' OR ?) "
             "GROUP BY t.image_id, r.other";
+        // 番号で: 親の名前の番号を先に作っておく
+        const char* newSql =
+            "INSERT INTO tag_rows(image_id, tag_id, source_id, confidence, manual) "
+            "SELECT t.image_id, pk.id, ?, max(t.confidence), 0 "
+            "FROM tags t LEFT JOIN tag_dict d ON d.tag = t.tag COLLATE NOCASE "
+            "JOIN tag_relations r ON r.kind='parent' AND r.tag = COALESCE(d.alias_of, t.tag) COLLATE NOCASE "
+            "JOIN tag_keys pk ON pk.tag = r.other AND pk.kind = 'general' "
+            "WHERE t.confidence >= 0.2 AND NOT (t.manual=1 AND t.confidence < 0.5) AND (t.source<>'parent' OR ?) "
+            "GROUP BY t.image_id, pk.id "
+            "ON CONFLICT(image_id, tag_id, source_id) DO UPDATE SET confidence=excluded.confidence, manual=0";
+        int64_t parentSource = 0;
+        if (nf) {
+            db.exec("INSERT INTO tag_keys(tag, kind) SELECT DISTINCT r.other, 'general' FROM tag_relations r WHERE r.kind='parent' "
+                    "AND NOT EXISTS (SELECT 1 FROM tag_keys k WHERE k.tag = r.other AND k.kind = 'general')");
+            parentSource = tagSourceId(db, "parent");
+        }
         size_t total = 0;
         for (int pass = 0; pass < depth; ++pass) {
-            Stmt st(db.handle(), sql);
-            st.bind(1, static_cast<int64_t>(pass > 0));  // 2 回目からは、付けた親のさらに親
+            Stmt st(db.handle(), nf ? newSql : legacySql);
+            if (nf) st.bind(1, parentSource);
+            st.bind(nf ? 2 : 1, static_cast<int64_t>(pass > 0));  // 2 回目からは、付けた親のさらに親
             st.step();
             const size_t n = static_cast<size_t>(db.changes());
             if (pass == 0) total = n;
             if (n == 0) break;
         }
-        Stmt count(db.handle(), "SELECT COUNT(*) FROM tags WHERE source='parent'");
-        if (count.step()) total = static_cast<size_t>(count.i64(0));
+        total = static_cast<size_t>(tagRowCount(db, "parent"));
         db.commit();
         return total;
     } catch (...) {

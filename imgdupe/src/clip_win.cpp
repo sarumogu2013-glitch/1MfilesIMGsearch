@@ -18,6 +18,7 @@
 #include "models_win.hpp"
 #include "onnx_win.hpp"
 #include "vectors.hpp"
+#include "tagstore.hpp"
 #include "win_util.hpp"
 
 namespace clip {
@@ -272,11 +273,7 @@ std::wstring applyDictionary(const std::wstring& dataDir, imgdupe::Db& db, bool 
     imgdupe::VectorIndex vecs;
     const Files f = findFiles(dataDir);
     const bool haveVecs = anyClip && f.ok && enabled(dataDir) && vecs.load(narrow(vectorPath(dataDir))) && vecs.version() == f.version;
-    int64_t taggerRows = 0;
-    {
-        imgdupe::Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE source='tagger'");
-        if (st.step()) taggerRows = st.i64(0);
-    }
+    const int64_t taggerRows = imgdupe::tagRowCount(db, "tagger");
     const std::string state = imgdupe::dictionaryHash(text) + "|" + std::to_string(taggerRows) + "|" +
                               std::to_string(haveVecs ? vecs.records() : 0);
     if (!force && db.setting("dict:state") == state) return {};
@@ -338,11 +335,7 @@ bool qualityEnabled(const std::wstring& dataDir) {
 
 size_t applyTagParents(imgdupe::Db& db, bool force) {
     const imgdupe::RelationCounts rc = imgdupe::relationCounts(db);
-    int64_t rows = 0;
-    {
-        imgdupe::Stmt st(db.handle(), "SELECT COUNT(*) FROM tags WHERE source<>'parent'");
-        if (st.step()) rows = st.i64(0);
-    }
+    const int64_t rows = imgdupe::tagRowCountExcept(db, "parent");
     const std::string state = std::to_string(rows) + "|" + std::to_string(rc.userAlias) + "|" + std::to_string(rc.userParent) + "|" +
                               std::to_string(rc.danbooruAlias) + "|" + std::to_string(rc.danbooruParent);
     if (!force && db.setting("parents:state") == state) return 0;

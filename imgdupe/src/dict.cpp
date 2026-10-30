@@ -1,4 +1,5 @@
 #include "dict.hpp"
+#include "tagstore.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -140,19 +141,34 @@ std::string dictionaryHash(const std::string& text) {
 void applyDictionaryTags(Db& db, const std::vector<DictEntry>& entries) {
     db.begin();
     try {
-        db.exec("DELETE FROM tags WHERE source='dict' AND manual=0");
+        deleteSourceTags(db, "dict");
+        const bool nf = newTagFormat(db);
         for (const auto& e : entries) {
             if (e.wd14.empty()) continue;
             std::string in;
             for (size_t i = 0; i < e.wd14.size(); ++i) in += i ? ",?" : "?";
-            const std::string sql =
-                "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) "
-                "SELECT image_id, ?, ?, max(confidence), 'dict', 0 FROM tags WHERE source='tagger' AND manual=0 AND tag IN (" +
-                in + ") GROUP BY image_id";
-            Stmt st(db.handle(), sql.c_str());
-            st.bind(1, e.name).bind(2, e.kind);
-            for (size_t i = 0; i < e.wd14.size(); ++i) st.bind(static_cast<int>(i + 3), e.wd14[i]);
-            st.step();
+            if (nf) {
+                // 番号で: タガーのタグ（名前が e.wd14 のどれか）のある画像に、辞書のタグ
+                const std::string sql =
+                    "INSERT INTO tag_rows(image_id, tag_id, source_id, confidence, manual) "
+                    "SELECT r.image_id, ?, ?, max(r.confidence), 0 FROM tag_rows r WHERE r.source_id=? AND r.manual=0 AND "
+                    "r.tag_id IN (SELECT id FROM tag_keys WHERE tag IN (" + in + ")) GROUP BY r.image_id "
+                    "ON CONFLICT(image_id, tag_id, source_id) DO UPDATE SET confidence=excluded.confidence, manual=0";
+                const int64_t key = tagKeyId(db, e.name, e.kind), dict = tagSourceId(db, "dict"), tagger = tagSourceId(db, "tagger");
+                Stmt st(db.handle(), sql.c_str());
+                st.bind(1, key).bind(2, dict).bind(3, tagger);
+                for (size_t i = 0; i < e.wd14.size(); ++i) st.bind(static_cast<int>(i + 4), e.wd14[i]);
+                st.step();
+            } else {
+                const std::string sql =
+                    "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) "
+                    "SELECT image_id, ?, ?, max(confidence), 'dict', 0 FROM tags WHERE source='tagger' AND manual=0 AND tag IN (" +
+                    in + ") GROUP BY image_id";
+                Stmt st(db.handle(), sql.c_str());
+                st.bind(1, e.name).bind(2, e.kind);
+                for (size_t i = 0; i < e.wd14.size(); ++i) st.bind(static_cast<int>(i + 3), e.wd14[i]);
+                st.step();
+            }
         }
         db.commit();
     } catch (...) {
@@ -185,14 +201,10 @@ void replaceClipDictTags(Db& db, const std::vector<DictEntry>& entries,
                          const std::vector<std::vector<std::pair<int64_t, float>>>& matches) {
     db.begin();
     try {
-        db.exec("DELETE FROM tags WHERE source='clip' AND manual=0");
-        Stmt ins(db.handle(), "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'clip',0)");
+        deleteSourceTags(db, "clip");
+        TagWriter w(db, TagConflict::Replace);
         for (size_t i = 0; i < entries.size() && i < matches.size(); ++i)
-            for (const auto& [id, p] : matches[i]) {
-                ins.bind(1, id).bind(2, entries[i].name).bind(3, entries[i].kind).bind(4, static_cast<double>(p));
-                ins.step();
-                ins.reset();
-            }
+            for (const auto& [id, p] : matches[i]) w.put(id, entries[i].name, entries[i].kind, static_cast<double>(p), "clip", false);
         db.commit();
     } catch (...) {
         db.rollback();

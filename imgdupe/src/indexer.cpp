@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <exception>
 #include <functional>
@@ -12,6 +13,8 @@
 #include "clip.hpp"
 #include "log.hpp"
 #include "pathinfer.hpp"
+#include "tagstore.hpp"
+#include "stats.hpp"
 #include "names.hpp"
 #include "quality.hpp"
 
@@ -123,6 +126,7 @@ const char* phaseLogName(IndexPhase p) {
         case IndexPhase::Quality: return "品質";
         case IndexPhase::Lookup: return "出典の照会";
         case IndexPhase::Merge: return "仕上げ";
+        case IndexPhase::Convert: return "タグの置き場所の変換";
         default: return "?";
     }
 }
@@ -130,6 +134,41 @@ const char* phaseLogName(IndexPhase p) {
 double secondsSince(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+
+// タグの置き場所を新しい形に変換する（済んでいれば何もしない）。止めたら false
+bool convertTagStore(Db& db, IndexProgress& progress, const std::atomic<bool>& cancel) {
+    TagConversionState st = tagConversionState(db);
+    if (!st.pending) return true;
+    progress.phase = static_cast<int>(IndexPhase::Convert);
+    progress.prog.done = static_cast<uint64_t>(st.done);
+    progress.prog.total = static_cast<uint64_t>(st.total);
+    logs::info("タグの置き場所を新しい形に変換する（画像の ID " + std::to_string(st.done) + " / " + std::to_string(st.total) + " から）");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string step;
+    for (;;) {
+        if (cancel) {
+            logs::info("タグの変換を途中で止めた（続きは次の回で）");
+            return false;
+        }
+        bool finished = false;
+        try {
+            finished = convertTagsStep(db, 5000, &step);
+        } catch (const std::exception& e) {
+            logs::error(std::string("タグの変換でエラー（次の回でやり直す）: ") + e.what());
+            return false;
+        }
+        if (finished) break;
+        st = tagConversionState(db);
+        progress.prog.done = static_cast<uint64_t>(st.done);
+        progress.prog.total = static_cast<uint64_t>(st.total);
+        if (st.done >= st.total) logs::info("タグを移し終えた。索引を作って入れ替える（数分かかることがある）");
+    }
+    char t[128];
+    std::snprintf(t, sizeof t, "タグの置き場所を新しい形にした（%.0f 秒）", secondsSince(t0));
+    logs::info(t);
+    return true;
+}
+
 
 // 動作履歴: 「段階 タグ付け: 512 / 1400187 枚（失敗 0）・120.3 秒・4.3 枚/秒・譲った」
 void logStage(IndexPhase phase, const StageReport& sr, uint64_t total, double sec) {
@@ -282,6 +321,35 @@ Outcome runStages(Db& db, RunState& s, const std::vector<int64_t>* within) {
     return combine(cpu, gpu);
 }
 
+// DB の手入れ（フォルダ全体の回の仕上げで）: 検索の読み方を選ぶための数（ANALYZE。週に 1 回、少しだけ読んで見積もる）、
+// 統計の集計（6 時間に 1 回。統計の画面はこれをすぐ出す）
+void maintainDb(Db& db, const std::atomic<bool>& cancel) {
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    auto due = [&](const char* key, int64_t every) { return now - std::atoll(db.setting(key, "0").c_str()) >= every; };
+    if (!tagConversionState(db).pending && due("maintain:analyze", 7 * 86400)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (db.exec("PRAGMA analysis_limit=1000; ANALYZE;")) {
+            db.setSetting("maintain:analyze", std::to_string(now));
+            char t[96];
+            std::snprintf(t, sizeof t, "検索の読み方のための数を取り直した（ANALYZE、%.1f 秒）", secondsSince(t0));
+            logs::info(t);
+        }
+    }
+    if (cancel || !due("maintain:stats", 6 * 3600)) return;
+    try {
+        const auto t0 = std::chrono::steady_clock::now();
+        const StatsSnapshot snap = computeStats(db);
+        if (cancel) return;
+        saveStatsSnapshot(db, snap);
+        db.setSetting("maintain:stats", std::to_string(now));
+        char t[96];
+        std::snprintf(t, sizeof t, "統計を集計して残した（%.1f 秒）", secondsSince(t0));
+        logs::info(t);
+    } catch (const std::exception& e) {
+        logs::warn(std::string("統計を集計できなかった: ") + e.what());
+    }
+}
+
 // 全体に掛かる仕上げ（差分グループ・照会・辞書）。どれも変わっていなければすぐ終わる
 bool finish(Db& db, RunState& s, bool lookup) {
     const IndexCallbacks& cb = s.cb;
@@ -321,6 +389,8 @@ bool finish(Db& db, RunState& s, bool lookup) {
         }
     });
     if (cb.merge) timed(IndexPhase::Merge, [&] { cb.merge(db); });
+    if (s.cancel) return false;
+    if (lookup) maintainDb(db, s.cancel);
     return true;
 }
 
@@ -405,14 +475,9 @@ size_t removeMisspelled(Db& db, const std::vector<std::string>& roots) {
     db.begin();
     try {
         // 手動で確定したタグは、正しい書き方の方へ移す（向こうに同じタグの確定があればそちらを残す）
-        Stmt move(db.handle(),
-                  "INSERT OR IGNORE INTO tags(image_id,tag,kind,confidence,source,manual) "
-                  "SELECT ?,tag,kind,confidence,source,manual FROM tags WHERE image_id=? AND manual=1");
         Stmt del(db.handle(), "DELETE FROM images WHERE id=?");
         for (const auto& [from, to] : dup) {
-            move.bind(1, to).bind(2, from);
-            move.step();
-            move.reset();
+            copyManualTags(db, from, to);
             del.bind(1, from);
             del.step();
             del.reset();
@@ -450,6 +515,8 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
         progress.phase = static_cast<int>(IndexPhase::Done);
         return rep;
     };
+    // 前の版の DB: タグの置き場所を新しい形に変換する（ほかの何よりも先に。止めても続きから）
+    if (!convertTagStore(db, progress, cancel)) return stop();
     for (;;) {
         if (cancel) return stop();
         if (opt.preempt) *opt.preempt = false;

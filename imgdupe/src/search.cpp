@@ -1,5 +1,6 @@
 #include "search.hpp"
 #include "tagnames.hpp"
+#include "tagstore.hpp"
 
 #include "json.hpp"
 #include "quality.hpp"
@@ -45,16 +46,8 @@ std::vector<std::string> aliasesOf(Db& db, const std::string& tag) {
     return std::vector<std::string>(out.begin(), out.end());
 }
 
-// DB にあるタグの名前（同じ名前は 1 つ）。索引を飛び飛びにたどるので、タグの行が多くても速い
-std::vector<std::string> allTagNames(Db& db) {
-    std::vector<std::string> out;
-    Stmt st(db.handle(),
-            "WITH RECURSIVE d(t) AS (SELECT min(tag COLLATE NOCASE) FROM tags UNION ALL "
-            "SELECT (SELECT min(tag COLLATE NOCASE) FROM tags WHERE tag > d.t COLLATE NOCASE) FROM d WHERE d.t IS NOT NULL) "
-            "SELECT t FROM d WHERE t IS NOT NULL");
-    while (st.step()) out.push_back(st.text(0));
-    return out;
-}
+// DB にあるタグの名前（同じ名前は 1 つ）
+std::vector<std::string> allTagNames(Db& db) { return tagNames(db); }
 
 std::string placeholders(size_t n) {
     std::string s;
@@ -463,20 +456,11 @@ void setManualTag(Db& db, int64_t imageId, const std::string& tag, bool correct)
         st.bind(1, imageId).bind(2, tag);
         if (st.step()) kind = st.text(0);
     }
-    Stmt ins(db.handle(),
-             "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'manual',1)");
-    ins.bind(1, imageId).bind(2, tag).bind(3, kind).bind(4, correct ? 1.0 : 0.0);
-    ins.step();
+    TagWriter(db, TagConflict::Replace).put(imageId, tag, kind, correct ? 1.0 : 0.0, "manual", true);
 }
 
 void clearManualTag(Db& db, int64_t imageId, const std::string& tag) {
-    const auto names = aliasesOf(db, tag);
-    const std::string sql =
-        "DELETE FROM tags WHERE image_id=? AND manual=1 AND tag COLLATE NOCASE IN (" + placeholders(names.size()) + ")";
-    Stmt del(db.handle(), sql.c_str());
-    del.bind(1, imageId);
-    for (size_t i = 0; i < names.size(); ++i) del.bind(static_cast<int>(i + 2), names[i]);
-    del.step();
+    deleteManualTags(db, imageId, aliasesOf(db, tag));
 }
 
 void TagHistory::touch(int64_t imageId, const std::string& tag) {
@@ -528,7 +512,7 @@ bool undoLastTagEdit(Db& db, std::string& description) {
     }
     Json j;
     if (parseJson(before, j) && j.type == Json::Array) {
-        Stmt ins(db.handle(), "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'manual',1)");
+        TagWriter ins(db, TagConflict::Replace);
         for (const Json& e : j.arr) {
             const Json* image = e.get("image");
             if (!image || image->type != Json::Number) continue;
@@ -537,9 +521,7 @@ bool undoLastTagEdit(Db& db, std::string& description) {
             if (const Json* rows = e.get("rows"); rows && rows->type == Json::Array) {
                 for (const Json& r : rows->arr) {
                     if (r.type != Json::Array || r.arr.size() != 3) continue;
-                    ins.bind(1, imageId).bind(2, r.arr[0].str).bind(3, r.arr[1].str).bind(4, std::strtod(r.arr[2].str.c_str(), nullptr));
-                    ins.step();
-                    ins.reset();
+                    ins.put(imageId, r.arr[0].str, r.arr[1].str, std::strtod(r.arr[2].str.c_str(), nullptr), "manual", true);
                 }
             }
         }
@@ -829,10 +811,7 @@ bool importSmartFolders(const std::string& text, std::vector<SmartFolder>& out) 
 }
 
 std::vector<std::pair<std::string, int64_t>> tagSources(Db& db) {
-    std::vector<std::pair<std::string, int64_t>> out;
-    Stmt st(db.handle(), "SELECT source, COUNT(*) FROM tags GROUP BY source ORDER BY 2 DESC");
-    while (st.step()) out.emplace_back(st.text(0), st.i64(1));
-    return out;
+    return tagSourceCounts(db);
 }
 
 }  // namespace imgdupe

@@ -1,4 +1,5 @@
 #include "refs.hpp"
+#include "tagstore.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -75,9 +76,8 @@ size_t applyReferences(Db& db, const VectorIndex& vecs, const std::vector<RefSet
     size_t used = 0;
     db.begin();
     try {
-        db.exec("DELETE FROM tags WHERE source='reference' AND manual=0");
-        Stmt ins(db.handle(),
-                 "INSERT OR REPLACE INTO tags(image_id,tag,kind,confidence,source,manual) VALUES(?,?,?,?,'reference',0)");
+        deleteSourceTags(db, "reference");
+        TagWriter ins(db, TagConflict::Replace);
         std::vector<float> v, mean;
         for (const auto& s : sets) {
             mean.assign(vecs.dim(), 0.f);
@@ -93,9 +93,7 @@ size_t applyReferences(Db& db, const VectorIndex& vecs, const std::vector<RefSet
             for (const auto& [id, sim] : vecs.topK(mean.data(), vecs.size(), {}, threads)) {
                 const double p = referenceProbability(sim);
                 if (p < 0.2) break;  // 内積の大きい順
-                ins.bind(1, id).bind(2, s.tag).bind(3, s.kind).bind(4, p);
-                ins.step();
-                ins.reset();
+                ins.put(id, s.tag, s.kind, p, "reference", false);
             }
         }
         db.commit();

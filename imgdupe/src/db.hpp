@@ -15,7 +15,7 @@ struct sqlite3_stmt;
 namespace imgdupe {
 
 // 今のスキーマの版。テーブルを変えたら上げ、Db::open の移行処理に足す
-constexpr int kSchemaVersion = 11;
+constexpr int kSchemaVersion = 12;
 
 // 1 つの SQL 文（プリペアドステートメント）
 class Stmt {
@@ -70,10 +70,14 @@ public:
     std::string setting(const std::string& key, const std::string& def = "");
     void setSetting(const std::string& key, const std::string& value);
 
+    // タグの名前・出どころの番号の控え（tagstore が使う。巻き戻した時は捨てる）
+    std::unordered_map<std::string, int64_t>& tagIdCache() { return tagIds_; }
+
 private:
     bool migrate();
     sqlite3* db_ = nullptr;
     std::string error_;
+    std::unordered_map<std::string, int64_t> tagIds_;
 };
 
 // 段階の状態（stages テーブル）
@@ -119,6 +123,7 @@ struct TagRow {
     double confidence = 0;
     bool manual = false;
 };
+// 画像の出どころ source のタグを置き換える（手動で確定したものは残す）。書き込みの細かい関数は tagstore.hpp
 void replaceTags(Db& db, int64_t imageId, const std::string& source, const std::vector<TagRow>& tags);
 std::vector<TagRow> tagsOf(Db& db, int64_t imageId);
 
