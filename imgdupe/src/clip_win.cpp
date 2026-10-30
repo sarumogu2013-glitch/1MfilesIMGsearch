@@ -64,7 +64,7 @@ Files findFiles(const std::wstring& dataDir) {
         else if (name == "vocab.txt") f.vocab = p;
         else if (name.find(".safetensors") != std::string::npos) f.dense = p;
     }
-    f.version = it->second.version;
+    f.version = it->second.key();  // 解析の結果の版（ファイルの中身が同じ間は変わらない）
     f.ok = !f.vision.empty() && !f.text.empty() && !f.vocab.empty() && !f.dense.empty();
     return f;
 }

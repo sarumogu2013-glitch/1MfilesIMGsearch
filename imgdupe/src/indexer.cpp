@@ -260,14 +260,20 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
         return s.clip != nullptr;
     };
     bool taggerOn = tv && cb.makeTagger, clipOn = cv && cb.makeClip;
-    // WD14 タガーと CLIP を、kGpuChunk 枚ずつ交互に進める（残りが多い時に、片方が済むまでもう片方が何日も始まらないと、
-    // 似た画像を探せる画像がなかなか増えないので）。スキャンタスク（within）の時は、その画像を全部
-    constexpr size_t kGpuChunk = 4096;
+    // WD14 タガーと CLIP を交互に、それぞれ約 kGpuTurnSec 秒分ずつ進める（残りが多い時に、片方が済むまでもう片方が何日も
+    // 始まらないと、似た画像を探せる画像がなかなか増えないので）。速さが違う（タガーは重い）ので、枚数は測った速さから決める。
+    // スキャンタスク（within）の時は、その画像を全部
+    constexpr double kGpuTurnSec = 600;
+    size_t taggerChunk = 2048, clipChunk = 2048;
+    auto nextChunk = [&](size_t done, double sec) {
+        const double rate = sec > 1 ? done / sec : 0;
+        return rate > 0 ? std::clamp<size_t>(static_cast<size_t>(rate * kGpuTurnSec), 256, 200000) : size_t(2048);
+    };
     std::vector<int64_t> lastTagger, lastClip;  // 前の回の分（進まなくなったらやめる）
     for (;;) {
         bool any = false;
         if (taggerOn) {
-            std::vector<int64_t> ids = pendingImages(db, stage::kTagger, tv, within ? 0 : kGpuChunk, within);
+            std::vector<int64_t> ids = pendingImages(db, stage::kTagger, tv, within ? 0 : taggerChunk, within);
             if (ids.empty() || ids == lastTagger || !taggerReady()) {
                 taggerOn = false;
             } else {
@@ -276,11 +282,14 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
                 progress.gpuPhase = static_cast<int>(IndexPhase::Tagger);
                 progress.gpuProg.done = 0;
                 progress.gpuProg.total = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                const size_t before = rep.tagged;
                 if ((o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged, &ids)) != Outcome::Done) return o;
+                taggerChunk = nextChunk(rep.tagged - before, secondsSince(t0));
             }
         }
         if (clipOn) {
-            std::vector<int64_t> ids = pendingImages(db, kStageClip, cv, within ? 0 : kGpuChunk, within);
+            std::vector<int64_t> ids = pendingImages(db, kStageClip, cv, within ? 0 : clipChunk, within);
             if (ids.empty() || ids == lastClip || !clipReady()) {
                 clipOn = false;
             } else {
@@ -289,7 +298,10 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
                 progress.gpuPhase = static_cast<int>(IndexPhase::Clip);
                 progress.gpuProg.done = 0;
                 progress.gpuProg.total = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                const size_t before = rep.clipped;
                 if ((o = stage(IndexPhase::Clip, *s.clip, rep.clipped, &ids)) != Outcome::Done) return o;
+                clipChunk = nextChunk(rep.clipped - before, secondsSince(t0));
             }
         }
         if (!any || within) break;

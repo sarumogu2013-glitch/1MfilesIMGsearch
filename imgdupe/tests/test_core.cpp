@@ -1499,6 +1499,19 @@ static void testModels() {
     Installed back;
     CHECK(parseInstalled(installedToJson(in), back) && back.size() == 1 && back["wd14"].version == "old" &&
           back["wd14"].files.size() == 2);
+    CHECK(back["wd14"].key() == "old");  // 解析の版の名前が無い前の記録は、版をそのまま使う
+    {
+        // 版（コミット）だけが変わって、ファイルの中身が同じ時は入れ直さない（タグ・CLIP を作り直さない）
+        Installed same;
+        same["onnxruntime"] = {"1.24.4", {"onnxruntime.dll", "DirectML.dll"}};
+        same["wd14"] = {"old-commit", {"wd14/model.onnx"}, {h2}, "first-key"};
+        CHECK(sameFiles(same["wd14"], *m.find("wd14")) && planUpdate(m, same).empty() && planInstall(m, same, {"wd14"}).empty());
+        same["wd14"].sha256 = {std::string(64, 'c')};  // 中身が違う
+        CHECK((ids(planUpdate(m, same)) == V{"wd14"}));
+        Installed back2;
+        CHECK(parseInstalled(installedToJson(same), back2) && back2["wd14"].sha256.size() == 1 && back2["wd14"].analysisKey == "first-key" &&
+              back2["wd14"].key() == "first-key");
+    }
 
     // 危ないもの
     CHECK(safeRelativePath("a/b.onnx") && !safeRelativePath("../x") && !safeRelativePath("a/../b") &&

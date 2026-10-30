@@ -92,7 +92,7 @@ int stageVersion(const std::wstring& dataDir) {
     const imgdupe::Installed installed = models::loadInstalled(dataDir);
     auto wd = installed.find("wd14");
     if (wd == installed.end() || !installed.count("onnxruntime")) return 0;
-    return imgdupe::taggerStageVersion(wd->second.version);
+    return imgdupe::taggerStageVersion(wd->second.key());
 }
 
 LoadResult load(const std::wstring& dataDir, int cpuThreads, std::function<void()> threadInit, std::function<void()> threadExit) {
@@ -130,7 +130,7 @@ LoadResult load(const std::wstring& dataDir, int cpuThreads, std::function<void(
     if (model->gpu() && model->dynamicBatch()) model->setBatch(kGpuBatch);
     r.device = model->gpu() ? L"GPU（DirectML）" : L"CPU";
     r.analyzer = std::make_shared<imgdupe::TaggerAnalyzer>(
-        model, std::move(labels), imgdupe::taggerStageVersion(wd->second.version),
+        model, std::move(labels), imgdupe::taggerStageVersion(wd->second.key()),
         [](const std::string& path, int box, std::vector<uint8_t>& bgra, int& w, int& h) {
             return imgwin::decodeBgra(widen(path), box, bgra, w, h);
         },

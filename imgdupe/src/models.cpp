@@ -105,6 +105,8 @@ bool parseInstalled(const std::string& json, Installed& out) {
         InstalledComponent c;
         c.version = v.getString("version");
         c.files = strings(v.get("files"));
+        c.sha256 = strings(v.get("sha256"));
+        c.analysisKey = v.getString("analysisKey");
         in[id] = std::move(c);
     }
     out = std::move(in);
@@ -125,7 +127,20 @@ std::string installedToJson(const Installed& in) {
             if (i) out += ",";
             jsonString(out, c.files[i]);
         }
-        out += "]}";
+        out += "]";
+        if (!c.sha256.empty()) {
+            out += ",\"sha256\":[";
+            for (size_t i = 0; i < c.sha256.size(); ++i) {
+                if (i) out += ",";
+                jsonString(out, c.sha256[i]);
+            }
+            out += "]";
+        }
+        if (!c.analysisKey.empty()) {
+            out += ",\"analysisKey\":";
+            jsonString(out, c.analysisKey);
+        }
+        out += "}";
     }
     out += "}";
     return out;
@@ -145,7 +160,8 @@ std::vector<const Component*> plan(const Manifest& m, const Installed& installed
         visiting.erase(id);
         done.insert(id);
         auto it = installed.find(id);
-        if (it == installed.end() || it->second.version != c->version) out.push_back(c);
+        // 版が違っても、ファイルの中身が全部同じなら入れ直さない（Hugging Face のコミットだけが変わった時）
+        if (it == installed.end() || (it->second.version != c->version && !sameFiles(it->second, *c))) out.push_back(c);
     };
     for (const auto& id : wanted) visit(id);
     return out;
@@ -161,6 +177,17 @@ std::vector<const Component*> planUpdate(const Manifest& m, const Installed& ins
     std::vector<std::string> ids;
     for (const auto& [id, c] : installed) ids.push_back(id);
     return plan(m, installed, ids);
+}
+
+bool sameFiles(const InstalledComponent& installed, const Component& c) {
+    if (installed.sha256.size() != installed.files.size() || installed.files.size() != c.files.size()) return false;
+    for (const auto& f : c.files) {
+        bool found = false;
+        for (size_t i = 0; i < installed.files.size(); ++i)
+            if (installed.files[i] == f.path && installed.sha256[i] == f.sha256) found = true;
+        if (!found) return false;
+    }
+    return true;
 }
 
 std::vector<std::string> staleFiles(const InstalledComponent& before, const Component& now) {

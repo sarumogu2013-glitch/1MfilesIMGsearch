@@ -2,7 +2,10 @@
 // 一覧（models.json）はリリースに添付する。作り方は tools/make_models_json.py と models.src.json。
 //   {"version":1,"components":[{"id":"wd14","name":"...","description":"...","version":"...","requires":["onnxruntime"],
 //     "files":[{"path":"wd14/model.onnx","url":"https://...","sha256":"...","size":123}]}]}
-// 入れた部品は <データのフォルダ>/models/installed.json に {"wd14":{"version":"...","files":["wd14/model.onnx"]}} で残す。
+// 入れた部品は <データのフォルダ>/models/installed.json に {"wd14":{"version":"...","files":["wd14/model.onnx"],
+//   "sha256":["..."],"analysisKey":"..."}} で残す。
+// analysisKey は解析の結果（タグ・CLIP のベクトル）の版に使う名前。版（Hugging Face のコミット）だけが変わってファイルの中身が同じ時は、
+// 前の analysisKey のままにする（作り直さない）。無ければ version
 #pragma once
 
 #include <cstdint>
@@ -40,7 +43,12 @@ bool parseManifest(const std::string& json, Manifest& out);
 struct InstalledComponent {
     std::string version;
     std::vector<std::string> files;
+    std::vector<std::string> sha256;  // files と同じ並び（前の版の記録には無い）
+    std::string analysisKey;
+    const std::string& key() const { return analysisKey.empty() ? version : analysisKey; }
 };
+// 入れた部品のファイルの中身が、一覧の部品と同じか（パスと sha256 が全部同じ。記録に sha256 が無ければ false）
+bool sameFiles(const InstalledComponent& installed, const Component& c);
 using Installed = std::map<std::string, InstalledComponent>;
 
 bool parseInstalled(const std::string& json, Installed& out);

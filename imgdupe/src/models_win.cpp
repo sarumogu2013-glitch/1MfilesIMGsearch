@@ -92,6 +92,7 @@ std::wstring install(const std::wstring& dataDir, const std::vector<const imgdup
     imgdupe::Installed installed = loadInstalled(dataDir);
     for (const auto* c : comps) {
         const std::wstring name = widen(c->name);
+        bool changed = false;  // 中身が違うファイルを落とした
         for (const auto& f : c->files) {
             const std::wstring path = join(dir, f.path);
             makeParentDirs(path);
@@ -110,6 +111,7 @@ std::wstring install(const std::wstring& dataDir, const std::vector<const imgdup
             });
             if (!r.ok) return name + L": " + r.error;
             before += f.size;
+            changed = true;
         }
         // 前の版にしか無いファイルを消してから、入れた版を記録する
         auto it = installed.find(c->id);
@@ -117,7 +119,13 @@ std::wstring install(const std::wstring& dataDir, const std::vector<const imgdup
             for (const auto& stale : imgdupe::staleFiles(it->second, *c)) DeleteFileW(join(dir, stale).c_str());
         imgdupe::InstalledComponent ic;
         ic.version = c->version;
-        for (const auto& f : c->files) ic.files.push_back(f.path);
+        for (const auto& f : c->files) {
+            ic.files.push_back(f.path);
+            ic.sha256.push_back(f.sha256);
+        }
+        // ファイルの中身が前と同じなら、解析の結果（タグ・CLIP のベクトル）の版は前のまま（作り直さない）
+        const bool sameList = it != installed.end() && it->second.files == ic.files;
+        ic.analysisKey = !changed && sameList ? it->second.key() : c->version;
         installed[c->id] = std::move(ic);
         if (!saveInstalled(dataDir, installed)) return L"入れた部品の記録（installed.json）を書けませんでした";
     }
