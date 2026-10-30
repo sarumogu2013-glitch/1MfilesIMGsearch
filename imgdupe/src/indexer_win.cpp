@@ -188,7 +188,11 @@ void handleCommand(Db& db, const std::string& c) {
     if (c == "quit") g->quit = true;
     else if (c == "rescan") g->dirty = true;
     else if (c == "infer") g->inferDirty = true;
-    else if (c == "compact") g->compactDb = true;
+    else if (c == "compact") {
+        // 解析の途中なら止めて、先に詰める（解析は詰めた後に続きから）
+        g->compactDb = true;
+        if (g->running) g->cancelRun = true;
+    }
     else if (c == "pause") g->paused = true;
     else if (c == "resume") g->paused = false;
     else if (c == "tasks") {
@@ -436,20 +440,6 @@ void workLoop() {
             }
         }
         setStatus(&g->waitReason, reason);
-        if ((full || haveTasks) && reason.empty()) {
-            if (full) g->dirty = false;
-            g->tasksDirty = false;
-            g->cancelRun = false;
-            g->preempt = false;
-            std::vector<std::wstring> roots;
-            {
-                std::lock_guard<std::mutex> lock(g->m);
-                roots = g->roots;
-            }
-            runOnce(roots, full);
-            lastRun = GetTickCount64();
-            continue;
-        }
         if (g->compactDb && !g->paused) {
             // DB を詰める（終わるまで解析はしない）
             g->compactDb = false;
@@ -469,6 +459,20 @@ void workLoop() {
                 setStatus(&g->lastResult, L"DB を詰められませんでした: " + widen(error));
             }
             setStatus(&g->waitReason, L"");
+            continue;
+        }
+        if ((full || haveTasks) && reason.empty()) {
+            if (full) g->dirty = false;
+            g->tasksDirty = false;
+            g->cancelRun = false;
+            g->preempt = false;
+            std::vector<std::wstring> roots;
+            {
+                std::lock_guard<std::mutex> lock(g->m);
+                roots = g->roots;
+            }
+            runOnce(roots, full);
+            lastRun = GetTickCount64();
             continue;
         }
         if (g->inferDirty && !g->paused) {

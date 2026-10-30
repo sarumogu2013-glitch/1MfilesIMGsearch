@@ -1866,7 +1866,19 @@ void runSearch() {
                 if (!similarVec.empty()) {
                     qv = similarVec;  // インデックスに無い画像（画像で探す）
                 } else if (q.similarTo) {
-                    if (!idx.get(q.similarTo, qv)) throw std::runtime_error("この画像の CLIP のベクトルがまだありません（バックグラウンドの解析で作ります）");
+                    if (!idx.get(q.similarTo, qv)) {
+                        // この画像はまだ解析で CLIP を作っていない: その場でこの 1 枚だけ作る
+                        std::string path;
+                        {
+                            Stmt st(d.handle(), "SELECT path FROM images WHERE id=?");
+                            st.bind(1, q.similarTo);
+                            if (st.step()) path = st.text(0);
+                        }
+                        std::wstring err;
+                        if (path.empty() || !clip::encodeImageFile(dataDir, widen(path), qv, err))
+                            throw std::runtime_error("この画像の CLIP のベクトルを作れませんでした" + (err.empty() ? std::string() : "（" + narrow(err) + "）"));
+                        logs::info("似た画像: 解析でまだ CLIP を作っていない画像なので、その場で作った（" + path + "）");
+                    }
                 } else {
                     std::shared_ptr<ClipModel> model;
                     {
@@ -1929,6 +1941,7 @@ void onSearched(SearchDone* p) {
     if (!done->error.empty()) {
         logs::warn("検索できなかった: " + narrow(done->error));
         setText(app.s.count, L"検索できませんでした: " + done->error);
+        if (ex.view) ex.view->SetSameStatus(L"検索できませんでした: " + done->error);
         return;
     }
     app.searchIds = std::move(done->result.ids);

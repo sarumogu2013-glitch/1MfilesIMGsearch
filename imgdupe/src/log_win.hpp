@@ -70,7 +70,20 @@ inline void start(const std::wstring& dataDir, const char* name, const char* who
     imgdupe::logs::info("exe: " + winutil::narrow(exe) + "、データ: " + winutil::narrow(dataDir));
     SetUnhandledExceptionFilter(crashFilter);
     std::set_terminate([] {
-        imgdupe::logs::error("落ちました: 処理しきれない C++ の例外（std::terminate）");
+        // 投げられた例外があれば、その中身も書く（どこで落ちたか分かるように）
+        std::string what = "（例外の中身は分かりません）";
+        if (std::exception_ptr e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const std::exception& x) {
+                what = std::string("「") + x.what() + "」";
+            } catch (...) {
+                what = "（C++ の例外ではないもの）";
+            }
+        }
+        char t[64];
+        std::snprintf(t, sizeof t, "（スレッド %lu）", GetCurrentThreadId());
+        imgdupe::logs::error("落ちました: 処理しきれない C++ の例外（std::terminate）" + what + t);
         std::abort();
     });
 }

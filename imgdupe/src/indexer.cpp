@@ -232,41 +232,67 @@ Outcome runCpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
 Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, unsigned threads, IndexReport& rep) {
     const IndexCallbacks& cb = s.cb;
     IndexProgress& progress = s.progress;
-    auto stage = [&](IndexPhase phase, Analyzer& a, size_t& counter) {
-        return runOne(db, s, phase, a, within, threads, progress.gpuPhase, progress.gpuProg, rep, counter, false);
+    auto stage = [&](IndexPhase phase, Analyzer& a, size_t& counter, const std::vector<int64_t>* ids) {
+        return runOne(db, s, phase, a, ids, threads, progress.gpuPhase, progress.gpuProg, rep, counter, false);
     };
     Outcome o;
-    // WD14 タガー（重い。モデルの読み込みにも時間がかかるので、済んでいない画像がある時だけ読む）
     const int tv = cb.taggerVersion ? cb.taggerVersion() : 0;
-    if (tv && cb.makeTagger && !pendingImages(db, stage::kTagger, tv, 1, within).empty()) {
-        progress.gpuPhase = static_cast<int>(IndexPhase::Tagger);
-        progress.gpuProg.done = 0;
-        progress.gpuProg.total = 0;
+    const int cv = cb.clipVersion ? cb.clipVersion() : 0;
+    if (cv && cb.makeClip && cb.prepareClip && !s.clipPrepared) {
+        s.clipPrepared = true;
+        cb.prepareClip(db);
+    }
+    // モデルは、済んでいない画像がある時だけ読む（重い。読み込みにも時間がかかる）
+    auto taggerReady = [&] {
         if (!s.taggerTried) {
             s.taggerTried = true;
             s.tagger = cb.makeTagger(rep.taggerError);
             if (!s.tagger) logs::error("タグ付けのモデルを読めませんでした: " + rep.taggerError);
         }
-        if (s.tagger && (o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged)) != Outcome::Done) return o;
-    }
-    // CLIP（似た画像・言葉での検索のためのベクトル）
-    const int cv = cb.clipVersion ? cb.clipVersion() : 0;
-    if (cv && cb.makeClip) {
-        if (cb.prepareClip && !s.clipPrepared) {
-            s.clipPrepared = true;
-            cb.prepareClip(db);
+        return s.tagger != nullptr;
+    };
+    auto clipReady = [&] {
+        if (!s.clipTried) {
+            s.clipTried = true;
+            s.clip = cb.makeClip(rep.clipError);
+            if (!s.clip) logs::error("CLIP のモデルを読めませんでした: " + rep.clipError);
         }
-        if (!pendingImages(db, kStageClip, cv, 1, within).empty()) {
-            progress.gpuPhase = static_cast<int>(IndexPhase::Clip);
-            progress.gpuProg.done = 0;
-            progress.gpuProg.total = 0;
-            if (!s.clipTried) {
-                s.clipTried = true;
-                s.clip = cb.makeClip(rep.clipError);
-                if (!s.clip) logs::error("CLIP のモデルを読めませんでした: " + rep.clipError);
+        return s.clip != nullptr;
+    };
+    bool taggerOn = tv && cb.makeTagger, clipOn = cv && cb.makeClip;
+    // WD14 タガーと CLIP を、kGpuChunk 枚ずつ交互に進める（残りが多い時に、片方が済むまでもう片方が何日も始まらないと、
+    // 似た画像を探せる画像がなかなか増えないので）。スキャンタスク（within）の時は、その画像を全部
+    constexpr size_t kGpuChunk = 4096;
+    std::vector<int64_t> lastTagger, lastClip;  // 前の回の分（進まなくなったらやめる）
+    for (;;) {
+        bool any = false;
+        if (taggerOn) {
+            std::vector<int64_t> ids = pendingImages(db, stage::kTagger, tv, within ? 0 : kGpuChunk, within);
+            if (ids.empty() || ids == lastTagger || !taggerReady()) {
+                taggerOn = false;
+            } else {
+                any = true;
+                lastTagger = ids;
+                progress.gpuPhase = static_cast<int>(IndexPhase::Tagger);
+                progress.gpuProg.done = 0;
+                progress.gpuProg.total = 0;
+                if ((o = stage(IndexPhase::Tagger, *s.tagger, rep.tagged, &ids)) != Outcome::Done) return o;
             }
-            if (s.clip && (o = stage(IndexPhase::Clip, *s.clip, rep.clipped)) != Outcome::Done) return o;
         }
+        if (clipOn) {
+            std::vector<int64_t> ids = pendingImages(db, kStageClip, cv, within ? 0 : kGpuChunk, within);
+            if (ids.empty() || ids == lastClip || !clipReady()) {
+                clipOn = false;
+            } else {
+                any = true;
+                lastClip = ids;
+                progress.gpuPhase = static_cast<int>(IndexPhase::Clip);
+                progress.gpuProg.done = 0;
+                progress.gpuProg.total = 0;
+                if ((o = stage(IndexPhase::Clip, *s.clip, rep.clipped, &ids)) != Outcome::Done) return o;
+            }
+        }
+        if (!any || within) break;
     }
     return Outcome::Done;
 }
