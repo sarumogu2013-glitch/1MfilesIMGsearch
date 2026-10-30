@@ -2946,7 +2946,7 @@ static void testPathInfer() {
 
 // 前の版（タグが表）の DB を作る: 新しい形を崩して、版 11 の tags の表と変換の準備にする
 static void makeLegacyTags(Db& db) {
-    CHECK(db.exec("DROP VIEW tags; DROP TRIGGER tag_rows_count_ins; DROP TRIGGER tag_rows_count_del; DROP INDEX tag_rows_tag; "
+    CHECK(db.exec("DROP VIEW tags; DROP TRIGGER tag_rows_count_ins; DROP TRIGGER tag_rows_count_del; DROP INDEX tag_rows_tag_image; "
                   "DELETE FROM tag_rows; DELETE FROM tag_keys; DELETE FROM tag_sources;"));
     CHECK(db.exec(R"SQL(
 CREATE TABLE tags(image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE, tag TEXT NOT NULL, kind TEXT NOT NULL,
@@ -3057,6 +3057,20 @@ static void testTagStore() {
     q.tags = {"MIKU"};
     CHECK(search(db, q).ids.size() == 38);  // 40 枚 − 消した 7 − タガーのタグを置き換えた 2
     CHECK(tagNames(db).size() >= 3);
+    // 探すのに要る列が全部入った索引だけで足りる（本体の表を読みに行かない）
+    const std::string cte = queryPlan(db, "SELECT image_id, max(manual), max(confidence) FROM tags WHERE tag COLLATE NOCASE IN ('miku') "
+                                          "AND confidence >= 0.5 GROUP BY image_id");
+    CHECK(cte.find("COVERING INDEX tag_rows_tag_image") != std::string::npos);
+    // v2.18 の索引の DB は、作り直す
+    CHECK(!tagIndexUpgradePending(db));
+    CHECK(db.exec("DROP INDEX tag_rows_tag_image; CREATE INDEX tag_rows_tag ON tag_rows(tag_id, confidence);"));
+    CHECK(tagIndexUpgradePending(db));
+    upgradeTagIndex(db);
+    CHECK(!tagIndexUpgradePending(db) && search(db, q).ids.size() == 38);
+    {
+        Stmt st(db.handle(), "SELECT count(*) FROM sqlite_master WHERE name='tag_rows_tag'");
+        CHECK(st.step() && st.i64(0) == 0);
+    }
     fs::remove_all(dir);
 }
 

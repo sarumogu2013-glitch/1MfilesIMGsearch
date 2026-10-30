@@ -72,6 +72,9 @@ TagConversionState tagConversionState(Db& db);
 bool convertTagsStep(Db& db, int64_t maxImages, std::string* step = nullptr);
 // 新しく作った DB を新しい形にする（Db::migrate のトランザクションの中で。中身は空）
 bool finishNewTagFormat(Db& db);
+// v2.18 で変換した DB の索引を、探すのに要る列が全部入った索引に作り直す（数分かかることがある。済んでいれば何もしない）
+bool tagIndexUpgradePending(Db& db);
+void upgradeTagIndex(Db& db);
 
 // DB を詰めて小さくする（VACUUM。並べ替えは一時ファイルで。数分かかることがある）。失敗したら false と理由
 struct DbSpace {

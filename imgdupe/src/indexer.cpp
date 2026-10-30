@@ -138,7 +138,25 @@ double secondsSince(std::chrono::steady_clock::time_point t0) {
 // タグの置き場所を新しい形に変換する（済んでいれば何もしない）。止めたら false
 bool convertTagStore(Db& db, IndexProgress& progress, const std::atomic<bool>& cancel) {
     TagConversionState st = tagConversionState(db);
-    if (!st.pending) return true;
+    if (!st.pending) {
+        // v2.18 で変換した DB: 索引を作り直す（タグの検索が速くなる）
+        if (!tagIndexUpgradePending(db)) return true;
+        if (cancel) return false;
+        progress.phase = static_cast<int>(IndexPhase::Convert);
+        progress.prog.done = progress.prog.total = 0;
+        logs::info("タグの索引を作り直す（数分かかることがある）");
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            upgradeTagIndex(db);
+        } catch (const std::exception& e) {
+            logs::error(std::string("タグの索引を作り直せなかった（次の回でやり直す）: ") + e.what());
+            return false;
+        }
+        char t[96];
+        std::snprintf(t, sizeof t, "タグの索引を作り直した（%.0f 秒）", secondsSince(t0));
+        logs::info(t);
+        return true;
+    }
     progress.phase = static_cast<int>(IndexPhase::Convert);
     progress.prog.done = static_cast<uint64_t>(st.done);
     progress.prog.total = static_cast<uint64_t>(st.total);

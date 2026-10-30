@@ -7163,7 +7163,7 @@ void startTagConversion() {
         Db* db = uiDb();
         if (!db) return;
         try {
-            if (!tagConversionState(*db).pending) return;
+            if (!tagConversionState(*db).pending && !tagIndexUpgradePending(*db)) return;
         } catch (const std::exception&) {
             return;
         }
@@ -7188,7 +7188,13 @@ void startTagConversion() {
                 break;
             }
             try {
-                finished = convertTagsStep(db, 5000, &step);
+                if (!tagConversionState(db).pending) {
+                    post(L"タグの索引を作り直しています（初回だけ。数分かかります。使いながら待てます。終わると検索が速くなります）");
+                    upgradeTagIndex(db);
+                    finished = true;
+                } else {
+                    finished = convertTagsStep(db, 5000, &step);
+                }
             } catch (const std::exception& e) {
                 if (!tagConv.stop) logs::warn(std::string("タグの変換を中断した（次に起動した時に続きから）: ") + e.what());
                 break;

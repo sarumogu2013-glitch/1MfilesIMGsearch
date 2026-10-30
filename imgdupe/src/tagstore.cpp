@@ -29,7 +29,8 @@ constexpr size_t kIdCacheMax = 50000;  // 控えの数の上限（超えたら�
 // 新しい形のビューと、ビューに書いた時の置き換え（前と同じ形の INSERT・DELETE・UPDATE がそのまま使える）。
 // 出どころごとの行の数は tag_rows の追加・削除で数える（tag_rows には INSERT OR REPLACE を使わない。消した分が数えられないので）
 const char* const kNewFormatSql = R"SQL(
-CREATE INDEX IF NOT EXISTS tag_rows_tag ON tag_rows(tag_id, confidence);
+CREATE INDEX IF NOT EXISTS tag_rows_tag_image ON tag_rows(tag_id, image_id, confidence, manual);
+DROP INDEX IF EXISTS tag_rows_tag;
 DROP TRIGGER IF EXISTS tags_conv_ins;
 DROP TRIGGER IF EXISTS tags_conv_upd;
 DROP TRIGGER IF EXISTS tags_conv_del;
@@ -66,6 +67,11 @@ END;
 )SQL";
 
 const char* const kUptoKey = "tags:convertedUpTo";
+
+// タグで画像を探すための索引: タグの番号 → 画像 → 確度・手動の印（出どころは主キーから入る）。
+// 探すのに要る列が全部入っているので、本体の表を読みに行かない（v2.18 の (tag_id, confidence) は manual が無く、
+// 合う行ごとに本体を読みに行って遅かった）。画像の順に並ぶので、画像ごとにまとめるのも速い
+const char* const kTagIndexSql = "CREATE INDEX IF NOT EXISTS tag_rows_tag_image ON tag_rows(tag_id, image_id, confidence, manual)";
 
 // 前の表 tags の画像 ID の範囲 (lo, hi] を tag_rows に移す（名前・出どころの番号も作る）。移した行の数
 int64_t copyRange(Db& db, int64_t lo, int64_t hi) {
@@ -285,6 +291,33 @@ std::vector<std::string> tagNames(Db& db) {
 
 // ---------------------------------------------------------------- 前の版の DB の変換
 
+bool tagIndexUpgradePending(Db& db) {
+    if (!newTagFormat(db)) return false;
+    Stmt st(db.handle(), "SELECT 1 FROM sqlite_master WHERE type='index' AND name='tag_rows_tag_image'");
+    return !st.step();
+}
+
+void upgradeTagIndex(Db& db) {
+    if (!tagIndexUpgradePending(db)) return;
+    run(db, "PRAGMA temp_store=FILE");  // 並べ替えはメモリではなく一時ファイルで
+    try {
+        db.begin();
+        try {
+            run(db, kTagIndexSql);
+            run(db, "DROP INDEX IF EXISTS tag_rows_tag");
+            db.commit();
+        } catch (...) {
+            db.rollback();
+            throw;
+        }
+    } catch (...) {
+        db.exec("PRAGMA temp_store=MEMORY");
+        throw;
+    }
+    db.exec("PRAGMA temp_store=MEMORY");
+    db.exec("PRAGMA analysis_limit=1000; ANALYZE;");
+}
+
 TagConversionState tagConversionState(Db& db) {
     TagConversionState s;
     if (newTagFormat(db)) return s;
@@ -346,7 +379,7 @@ bool convertTagsStep(Db& db, int64_t maxImages, std::string* step) {
     try {
         db.begin();
         try {
-            run(db, "CREATE INDEX IF NOT EXISTS tag_rows_tag ON tag_rows(tag_id, confidence)");
+            run(db, kTagIndexSql);
             db.commit();
         } catch (...) {
             db.rollback();
