@@ -704,6 +704,17 @@ static void testIndexer() {
     encodes = 0;
     r = indexOnce(opt, cb, prog, cancel);
     CHECK(r.added == 0 && r.removed == 1 && r.hashed == 0 && decodes == 0 && encodes == 0);
+    {
+        // 調べるフォルダが読めない（ドライブを外した）時は、見つからなくても消さない
+        int turns = 0;
+        IndexCallbacks off = cb;
+        off.scan = [](const std::string&, std::vector<ScannedFile>&) {};  // 何も見つからない
+        off.rootAvailable = [](const std::string&) { return false; };
+        off.betweenGpuTurns = [&turns](Db&) { ++turns; };
+        r = indexOnce(opt, off, prog, cancel);
+        CHECK(r.removed == 0);
+        CHECK(turns >= 1);  // GPU の段階の合間に呼ぶ
+    }
 
     // indexer が済ませた分は、検索でも読み直さない
     RunOptions ro;

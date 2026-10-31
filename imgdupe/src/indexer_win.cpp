@@ -280,6 +280,21 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
         }
         imgwin::scanFolder(w, files, found, g->cancelRun);
     };
+    cb.rootAvailable = [](const std::string& root) {
+        const DWORD a = GetFileAttributesW(widen(root).c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    // フォルダ名から読み取る形を教えられた: 回の終わりを待たず、GPU の段階の合間に推し量り直す
+    cb.betweenGpuTurns = [](Db& db) {
+        if (!g->inferDirty.exchange(false)) return;
+        try {
+            const InferSummary r = runFolderInference(db, false, &g->cancelRun);
+            logs::info("フォルダ名から推し量り直した（解析の途中で）: 変わったフォルダ " + std::to_string(r.changedDirs) + " 個・画像 " +
+                       std::to_string(r.images) + " 枚");
+        } catch (const std::exception& e) {
+            logs::error(std::string("フォルダ名から推し量れなかった: ") + e.what());
+        }
+    };
     cb.decode = [](const std::string& path) { return imgwin::decodeFeatures(widen(path)); };
     cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
         return imgwin::encodeThumbnail(widen(path), side, bytes, w, h);

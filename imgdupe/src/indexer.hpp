@@ -56,6 +56,10 @@ struct IndexCallbacks {
     std::function<void(Db&, const std::atomic<bool>& cancel, Progress*)> lookup;
     // 9. 統合（行動・アイテム辞書を当てる。変わっていなければ何もしない）
     std::function<void(Db&)> merge;
+    // 調べるフォルダが今読めるか（外付けのドライブを外した時など）。読めないフォルダの下の画像は「消えた」にしない（無ければ全部読める）
+    std::function<bool(const std::string& root)> rootAvailable;
+    // GPU の段階（タガーと CLIP の交互）の合間に呼ぶ（画面から頼まれた軽い処理をはさむ。長い回の終わりまで待たせない）
+    std::function<void(Db&)> betweenGpuTurns;
 };
 
 enum class IndexPhase { Idle, Scan, Hash, Thumb, Meta, Names, Tagger, Clip, Variants, Quality, Lookup, Merge, Convert, Done };

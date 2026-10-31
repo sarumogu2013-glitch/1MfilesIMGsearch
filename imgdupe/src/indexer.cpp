@@ -289,6 +289,7 @@ Outcome runGpuStages(Db& db, RunState& s, const std::vector<int64_t>* within, un
     };
     std::vector<int64_t> lastTagger, lastClip;  // 前の回の分（進まなくなったらやめる）
     for (;;) {
+        if (!within && cb.betweenGpuTurns) cb.betweenGpuTurns(db);
         bool any = false;
         if (taggerOn) {
             std::vector<int64_t> ids = pendingImages(db, stage::kTagger, tv, within ? 0 : taggerChunk, within);
@@ -469,7 +470,13 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
     s.rep.files += files.size();
     const int64_t before = imageCount(db);
     const auto ids = upsertScanned(db, files);
-    const size_t removed = removeUnder.empty() ? 0 : removeMissing(db, removeUnder, ids);
+    // 読めないフォルダ（外したドライブなど）の下は消さない（つなぎ直した時にタグ・CLIP などを作り直さずに済むように）
+    std::vector<std::string> removable;
+    for (const auto& r : removeUnder) {
+        if (!s.cb.rootAvailable || s.cb.rootAvailable(r)) removable.push_back(r);
+        else logs::warn("調べるフォルダが見つからない（ドライブを外した・名前を変えたなど）ので、その下の画像は消さずに残す: " + r);
+    }
+    const size_t removed = removable.empty() ? 0 : removeMissing(db, removable, ids);
     s.rep.removed += removed;
     s.rep.added += static_cast<size_t>(std::max<int64_t>(0, imageCount(db) - before + static_cast<int64_t>(removed)));
     {

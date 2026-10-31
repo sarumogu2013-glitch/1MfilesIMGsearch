@@ -7477,6 +7477,10 @@ IndexCallbacks windowsIndexCallbacks(std::atomic<uint64_t>& found, const std::at
     cb.scan = [&found, &cancel](const std::string& root, std::vector<ScannedFile>& files) {
         imgwin::scanFolder(widen(root), files, found, cancel);
     };
+    cb.rootAvailable = [](const std::string& root) {  // 読めないフォルダ（外したドライブ）の下は消さない
+        const DWORD a = GetFileAttributesW(widen(root).c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    };
     cb.decode = [](const std::string& path) { return imgwin::decodeFeatures(widen(path)); };
     cb.encodeThumb = [](const std::string& path, int side, std::vector<uint8_t>& bytes, int& w, int& h) {
         return imgwin::encodeThumbnail(widen(path), side, bytes, w, h);
