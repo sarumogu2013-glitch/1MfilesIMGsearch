@@ -5130,13 +5130,24 @@ struct ProgressState {
 };
 ProgressState progressState;
 
-// 進み具合に数える段階（解析の総合の数と同じ。入れていない AI の部品の段階は数えない）
-std::vector<StageKey> progressStages() {
+// 進み具合に数える段階（解析の総合の数と同じ。入れていない AI の部品の段階は数えない）と、
+// 割合の重み = 1 枚の処理の時間の目安（秒。疑似的な値。タガーが一番重く、名前の解析はほぼかからない）
+std::vector<StageKey> progressStages(std::vector<double>& weights) {
     std::vector<StageKey> st = {{stage::kHash, kHashVersion}, {stage::kThumb, kThumbVersion}, {stage::kMeta, kMetaVersion},
                                 {kStageNames, kNamesVersion}};
-    if (const int tv = tagger::stageVersion(app.dataDir)) st.push_back({stage::kTagger, tv});
-    if (const int cv = clip::stageVersion(app.dataDir)) st.push_back({kStageClip, cv});
-    if (clip::qualityEnabled(app.dataDir)) st.push_back({kStageQuality, kQualityVersion});
+    weights = {0.010, 0.015, 0.003, 0.001};
+    if (const int tv = tagger::stageVersion(app.dataDir)) {
+        st.push_back({stage::kTagger, tv});
+        weights.push_back(0.170);  // 約 6 枚/秒
+    }
+    if (const int cv = clip::stageVersion(app.dataDir)) {
+        st.push_back({kStageClip, cv});
+        weights.push_back(0.040);
+    }
+    if (clip::qualityEnabled(app.dataDir)) {
+        st.push_back({kStageQuality, kQualityVersion});
+        weights.push_back(0.020);
+    }
     return st;
 }
 
@@ -5157,22 +5168,22 @@ void ExplorerApp::ExplorerRequestProgress(const std::wstring& dir) {
     ps.cancel = std::make_shared<std::atomic<bool>>(false);
     std::vector<std::string> roots;
     for (const auto& f : folderList()) roots.push_back(narrow(f));
-    const std::vector<StageKey> stages = progressStages();
+    std::vector<double> weights;
+    const std::vector<StageKey> stages = progressStages(weights);
     const std::string db = narrow(dbPath());
     HWND hwnd = app.hwnd;
     auto cancel = ps.cancel;
-    std::thread([dir, roots, stages, db, hwnd, cancel] {
+    std::thread([dir, roots, stages, weights, db, hwnd, cancel] {
         auto* done = new ProgressDone{dir, {}};
         try {
             Db d;
             if (d.open(db)) {
                 const auto counts = childProgress(d, narrow(dir), roots, stages, cancel.get());
-                const double kinds = static_cast<double>(std::max<size_t>(1, stages.size()));
                 for (const auto& [name, c] : counts) {
                     if (!c.images) continue;
                     ExplorerProgress p;
                     p.name = widen(name);
-                    p.ratio = std::clamp(static_cast<double>(c.done) / (static_cast<double>(c.images) * kinds), 0.0, 1.0);
+                    p.ratio = weightedProgress(c, weights);  // 処理の時間で重みを付けた割合
                     const int pct = static_cast<int>(p.ratio * 100);  // 切り捨て（全部済むまで 100% にしない）
                     p.text = L"[" + std::to_wstring(pct) + L"%] ";
                     if (c.images == 1) p.text += std::to_wstring(c.done) + L"/" + std::to_wstring(stages.size()) + L" 種類";
@@ -7824,6 +7835,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             POINT pt{GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam)};
             if (wheelOnTabs(pt, GET_WHEEL_DELTA_WPARAM(msg.wParam))) continue;
             HWND under = WindowFromPoint(pt);
+            if (under == app.s.sources && !(GET_KEYSTATE_WPARAM(msg.wParam) & (MK_CONTROL | MK_SHIFT))) {
+                // 探す所の一覧は、普段の 1/4 の速さで（行が少ないので行き過ぎないように）
+                static int acc = 0;
+                UINT lines = 3;
+                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                if (lines == WHEEL_PAGESCROLL || lines == 0) lines = 3;
+                acc += GET_WHEEL_DELTA_WPARAM(msg.wParam) * static_cast<int>(lines);
+                const int step = 4 * WHEEL_DELTA;
+                const int n = acc / step;  // 動かす行（上へが正）
+                acc -= n * step;
+                RECT ir{};
+                if (n && ListView_GetItemRect(app.s.sources, 0, &ir, LVIR_BOUNDS))
+                    ListView_Scroll(app.s.sources, 0, -n * (ir.bottom - ir.top));
+                continue;
+            }
             if (under && (under == app.s.from || under == app.s.to) && under != msg.hwnd) {
                 SendMessageW(under, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
                 continue;

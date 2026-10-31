@@ -2697,6 +2697,10 @@ static void testSameImage() {
         // 進み具合: 直下の名前ごと（フォルダは下の全部）。済んだ段階の延べ数
         auto pr = childProgress(db, "d:\\pics", roots, {{"hash", kHashVersion}, {"nothing", 1}});
         CHECK(pr["a"].images == 3 && pr["a"].done == 2 && pr.count("b") && pr["b"].images >= 2);
+        CHECK(pr["a"].doneBy.size() == 2 && pr["a"].doneBy[0] == 2 && pr["a"].doneBy[1] == 0);
+        // 時間の重み: hash が 1、nothing が 3 なら (1×2/3) / 4
+        CHECK(std::abs(weightedProgress(pr["a"], {1.0, 3.0}) - (2.0 / 3.0) / 4.0) < 1e-9);
+        CHECK(weightedProgress(ProgressCount{}, {1.0}) == 0);
         auto pa = childProgress(db, "D:\\Pics\\a", roots, {{"hash", kHashVersion}});
         CHECK(pa["1.jpg"].images == 1 && pa["1.jpg"].done == 1 && pa["7.jpg"].done == 0);
         std::atomic<bool> stop{true};

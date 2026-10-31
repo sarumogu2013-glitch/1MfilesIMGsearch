@@ -487,6 +487,7 @@ class ExplorerImpl {
   }
   int scrollY = 0;
   bool tracking = false;
+  int scrollX = 0;              // 詳細表示の横のスクロール
   int resizeCol = -1;           // 詳細表示の列の幅を変えている（列の番号）
   int resizeFromX = 0, resizeFromW = 0;
 
@@ -553,7 +554,13 @@ class ExplorerImpl {
     GetClientRect(grid, &rc);
     return rc.right;
   }
-  int CellW() const { return Details() ? GridW() : ThumbSize() + Pad() * 2; }
+  int CellW() const { return Details() ? std::max(GridW(), ContentW()) : ThumbSize() + Pad() * 2; }
+  // 詳細表示の列の幅の合計（横のスクロールの幅）
+  int ContentW() const {
+    if (!Details()) return GridW();
+    const auto cols = DetailColumns();
+    return cols.empty() ? GridW() : cols.back().right + scrollX;
+  }
   int CellH() const { return Details() ? Px(24) : ThumbSize() + Pad() * 2 + TextH(); }
   int Cols() const {
     if (Details()) return 1;
@@ -566,7 +573,7 @@ class ExplorerImpl {
   RECT CellRect(int i) const {
     int c = Cols();
     int top = Details() ? HeaderH() : Pad();
-    int x = OffsetX() + (i % c) * CellW(), y = top + (i / c) * CellH() - scrollY;
+    int x = OffsetX() + (i % c) * CellW() - (Details() ? scrollX : 0), y = top + (i / c) * CellH() - scrollY;
     return RECT{x, y, x + CellW(), y + CellH()};
   }
   int TotalHeight() const {
@@ -1633,6 +1640,21 @@ class ExplorerImpl {
     si.nPage = UINT(rc.bottom);
     si.nPos = scrollY;
     SetScrollInfo(grid, SB_VERT, &si, TRUE);
+    // 横: 詳細表示で列の幅の合計が一覧の幅より広い時だけ（ほかは出さない）
+    const int content = Details() ? ContentW() : 0;
+    scrollX = Details() ? std::max(0, std::min(scrollX, content - int(rc.right))) : 0;
+    SCROLLINFO hi = {sizeof(hi), SIF_RANGE | SIF_PAGE | SIF_POS};
+    hi.nMin = 0;
+    hi.nMax = Details() && content > rc.right ? content - 1 : 0;
+    hi.nPage = Details() && content > rc.right ? UINT(rc.right) : 0;
+    hi.nPos = scrollX;
+    SetScrollInfo(grid, SB_HORZ, &hi, TRUE);
+  }
+
+  void ScrollToX(int x) {
+    scrollX = x;
+    UpdateScroll();
+    InvalidateRect(grid, nullptr, FALSE);
   }
 
   void ScrollTo(int y) {
@@ -2167,7 +2189,7 @@ class ExplorerImpl {
   // 列の幅（自分で変えた幅。無ければ既定。名前は既定なら残りの幅）
   int ColWidth(size_t i) const {
     if (i < settings.detailCols.size() && settings.detailCols[i] > 0) return Px(settings.detailCols[i]);
-    static const int defaults[] = {0, 140, 150, 90, 150};
+    static const int defaults[] = {0, 140, 150, 90, 260};
     if (i == 2 && listMode) return Px(280);
     return Px(defaults[i]);
   }
@@ -2179,7 +2201,7 @@ class ExplorerImpl {
     std::vector<Column> cols = {{L"名前", 0, 0, 0}, {L"更新日時", 1, 0, 0}, {listMode ? L"フォルダ" : L"種類", listMode ? kFolderSort : 2, 0, 0},
                                 {L"サイズ", 3, 0, 0}, {L"インデックス", kIndexSort, 0, 0}};
     int widths[] = {nameW, dateW, typeW, sizeW, stateW};
-    int x = 0;
+    int x = -scrollX;
     for (size_t i = 0; i < cols.size(); i++) {
       cols[i].left = x;
       x += widths[i];
@@ -3409,6 +3431,7 @@ class ExplorerImpl {
               self->host->ExplorerSettingsChanged(self->settings);
               if (self->Details() && !self->listMode) self->host->ExplorerRequestProgress(self->dir);
               self->scrollY = 0;
+              self->scrollX = 0;
               self->UpdateScroll();
               self->EnsureVisible(self->sel);
               InvalidateRect(self->grid, nullptr, FALSE);
@@ -3653,9 +3676,37 @@ class ExplorerImpl {
           // Ctrl + ホイールで大きさを変える (可変になる)
           int step = delta > 0 ? 16 : -16;
           SetSize(3, CurrentLogicalSize() + step);
+        } else if ((GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) && Details()) {
+          ScrollToX(scrollX - delta * Px(120) / WHEEL_DELTA);  // Shift + ホイールで横に
         } else {
-          ScrollTo(scrollY - delta * CellH() / 2 / WHEEL_DELTA);
+          // 詳細表示は 1 目盛りで 1 行（サムネイルは半分）
+          ScrollTo(scrollY - delta * CellH() / (Details() ? 1 : 2) / WHEEL_DELTA);
         }
+        return 0;
+      }
+      case WM_MOUSEHWHEEL:  // チルトホイール・タッチパッドの横
+        if (Details()) ScrollToX(scrollX + GET_WHEEL_DELTA_WPARAM(wp) * Px(120) / WHEEL_DELTA);
+        return 0;
+      case WM_HSCROLL: {
+        RECT rc;
+        GetClientRect(grid, &rc);
+        int x = scrollX;
+        switch (LOWORD(wp)) {
+          case SB_LINELEFT: x -= Px(40); break;
+          case SB_LINERIGHT: x += Px(40); break;
+          case SB_PAGELEFT: x -= rc.right; break;
+          case SB_PAGERIGHT: x += rc.right; break;
+          case SB_LEFT: x = 0; break;
+          case SB_RIGHT: x = ContentW(); break;
+          case SB_THUMBTRACK:
+          case SB_THUMBPOSITION: {
+            SCROLLINFO si = {sizeof(si), SIF_TRACKPOS};
+            GetScrollInfo(grid, SB_HORZ, &si);
+            x = si.nTrackPos;
+            break;
+          }
+        }
+        ScrollToX(x);
         return 0;
       }
       case WM_MOUSEMOVE: {
@@ -3663,6 +3714,7 @@ class ExplorerImpl {
           const int w = std::max(Px(40), resizeFromW + GET_X_LPARAM(lp) - resizeFromX);
           if (settings.detailCols.size() < 5) settings.detailCols.resize(5, 0);
           settings.detailCols[size_t(resizeCol)] = std::max(1, w * 96 / std::max(1, Px(96)));
+          UpdateScroll();
           InvalidateRect(grid, nullptr, FALSE);
           return 0;
         }
@@ -3816,6 +3868,7 @@ class ExplorerImpl {
           if (edge >= 0 && size_t(edge) < settings.detailCols.size()) {
             settings.detailCols[size_t(edge)] = 0;
             host->ExplorerSettingsChanged(settings);
+            UpdateScroll();
             InvalidateRect(grid, nullptr, FALSE);
           }
           return 0;

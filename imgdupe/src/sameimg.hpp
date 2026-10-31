@@ -94,8 +94,11 @@ struct StageKey {
 };
 struct ProgressCount {
     int64_t images = 0;  // 画像の枚数
-    int64_t done = 0;    // 済んだ（画像, 段階）の延べ数。割合 = done / (images × 段階の数)
+    int64_t done = 0;    // 済んだ（画像, 段階）の延べ数
+    std::vector<int64_t> doneBy;  // 段階ごとの済んだ枚数（stages と同じ並び）
 };
+// 処理の時間で重みを付けた進み具合（0〜1）。weights は段階ごとの 1 枚の処理の時間の目安（stages と同じ並び）
+double weightedProgress(const ProgressCount& c, const std::vector<double>& weights);
 // フォルダ dir の直下の名前ごと（ファイルはその画像、フォルダはその下の全部の画像）の進み具合。cancel が立つと途中で空を返す
 std::unordered_map<std::string, ProgressCount> childProgress(Db& db, const std::string& dir, const std::vector<std::string>& roots,
                                                              const std::vector<StageKey>& stages, const std::atomic<bool>* cancel = nullptr);

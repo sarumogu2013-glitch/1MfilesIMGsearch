@@ -229,12 +229,11 @@ std::unordered_map<std::string, ProgressCount> childProgress(Db& db, const std::
             prefix = trimSep(r) + trimSep(dir).substr(trimSep(r).size());
         }
     }
-    std::string match;  // 済んだ段階（版も同じ）を数える
-    for (size_t i = 0; i < stages.size(); ++i) match += std::string(i ? " OR " : "") + "(s.stage=? AND s.version=?)";
-    const std::string sql = "SELECT i.path, " +
-                            (stages.empty() ? std::string("0")
-                                            : "(SELECT count(*) FROM stages s WHERE s.image_id=i.id AND s.state<>0 AND (" + match + "))") +
-                            " FROM images i WHERE i.path >= ? AND i.path < ?";
+    // 段階ごとに、済んだ（版も同じ。失敗も済み）か（主キーで 1 つずつ引く）
+    std::string sql = "SELECT i.path";
+    for (size_t k = 0; k < stages.size(); ++k)
+        sql += ", (SELECT s.state<>0 FROM stages s WHERE s.image_id=i.id AND s.stage=? AND s.version=?)";
+    sql += " FROM images i WHERE i.path >= ? AND i.path < ?";
     for (const char sep : {'\\', '/'}) {
         std::string p = prefix;
         if (sep == '/') std::replace(p.begin(), p.end(), '\\', '/');
@@ -254,10 +253,25 @@ std::unordered_map<std::string, ProgressCount> childProgress(Db& db, const std::
             const size_t cut = rest.find_first_of("\\/");
             ProgressCount& c = out[cut == std::string::npos ? rest : rest.substr(0, cut)];
             ++c.images;
-            c.done += st.i64(1);
+            if (c.doneBy.size() < stages.size()) c.doneBy.resize(stages.size(), 0);
+            for (size_t k = 0; k < stages.size(); ++k)
+                if (st.i64(static_cast<int>(k) + 1) != 0) {
+                    ++c.doneBy[k];
+                    ++c.done;
+                }
         }
     }
     return out;
+}
+
+double weightedProgress(const ProgressCount& c, const std::vector<double>& weights) {
+    if (c.images <= 0) return 0;
+    double all = 0, done = 0;
+    for (size_t k = 0; k < weights.size(); ++k) {
+        all += weights[k];
+        if (k < c.doneBy.size()) done += weights[k] * static_cast<double>(c.doneBy[k]) / static_cast<double>(c.images);
+    }
+    return all > 0 ? std::clamp(done / all, 0.0, 1.0) : 0;
 }
 
 int64_t findImageId(Db& db, const std::string& path, const std::vector<std::string>& roots) {
