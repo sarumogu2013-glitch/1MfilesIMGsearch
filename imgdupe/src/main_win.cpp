@@ -5143,7 +5143,7 @@ std::vector<int> ExplorerApp::ExplorerStates(const std::wstring& dir, const std:
             if (st == IndexState::None)
                 if (Db* db = uiDb()) {
                     try {
-                        if (folderHasIndexed(*db, base + name)) st = IndexState::Partial;  // 調べる対象の外でも、画像が DB にある
+                        if (folderHasIndexed(*db, base + name)) st = IndexState::Offline;  // 調べるフォルダの外だが、画像が DB にある（結果に出ない）
                     } catch (const std::exception&) {
                     }
                 }

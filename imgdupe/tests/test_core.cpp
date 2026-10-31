@@ -2781,6 +2781,14 @@ static void testSameImage() {
     auto st = fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion);
     CHECK(st.size() == 3 && st["1.jpg"] == IndexState::Indexed && st["7.jpg"] == IndexState::Pending && !st.count("3.png"));
     CHECK(fileIndexStates(db, "D:\\Pics\\b", roots, kHashVersion).size() == 2);  // sub の下は入らない
+    {
+        // 外してある画像は Offline（灰色の印。結果に出ない）
+        db.exec("UPDATE images SET offline=1 WHERE path LIKE '%\\a\\1.jpg'");
+        CHECK(fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion)["1.jpg"] == IndexState::Offline);
+        const std::vector<std::string> one = {"1.jpg"};
+        CHECK(fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion, &one)["1.jpg"] == IndexState::Offline);
+        db.exec("UPDATE images SET offline=0");
+    }
     CHECK(fileIndexStates(db, "D:\\Other", {}, kHashVersion).size() == 1);
     {
         // 名前を渡すと、その名前だけ引く（同じ結果）

@@ -777,7 +777,7 @@ class ExplorerImpl {
     const size_t others = items.size() - dirs - images;
     std::wstring t = L"フォルダ " + std::to_wstring(dirs) + L" 個・画像 " + std::to_wstring(images) + L" 枚";
     if (others) t += L"・ほかのファイル " + std::to_wstring(others) + L" 個";
-    t += L"　　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部";
+    t += L"　　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部、灰: 外してある（結果に出ない）";
     SetWindowTextW(sameText, t.c_str());
   }
 
@@ -2060,7 +2060,7 @@ class ExplorerImpl {
     DrawFolderShape(dc, r);
   }
 
-  // インデックスの状態の印 (右下の丸): 緑 = 作成済み、橙 = 処理待ち、白 = 未作成、左半分が緑 = 一部
+  // インデックスの状態の印 (右下の丸): 緑 = 作成済み、橙 = 処理待ち、白 = 未作成、左半分が緑 = 一部、灰のチェック = 外してある
   void StateBadge(HDC dc, RECT box, int state) {
     if (state < 0) return;
     int ts = std::min(box.right - box.left, box.bottom - box.top);
@@ -2070,11 +2070,11 @@ class ExplorerImpl {
     COLORREF green = RGB(36, 160, 72), orange = RGB(232, 140, 24), gray = RGB(140, 140, 140);
     HPEN outline = CreatePen(PS_SOLID, std::max(1, Px(1)), RGB(255, 255, 255));
     HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
-    HBRUSH fill = CreateSolidBrush(state == kStateIndexed ? green : state == kStatePending ? orange : RGB(255, 255, 255));
+    HBRUSH fill = CreateSolidBrush(state == kStateIndexed ? green : state == kStateOffline ? gray : state == kStatePending ? orange : RGB(255, 255, 255));
     HGDIOBJ op = SelectObject(dc, outline);
     HGDIOBJ ob = SelectObject(dc, fill);
     Ellipse(dc, c.left - Px(1), c.top - Px(1), c.right + Px(1), c.bottom + Px(1));  // 白い縁
-    HPEN ring = CreatePen(PS_SOLID, std::max(1, Px(1)), state == kStateNone ? gray : state == kStatePending ? orange : green);
+    HPEN ring = CreatePen(PS_SOLID, std::max(1, Px(1)), state == kStateNone || state == kStateOffline ? gray : state == kStatePending ? orange : green);
     SelectObject(dc, ring);
     if (state == kStatePartial) {
       SelectObject(dc, white);
@@ -2087,8 +2087,8 @@ class ExplorerImpl {
     } else {
       Ellipse(dc, c.left, c.top, c.right, c.bottom);
     }
-    if (state == kStateIndexed) {
-      // 白いチェック
+    if (state == kStateIndexed || state == kStateOffline) {
+      // 白いチェック（外してあるものは灰色の丸に）
       HPEN check = CreatePen(PS_SOLID, std::max(2, r / 3), RGB(255, 255, 255));
       SelectObject(dc, check);
       POINT pts[3] = {{cx - r / 2, cy}, {cx - r / 8, cy + r * 2 / 5}, {cx + r / 2, cy - r * 2 / 5}};
@@ -2242,8 +2242,9 @@ class ExplorerImpl {
         int r = Px(5), cx = cols[4].left + pad + r, cy = (row.top + row.bottom) / 2;
         StateBadge(dc, {cx - r * 2, cy - r * 2, cx + r * 2 - Px(1), cy + r * 2 - Px(1)}, it.state);
         RECT tr = {cols[4].left + pad + r * 3, row.top, cols[4].right - pad, row.bottom};
-        static const wchar_t* names[] = {L"未作成", L"処理待ち", L"作成済み", L"一部"};
-        const std::wstring t = !it.progressText.empty() ? it.progressText : names[it.state];
+        static const wchar_t* names[] = {L"未作成", L"処理待ち", L"作成済み", L"一部", L"外してある（結果に出ない）"};
+        std::wstring t = !it.progressText.empty() ? it.progressText : names[it.state];
+        if (it.state == kStateOffline && !it.progressText.empty()) t = L"外してある・" + t;
         DrawTextW(dc, t.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
       }
     }
@@ -2422,6 +2423,7 @@ class ExplorerImpl {
       case kStatePending: return L"インデックス: 処理待ち";
       case kStatePartial: return L"インデックス: 一部のフォルダだけ";
       case kStateNone: return L"インデックス: 未作成";
+      case kStateOffline: return L"インデックス: 外してある（調べるフォルダの外。結果に出ない）";
     }
     return L"";
   }
@@ -4108,7 +4110,7 @@ class ExplorerImpl {
     for (const auto& [d, n] : settings.frequent) visits[DirKey(d)] = {d, n};
     // 下のステータスバー
     sameText = make(L"STATIC", L"画像を右クリック →「同じ画像を探す」か、画像のファイル・URL をここにドロップすると、同じ画像（インデックスを作った全部のフォルダの中）を一覧に出します。"
-                               L"　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部",
+                               L"　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部、灰: 外してある（結果に出ない）",
                     SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS, ID_SAME_TEXT);
     // マウスを乗せた時の説明
     {

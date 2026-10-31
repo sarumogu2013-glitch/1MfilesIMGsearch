@@ -59,7 +59,8 @@ struct ExplorerGroup {
 };
 
 // インデックスの状態の印 (sameimg.hpp の IndexState と同じ値。-1 = 印を出さない)
-enum ExplorerState { kStateNoBadge = -1, kStateNone = 0, kStatePending = 1, kStateIndexed = 2, kStatePartial = 3 };
+enum ExplorerState { kStateNoBadge = -1, kStateNone = 0, kStatePending = 1, kStateIndexed = 2, kStatePartial = 3,
+                     kStateOffline = 4 };  // 外してある（インデックスはあるが、調べるフォルダの外・つながっていない。結果に出ない）
 
 struct ExplorerMatch {
   std::wstring path;

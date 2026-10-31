@@ -76,7 +76,7 @@ std::vector<std::pair<std::string, std::string>> imageProperties(Db& db, int64_t
                                                                  const std::function<std::string(int64_t)>& timeText = nullptr);
 
 // インデックスの状態
-enum class IndexState { None = 0, Pending = 1, Indexed = 2, Partial = 3 };
+enum class IndexState { None = 0, Pending = 1, Indexed = 2, Partial = 3, Offline = 4 };  // Offline: 外してある（結果に出ない）
 
 // フォルダ dir（区切りで終わらない）の直下のファイルの状態（名前 → Indexed（読めなかったものも）/ Pending。DB に無いものは入らない）。
 // roots と大文字小文字だけが違う時は、roots の書き方に直して探す

@@ -186,7 +186,7 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
     if (names) {
         // 名前ごとに引く（パスの索引で 1 件ずつ）
         Stmt st(db.handle(),
-                "SELECT coalesce(s.state, 0) FROM images i "
+                "SELECT coalesce(s.state, 0), i.offline FROM images i "
                 "LEFT JOIN stages s ON s.image_id=i.id AND s.stage='hash' AND s.version=? WHERE i.path=?");
         for (const auto& name : *names)
             for (const char sep : {'\\', '/'}) {
@@ -194,7 +194,7 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
                 std::replace(p.begin(), p.end(), sep == '/' ? '\\' : '/', sep);
                 st.bind(1, static_cast<int64_t>(hashVersion)).bind(2, p + sep + name);
                 const bool found = st.step();
-                if (found) out[name] = st.i64(0) != 0 ? IndexState::Indexed : IndexState::Pending;
+                if (found) out[name] = st.i64(1) != 0 ? IndexState::Offline : st.i64(0) != 0 ? IndexState::Indexed : IndexState::Pending;
                 st.reset();
                 if (found) break;
             }
@@ -206,14 +206,14 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
         else std::replace(p.begin(), p.end(), '/', '\\');
         p += sep;
         Stmt st(db.handle(),
-                "SELECT i.path, coalesce(s.state, 0) FROM images i "
+                "SELECT i.path, coalesce(s.state, 0), i.offline FROM images i "
                 "LEFT JOIN stages s ON s.image_id=i.id AND s.stage='hash' AND s.version=? "
                 "WHERE i.path >= ? AND i.path < ?");
         st.bind(1, static_cast<int64_t>(hashVersion)).bind(2, p).bind(3, p + "\xff");
         while (st.step()) {
             const std::string rest = st.text(0).substr(p.size());
             if (rest.empty() || rest.find_first_of("\\/") != std::string::npos) continue;  // 下の階層
-            out[rest] = st.i64(1) != 0 ? IndexState::Indexed : IndexState::Pending;  // 読めなかった（失敗）も処理は済んでいる
+            out[rest] = st.i64(2) != 0 ? IndexState::Offline : st.i64(1) != 0 ? IndexState::Indexed : IndexState::Pending;  // 読めなかった（失敗）も処理は済んでいる
         }
     }
     return out;
