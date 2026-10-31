@@ -5710,7 +5710,7 @@ bool onSearchCommand(WPARAM wp) {
                 } else {
                     applyPreset(i);
                     fillSources();
-                    scheduleSearch(30);
+                    advancedChanged();  // 探すのは「検索」か Enter で
                 }
             }
             return true;
