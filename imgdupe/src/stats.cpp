@@ -33,7 +33,7 @@ std::string extensionOf(const std::string& path) {
 StatsSummary statsSummary(Db& db) {
     StatsSummary s;
     {
-        Stmt st(db.handle(), "SELECT count(*), coalesce(sum(size),0) FROM images");
+        Stmt st(db.handle(), "SELECT count(*), coalesce(sum(size),0) FROM images WHERE offline=0");
         if (st.step()) {
             s.images = st.i64(0);
             s.bytes = st.i64(1);
@@ -222,7 +222,7 @@ std::vector<StatRow> monthlyCounts(Db& db, bool localTime) {
                             ") AS m, count(*), coalesce(sum(size),0) FROM ("
                             "SELECT CASE WHEN f.created>0 AND f.created < i.mtime/10000000-11644473600 THEN f.created "
                             "ELSE i.mtime/10000000-11644473600 END AS t, i.size AS size "
-                            "FROM images i LEFT JOIN file_meta f ON f.image_id=i.id WHERE i.mtime>0) "
+                            "FROM images i LEFT JOIN file_meta f ON f.image_id=i.id WHERE i.mtime>0 AND i.offline=0) "
                             "GROUP BY m ORDER BY m";
     Stmt st(db.handle(), sql.c_str());
     while (st.step())
@@ -241,12 +241,12 @@ std::vector<StatRow> formatCounts(Db& db) {
     {
         Stmt st(db.handle(),
                 "SELECT upper(f.format), count(*), coalesce(sum(i.size),0) FROM images i JOIN file_meta f ON f.image_id=i.id "
-                "WHERE f.format IS NOT NULL AND f.format<>'' GROUP BY upper(f.format)");
+                "WHERE f.format IS NOT NULL AND f.format<>'' AND i.offline=0 GROUP BY upper(f.format)");
         while (st.step()) add(st.text(0), st.i64(1), st.i64(2));
     }
     {
         Stmt st(db.handle(),
-                "SELECT i.path, i.size FROM images i LEFT JOIN file_meta f ON f.image_id=i.id WHERE f.format IS NULL OR f.format=''");
+                "SELECT i.path, i.size FROM images i LEFT JOIN file_meta f ON f.image_id=i.id WHERE (f.format IS NULL OR f.format='') AND i.offline=0");
         while (st.step()) add(extensionOf(st.text(0)), 1, st.i64(1));
     }
     std::vector<StatRow> out;

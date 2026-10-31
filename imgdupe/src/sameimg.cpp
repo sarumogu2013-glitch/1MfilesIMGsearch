@@ -43,7 +43,10 @@ std::string folderOf(const std::string& path) {
 bool SameImageIndex::refresh(Db& db, int hashVersion) {
     int64_t count = 0, maxId = 0;
     {
-        Stmt st(db.handle(), "SELECT count(*), coalesce(max(image_id),0) FROM stages WHERE stage='hash' AND state=1 AND version=?");
+        // 外してある画像の数も含めて見る（付け替わったら作り直す）
+        Stmt st(db.handle(),
+                "SELECT count(*) + 1000003 * (SELECT coalesce(sum(offline),0) FROM images), coalesce(max(image_id),0) FROM stages "
+                "WHERE stage='hash' AND state=1 AND version=?");
         st.bind(1, static_cast<int64_t>(hashVersion));
         if (st.step()) {
             count = st.i64(0);
@@ -58,7 +61,7 @@ bool SameImageIndex::refresh(Db& db, int hashVersion) {
     rows.reserve(static_cast<size_t>(count));
     Stmt st(db.handle(),
             "SELECT i.id, i.dh, i.dv, i.color, i.contrast FROM images i JOIN stages s ON s.image_id=i.id AND s.stage='hash' "
-            "WHERE s.state=1 AND s.version=? AND i.readable=1");
+            "WHERE s.state=1 AND s.version=? AND i.readable=1 AND i.offline=0");
     st.bind(1, static_cast<int64_t>(hashVersion));
     while (st.step()) {
         const int64_t c = st.i64(3);
@@ -83,7 +86,7 @@ std::vector<SameMatch> SameImageIndex::find(Db& db, const SameQuery& q,
     const std::string self = normPath(q.selfPath);
     // 完全一致: 大きさが同じものの SHA-256 を比べる
     if (q.size > 0 && q.hasSha) {
-        Stmt st(db.handle(), "SELECT id, path, sha, width, height FROM images WHERE size=?");
+        Stmt st(db.handle(), "SELECT id, path, sha, width, height FROM images WHERE size=? AND offline=0");
         st.bind(1, static_cast<int64_t>(q.size));
         while (st.step()) {
             SameMatch m;

@@ -86,6 +86,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_RELEASES, "Releases", L"最新版のページを開く(&R)", ""},
     {CMD_HELP, "Help", L"使い方(&H)", "F1"},
     {CMD_COMPACT_DB, "CompactDb", L"DB を詰めて小さくする(&Z)...", ""},
+    {CMD_ARCHIVE, "Archive", L"保管したデータ(&H)...", ""},
     {CMD_REFRESH, "Refresh", L"更新(&F)", "Ctrl+F5"},
     {CMD_INFER_RULES, "InferRules", L"フォルダ名から読み取る形(&N)...", ""},
     {CMD_OPEN_LOGS, "OpenLogs", L"動作履歴（ログ）のフォルダを開く(&L)", ""},

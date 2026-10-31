@@ -248,6 +248,29 @@ std::vector<std::pair<int64_t, float>> VectorIndex::topK(const float* q, size_t 
     return all;
 }
 
+bool readVectorsOf(const std::string& path, const std::unordered_set<int64_t>& ids, std::unordered_map<int64_t, std::vector<uint16_t>>& out,
+                   std::string& version, uint32_t& dim) {
+    MappedFile m;
+    if (!m.open(path)) return false;
+    const uint8_t* d = m.data();
+    const uint64_t n = m.size();
+    if (n < 12 || std::memcmp(d, kMagic, 4) != 0) return false;
+    dim = readU32(d + 4);
+    const uint32_t len = readU32(d + 8);
+    if (dim == 0 || n < 12ull + len) return false;
+    version.assign(reinterpret_cast<const char*>(d + 12), len);
+    const uint64_t rec = 8 + 2ull * dim;
+    for (uint64_t off = 12ull + len; off + rec <= n; off += rec) {
+        int64_t id;
+        std::memcpy(&id, d + off, 8);
+        if (!ids.count(id)) continue;
+        std::vector<uint16_t>& v = out[id];  // 同じ画像は後のものを使う
+        v.resize(dim);
+        std::memcpy(v.data(), d + off + 8, 2ull * dim);
+    }
+    return true;
+}
+
 bool compactVectors(const std::string& path, const std::function<bool(int64_t)>& keep) {
     VectorIndex idx;
     if (!idx.load(path)) return false;

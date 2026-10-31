@@ -193,7 +193,7 @@ SearchIn effectiveSearchIn(const SearchQuery& q) {
 
 SearchResult search(Db& db, const SearchQuery& q) {
     std::vector<Param> params, withParams;  // WITH の中の値は、ほかの値より先に結び付ける
-    std::string with, joins, where = " WHERE 1";
+    std::string with, joins, where = " WHERE i.offline=0";  // 外してある画像は出さない
     const SearchIn in = effectiveSearchIn(q);
     // フリーワード: 語・" で囲んだ語（タグの名前どおり。タグの条件と同じに扱う）・除く語
     std::vector<std::string> words, exactTags, excludeWords;
@@ -660,7 +660,7 @@ bool undoLastTagEdit(Db& db, std::string& description) {
 
 std::vector<std::string> indexedFolders(Db& db) {
     std::set<std::string> dirs;
-    Stmt st(db.handle(), "SELECT path FROM images");
+    Stmt st(db.handle(), "SELECT path FROM images WHERE offline=0");
     std::string last;
     while (st.step()) {
         const std::string p = st.text(0);

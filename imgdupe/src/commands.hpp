@@ -67,6 +67,7 @@ enum Cmd : int {
     CMD_INFER_RULES,      // フォルダ名から読み取る形（教えた形の一覧）
     CMD_REFRESH,          // 更新（画面の控えを捨てて読み直す）
     CMD_COMPACT_DB,       // DB を詰めて小さくする
+    CMD_ARCHIVE,          // 保管したデータ（見つからなくなった画像のタグ・CLIP など）
 };
 
 struct CmdInfo {

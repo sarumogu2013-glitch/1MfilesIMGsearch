@@ -251,7 +251,13 @@ RankResult rankByVector(Db& db, const SearchQuery& q, const VectorIndex& index, 
         cond.review = false;
         for (int64_t id : search(db, cond).ids) allowed.insert(id);
     }
-    auto accept = [&](int64_t id) { return id != exclude && (!filter || allowed.count(id)); };
+    // 外してある画像は出さない（条件がある時は search がもう除いている）
+    std::unordered_set<int64_t> offline;
+    if (!filter) {
+        Stmt st(db.handle(), "SELECT id FROM images WHERE offline<>0");
+        while (st.step()) offline.insert(st.i64(0));
+    }
+    auto accept = [&](int64_t id) { return id != exclude && (filter ? allowed.count(id) != 0 : !offline.count(id)); };
     for (int64_t id : index.ids())
         if (accept(id)) ++r.total;
     for (const auto& [id, score] : index.topK(qv, k, accept)) {

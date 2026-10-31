@@ -29,6 +29,8 @@ struct IndexOptions {
     // 立てると、今の段階をひとまとまりの切れ目で止め、スキャンタスクの並びを読み直す（上に別のタスクが来た時）。
     // indexOnce が下ろす
     std::atomic<bool>* preempt = nullptr;
+    // 見つからなくなった画像を移す保管の DB（空なら、今までどおり消す）と、CLIP のベクトルのファイル（保管へ写す）
+    std::string archiveFile, vectorFile;
 };
 
 struct IndexCallbacks {

@@ -522,8 +522,25 @@ void setScanExcludes(const std::vector<std::string>& dirs) {
     for (const auto& d : dirs) excludeDirs.push_back(lowerPath(winutil::widen(d)));
 }
 
+bool isSystemDirName(const std::wstring& name) {
+    return _wcsicmp(name.c_str(), L"$Recycle.Bin") == 0 || _wcsicmp(name.c_str(), L"System Volume Information") == 0 ||
+           _wcsicmp(name.c_str(), L"RECYCLER") == 0;
+}
+
+bool inSystemDir(const std::wstring& path) {
+    size_t a = 0;
+    while (a < path.size()) {
+        size_t b = path.find_first_of(L"\\/", a);
+        if (b == std::wstring::npos) b = path.size();
+        if (b > a && isSystemDirName(path.substr(a, b - a))) return true;
+        a = b + 1;
+    }
+    return false;
+}
+
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,
                 const std::atomic<bool>& cancel) {
+    if (inSystemDir(root)) return;  // ゴミ箱などの中は調べない
     std::vector<std::wstring> excludes;
     {
         std::lock_guard<std::mutex> lock(excludeMutex);
@@ -546,6 +563,8 @@ void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
                 // ハードリンクの展開先（中身は元画像と同じファイルなので、読むと重複になる）
                 if (_wcsicmp(name.c_str(), L"_vfolders") == 0) continue;
+                // ゴミ箱・システムの復元の置き場（消したファイルや中身の写し。解析しても重複・検索の邪魔になる）
+                if (isSystemDirName(name)) continue;
                 const std::wstring sub = prefix + name;
                 if (!excludes.empty() && std::find(excludes.begin(), excludes.end(), lowerPath(sub)) != excludes.end()) continue;
                 stack.push_back(sub);

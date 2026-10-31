@@ -10,6 +10,7 @@
 #include <set>
 
 #include "analyzer.hpp"
+#include "archive.hpp"
 #include "commands.hpp"
 #include "db.hpp"
 #include "indexer.hpp"
@@ -381,6 +382,7 @@ static void testUpdateLogic() {
     CHECK(compareVersion("dev", "v1.0.0") == VersionCompare::RemoteNewer);
     CHECK(compareVersion("v1.0.9", "v1.0.10") == VersionCompare::RemoteNewer);
     CHECK(compareVersion("v1.1.0", "v1.0.15") == VersionCompare::LocalNewer);
+    CHECK(compareVersion("v2.28.0", "v3.0.0") == VersionCompare::RemoteNewer);  // 版の頭が上がっても
     const std::string json =
         R"({"tag_name":"v1.0.4","assets":[{"name":"imgdupe.zip","url":"https://api.github.com/a/1"},)"
         R"({"name":"imgdupe.exe","url":"https://api.github.com/a/2","digest":"sha256:ABCdef01"}]})";
@@ -702,8 +704,15 @@ static void testIndexer() {
     fs::remove(pics / "b.jpg");
     decodes = 0;
     encodes = 0;
+    opt.archiveFile = archiveFileOf(root.string());  // 消さずに保管へ
     r = indexOnce(opt, cb, prog, cancel);
     CHECK(r.added == 0 && r.removed == 1 && r.hashed == 0 && decodes == 0 && encodes == 0);
+    {
+        Db adb;
+        CHECK(adb.open(opt.dbFile));
+        const auto kept = listArchived(adb, opt.archiveFile, 0);
+        CHECK(kept.size() == 1 && kept[0].path.find("b.jpg") != std::string::npos && kept[0].tags == 1);  // タガーのタグを守った
+    }
     {
         // 調べるフォルダが読めない（ドライブを外した）時は、見つからなくても消さない
         int turns = 0;
@@ -733,6 +742,81 @@ static void testIndexer() {
     ThumbData t;
     CHECK(pack.get(db, res.ids[0], t) && t.width == kThumbSide);
     fs::remove_all(root);
+}
+
+
+// データ保護の 1 回目: 保管・外してある印
+static void testArchive() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-archive";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db d;
+    CHECK(d.open((dir / "imgdupe.db").string()));
+    auto ids = upsertScanned(d, {{"D:\\pics\\a.jpg", 10, 1}, {"D:\\pics\\b.jpg", 20, 1}, {"E:\\x\\c.jpg", 30, 1}});
+    const int64_t a = ids["D:\\pics\\a.jpg"], b = ids["D:\\pics\\b.jpg"], c = ids["E:\\x\\c.jpg"];
+    d.begin();
+    {
+        TagWriter w(d, TagConflict::Replace);
+        w.put(a, "long_hair", "general", 0.9, "tagger", false);
+        w.put(a, "from_folder", "general", 0.8, "folder", false);  // 作り直せるので守らない
+        w.put(c, "long_hair", "general", 0.9, "tagger", false);
+    }
+    d.commit();
+    setManualTag(d, a, "miku", true);
+    d.exec(("INSERT INTO stages(image_id,stage,state,version) VALUES(" + std::to_string(a) + ",'tagger',1,7)," + "(" +
+            std::to_string(a) + ",'clip',1,3),(" + std::to_string(a) + ",'hash',1,1)")
+               .c_str());
+    const std::string vec = (dir / "vectors_clip.bin").string();
+    {
+        VectorWriter vw;
+        CHECK(vw.open(vec, 4, "clip-v3"));
+        const float v1[4] = {1, 0, 0, 0}, v2[4] = {0, 1, 0, 0};
+        vw.append(a, v1);
+        vw.append(b, v1);
+        vw.append(a, v2);  // 後のものを使う
+        vw.close();
+    }
+    const std::string arc = archiveFileOf(dir.string());
+    CHECK(arc.find("archive") != std::string::npos);
+    CHECK(archiveImages(d, arc, {a}, vec, "見つからない") == 1);
+    CHECK(imageCount(d) == 2);
+    {
+        const ArchiveSummary sum = archiveSummary(d, arc);
+        CHECK(sum.images == 1 && sum.fileBytes > 0 && sum.oldest > 0);
+        const auto rows = listArchived(d, arc, 0);
+        CHECK(rows.size() == 1 && rows[0].path == "D:\\pics\\a.jpg" && rows[0].size == 10 && rows[0].tags == 2 && rows[0].vector &&
+              rows[0].reason == "見つからない");
+        // 守ったもの: タガーのタグ・手動の確定、タガーと CLIP の段階、ベクトル（後のもの）
+        d.exec(("ATTACH DATABASE '" + arc + "' AS a2").c_str());
+        Stmt n(d.handle(), "SELECT (SELECT count(*) FROM a2.archived_stages), (SELECT dim FROM a2.archived_vectors), "
+                           "(SELECT model FROM a2.archived_vectors), (SELECT data FROM a2.archived_vectors)");
+        CHECK(n.step() && n.i64(0) == 2 && n.i64(1) == 4 && n.text(2) == "clip-v3");
+        const auto blob = n.blob(3);
+        CHECK(blob.size() == 8 && halfToFloat(static_cast<uint16_t>(blob[2] | (blob[3] << 8))) == 1.0f);
+        n.reset();
+        d.exec("DETACH DATABASE a2");
+    }
+    CHECK(archiveImages(d, arc, {}, vec, "x") == 0);
+    CHECK(archiveImages(d, arc, {a}, vec, "x") == 0);  // もう無い
+    // 消す
+    CHECK(deleteArchivedBefore(d, arc, 0) == 0);
+    CHECK(deleteArchived(d, arc, {listArchived(d, arc, 0)[0].aid}) == 1);
+    CHECK(archiveSummary(d, arc).images == 0);
+    CHECK(archiveSummary(d, (dir / "none.db").string()).images == 0 && listArchived(d, (dir / "none.db").string(), 0).empty());
+
+    // 外してある印: つながっている調べるフォルダの下だけ「ある」。検索に出さない
+    CHECK(updateOffline(d, {"D:\\pics"}) == 1);  // c が外してある
+    CHECK(updateOffline(d, {"D:\\pics"}) == 0);  // 変わらなければ書かない
+    SearchQuery q;
+    q.tags = {"long_hair"};
+    CHECK(search(d, q).total == 0);  // c は外してある
+    CHECK(updateOffline(d, {"D:\\pics\\", "E:/x"}) == 1);  // 区切りの書き方が違っても
+    CHECK(search(d, q).total == 1);
+    CHECK(updateOffline(d, {"d:\\PICS", "E:\\x"}) == 0);  // 大文字小文字だけ違っても同じ
+    CHECK(updateOffline(d, {}) == 2);
+    CHECK(indexedFolders(d).empty());
+    d.close();
+    fs::remove_all(dir);
 }
 
 static void testScanTasks() {
@@ -3239,6 +3323,7 @@ int main() {
     testPack();
     testIndexer();
     testScanTasks();
+    testArchive();
     testMeta();
     testSearch();
     testLinks();

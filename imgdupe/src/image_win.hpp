@@ -40,6 +40,9 @@ bool readFileMeta(const std::wstring& path, imgdupe::FileMeta& out);
 void setScanExcludes(const std::vector<std::string>& dirs);
 
 // root 以下の画像を out に追加する（リパースポイントのフォルダ、_vfolders、外すフォルダはたどらない）
+// ゴミ箱（$Recycle.Bin）・システムの復元（System Volume Information）の名前か / パスがその中か（スキャンしない）
+bool isSystemDirName(const std::wstring& name);
+bool inSystemDir(const std::wstring& path);
 void scanFolder(const std::wstring& root, std::vector<imgdupe::ScannedFile>& out, std::atomic<uint64_t>& found,
                 const std::atomic<bool>& cancel);
 

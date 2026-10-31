@@ -286,6 +286,10 @@ CREATE TABLE IF NOT EXISTS infer_dirs(
 // 版 12: タグを番号で持つ（tag_keys: タグの名前と種類 → 番号、tag_sources: 出どころ → 番号と行の数、tag_rows: 画像ごとのタグ）。
 // 前の tags の表は、tagstore の変換が少しずつ tag_rows に移し、済んだら消して同じ名前のビューにする（読む側はそのまま使える）。
 // 変換の間に tags が書き換わった画像は tags_conv_dirty に覚え、入れ替える前に移し直す
+// 版 13: 外してある画像の印（データ保護の実装仕様 1.2。1 = 調べるフォルダが今つながっていない・一覧から外した。検索などに出さない）
+const char* const kSchemaV13Columns[] = {"images.offline INTEGER NOT NULL DEFAULT 0"};
+const char* const kSchemaV13 = "SELECT 1;";
+
 const char* const kSchemaV12 = R"SQL(
 CREATE TABLE IF NOT EXISTS tag_keys(
     id INTEGER PRIMARY KEY,
@@ -439,12 +443,13 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11, kSchemaV12};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11, kSchemaV12, kSchemaV13};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         std::vector<const char*> columns;  // 無ければ足す列（ALTER TABLE は 2 回当てられないので確かめてから）
         if (i == 6) columns.assign(std::begin(kSchemaV7Columns), std::end(kSchemaV7Columns));
         if (i == 9) columns.assign(std::begin(kSchemaV10Columns), std::end(kSchemaV10Columns));
+        if (i == 12) columns.assign(std::begin(kSchemaV13Columns), std::end(kSchemaV13Columns));
         for (const char* c : columns) {
             const std::string def = c;
             const size_t dot = def.find('.'), sp = def.find(' ');
@@ -648,21 +653,63 @@ void saveSha(Db& db, const std::vector<std::pair<int64_t, Sha256>>& rows) {
     }
 }
 
-size_t removeMissing(Db& db, const std::vector<std::string>& roots,
-                     const std::unordered_map<std::string, int64_t>& alive) {
+std::vector<int64_t> missingImages(Db& db, const std::vector<std::string>& roots, const std::unordered_map<std::string, int64_t>& alive) {
     std::vector<int64_t> gone;
-    {
-        Stmt st(db.handle(), "SELECT id,path FROM images");
-        while (st.step()) {
-            const std::string p = st.text(1);
-            if (alive.count(p)) continue;
-            for (const auto& r : roots)
-                if (underRoot(p, r)) {
-                    gone.push_back(st.i64(0));
-                    break;
-                }
+    Stmt st(db.handle(), "SELECT id,path FROM images");
+    while (st.step()) {
+        const std::string p = st.text(1);
+        if (alive.count(p)) continue;
+        for (const auto& r : roots)
+            if (underRoot(p, r)) {
+                gone.push_back(st.i64(0));
+                break;
+            }
+    }
+    return gone;
+}
+
+size_t updateOffline(Db& db, const std::vector<std::string>& onlineRoots) {
+    // 調べるフォルダの下（区切りは \ と / の両方）。パスは調べるフォルダの書き方にそろえてある
+    std::string under;
+    std::vector<std::string> params;
+    for (const auto& r : onlineRoots) {
+        std::string base = r;
+        while (base.size() > 1 && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+        if (base.empty()) continue;
+        for (const char sep : {'\\', '/'}) {
+            std::string p = base;
+            for (char& c : p)
+                if (c == '\\' || c == '/') c = sep;
+            p += sep;
+            // 大文字小文字だけが違う書き方（前の版のスキャンタスクなど）も同じフォルダとみなす
+            under += std::string(under.empty() ? "" : " OR ") + "(path >= ? COLLATE NOCASE AND path < ? COLLATE NOCASE)";
+            params.push_back(p);
+            params.push_back(p + "\xff");
         }
     }
+    if (under.empty()) under = "0";
+    size_t changed = 0;
+    db.begin();
+    try {
+        for (const bool online : {false, true}) {
+            const std::string sql = online ? "UPDATE images SET offline=0 WHERE offline<>0 AND (" + under + ")"
+                                           : "UPDATE images SET offline=1 WHERE offline=0 AND NOT (" + under + ")";
+            Stmt st(db.handle(), sql.c_str());
+            for (size_t i = 0; i < params.size(); ++i) st.bind(static_cast<int>(i) + 1, params[i]);
+            st.step();
+            changed += static_cast<size_t>(db.changes());
+        }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+    return changed;
+}
+
+size_t removeMissing(Db& db, const std::vector<std::string>& roots,
+                     const std::unordered_map<std::string, int64_t>& alive) {
+    const std::vector<int64_t> gone = missingImages(db, roots, alive);
     if (gone.empty()) return 0;
     db.begin();
     try {

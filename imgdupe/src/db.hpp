@@ -15,7 +15,7 @@ struct sqlite3_stmt;
 namespace imgdupe {
 
 // 今のスキーマの版。テーブルを変えたら上げ、Db::open の移行処理に足す
-constexpr int kSchemaVersion = 12;
+constexpr int kSchemaVersion = 13;
 
 // 1 つの SQL 文（プリペアドステートメント）
 class Stmt {
@@ -106,6 +106,11 @@ void saveSha(Db& db, const std::vector<std::pair<int64_t, Sha256>>& rows);
 
 // roots の下で、alive に無い画像を消す（段階・タグなどもまとめて消える）。消した数を返す
 size_t removeMissing(Db& db, const std::vector<std::string>& roots, const std::unordered_map<std::string, int64_t>& alive);
+// roots の下で、alive に無い画像の ID（消さない。保管へ移すのは archive.hpp）
+std::vector<int64_t> missingImages(Db& db, const std::vector<std::string>& roots, const std::unordered_map<std::string, int64_t>& alive);
+// 外してある画像の印（images.offline）を付け直す: onlineRoots（今つながっている調べるフォルダ）の下は 0、ほかは 1。
+// 変えた行の数を返す（変わった行だけ書く）
+size_t updateOffline(Db& db, const std::vector<std::string>& onlineRoots);
 
 // ---------------------------------------------------------------- まとまり（groups）
 

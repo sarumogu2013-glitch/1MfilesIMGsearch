@@ -22,6 +22,7 @@
 #include "clip.hpp"
 #include "db.hpp"
 #include "image_win.hpp"
+#include "archive.hpp"
 #include "indexer.hpp"
 #include "log.hpp"
 #include "pathinfer.hpp"
@@ -253,6 +254,8 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
         opt.roots.push_back(narrow(clip::refsDir(g->dataDir)));
     opt.dbFile = dbFileOf(g->dataDir);
     opt.packDir = narrow(g->dataDir);
+    opt.archiveFile = archiveFileOf(opt.packDir);  // 見つからなくなった画像は消さずに保管へ
+    opt.vectorFile = narrow(clip::vectorPath(g->dataDir));
     g->load = loadLevel(g->dataDir);
     applyProcessPriority(g->load);
     opt.threads = threadsForLoad();
@@ -267,8 +270,8 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
         const std::wstring w = widen(root);
         WIN32_FILE_ATTRIBUTE_DATA fa;
         if (GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &fa) && !(fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            // スキャンタスクのファイル 1 つ
-            if (!isImageExt(root)) return;
+            // スキャンタスクのファイル 1 つ（ゴミ箱の中のものは除く）
+            if (!isImageExt(root) || imgwin::inSystemDir(w)) return;
             ScannedFile f;
             f.path = root;
             f.size = (static_cast<uint64_t>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;

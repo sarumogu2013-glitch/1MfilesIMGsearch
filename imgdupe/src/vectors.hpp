@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -67,6 +68,11 @@ private:
     std::vector<uint64_t> offsets_;  // ids_ と同じ並び（レコードの先頭からの位置）
     std::unordered_map<int64_t, size_t> pos_;
 };
+
+// ファイルを頭から読み、ids の画像のベクトル（最後のレコード。fp16 のまま）を out に入れる（モデルの版と次元も返す）。
+// 索引を作らないので、メモリは見つけた分だけ
+bool readVectorsOf(const std::string& path, const std::unordered_set<int64_t>& ids, std::unordered_map<int64_t, std::vector<uint16_t>>& out,
+                   std::string& version, uint32_t& dim);
 
 // keep に入っている画像の最後のレコードだけを残して作り直す（消えた画像・古いレコードを捨てる）。成功したら true
 bool compactVectors(const std::string& path, const std::function<bool(int64_t)>& keep);

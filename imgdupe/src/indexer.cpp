@@ -1,5 +1,7 @@
 #include "indexer.hpp"
 
+#include "archive.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -476,7 +478,17 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
         if (!s.cb.rootAvailable || s.cb.rootAvailable(r)) removable.push_back(r);
         else logs::warn("調べるフォルダが見つからない（ドライブを外した・名前を変えたなど）ので、その下の画像は消さずに残す: " + r);
     }
-    const size_t removed = removable.empty() ? 0 : removeMissing(db, removable, ids);
+    size_t removed = 0;
+    if (!removable.empty()) {
+        if (s.opt.archiveFile.empty()) {
+            removed = removeMissing(db, removable, ids);
+        } else {
+            // 消さずに保管へ移す（タガーのタグ・手動の確定・CLIP のベクトルを守る）
+            const std::vector<int64_t> gone = missingImages(db, removable, ids);
+            removed = archiveImages(db, s.opt.archiveFile, gone, s.opt.vectorFile, "見つからない");
+            if (removed) logs::info("見つからなくなった画像 " + std::to_string(removed) + " 枚を保管へ移した（" + s.opt.archiveFile + "）");
+        }
+    }
     s.rep.removed += removed;
     s.rep.added += static_cast<size_t>(std::max<int64_t>(0, imageCount(db) - before + static_cast<int64_t>(removed)));
     {
@@ -622,6 +634,14 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
         if (!scanned) {
             scanAndRegister(db, s, opt.roots, opt.roots);
             if (cancel) return stop();
+            // 外してある画像の印: 今つながっている調べるフォルダの下だけを「ある」に（一覧から外したフォルダ・外したドライブは外してある）
+            {
+                std::vector<std::string> online;
+                for (const auto& r : opt.roots)
+                    if (!cb.rootAvailable || cb.rootAvailable(r)) online.push_back(r);
+                if (const size_t n = updateOffline(db, online))
+                    logs::info("外してある画像の印を付け直した: " + std::to_string(n) + " 枚");
+            }
             // 前の版のスキャンタスクで、書き方の違うパスで二重に登録した画像を消す
             if (const size_t n = removeMisspelled(db, opt.roots)) {
                 rep.removed += n;

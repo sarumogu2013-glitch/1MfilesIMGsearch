@@ -38,6 +38,7 @@
 #include "tagnames.hpp"
 #include "tagrel.hpp"
 #include "image_win.hpp"
+#include "archive.hpp"
 #include "indexer.hpp"
 #include "indexer_win.hpp"
 #include "install_win.hpp"
@@ -98,6 +99,7 @@ constexpr UINT WM_APP_QUERY_VEC = WM_APP + 12;   // lParam: QueryVector*（似�
 constexpr UINT WM_APP_QUERY_TAGS = WM_APP + 13;  // lParam: QueryTagsDone*（生成したタグ）
 constexpr UINT WM_APP_CONVERT = WM_APP + 14;     // lParam: std::wstring*（DB の変換の様子。空なら済んだ）
 constexpr UINT WM_APP_PROGRESS = WM_APP + 56;  // lParam: ProgressDone*（詳細表示のインデックスの進み具合）
+constexpr UINT WM_APP_OFFLINE = WM_APP + 57;  // wParam: 外してある印を付け直した数（-1 = もう一度やり直す）
 constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
@@ -426,10 +428,49 @@ void saveSearchSettings();
 
 void saveExplorerDir();
 
+// 外してある画像の印を、今の調べるフォルダとつながっているドライブで付け直す（裏のスレッド。全部の画像を 1 回読む）
+std::atomic<bool> offlineBusy{false}, offlineAgain{false};
+void refreshOfflineAsync() {
+    if (app.dataDir.empty() || !app.hwnd) return;
+    if (offlineBusy.exchange(true)) {
+        offlineAgain = true;  // 終わったらもう一度
+        return;
+    }
+    auto roots = folderList();
+    roots.push_back(clip::refsDir(app.dataDir));  // 見本画像のフォルダも調べるフォルダ（解析と同じ）
+    const std::string db = narrow(dbPath());
+    HWND hwnd = app.hwnd;
+    std::thread([roots, db, hwnd] {
+        WPARAM changed = 0;
+        try {
+            std::vector<std::string> online;
+            for (const auto& r : roots) {
+                const DWORD a = GetFileAttributesW(r.c_str());
+                if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) online.push_back(narrow(r));
+            }
+            Db d;
+            if (d.open(db)) changed = updateOffline(d, online);
+            if (changed) logs::info("外してある画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
+        } catch (const std::exception& e) {
+            logs::warn(std::string("外してある画像の印を付け直せなかった: ") + e.what());
+        }
+        offlineBusy = false;
+        if (offlineAgain.exchange(false)) changed = static_cast<WPARAM>(-1);
+        PostMessageW(hwnd, WM_APP_OFFLINE, changed, 0);
+    }).detach();
+}
+
 void saveSettings() {
     if (app.s.tags) saveSearchSettings();
     const auto f = folderList();
     indexer::setRoots(app.dataDir, f);  // バックグラウンドの解析も同じフォルダを見る
+    {
+        static std::vector<std::wstring> lastRoots;
+        static bool first = true;
+        if (first || f != lastRoots) refreshOfflineAsync();  // 調べるフォルダが変わった（外した・足した）
+        first = false;
+        lastRoots = f;
+    }
     WritePrivateProfileSectionW(L"folders", L"\0", iniPath().c_str());
     for (size_t i = 0; i < f.size(); ++i)
         WritePrivateProfileStringW(L"folders", std::to_wstring(i + 1).c_str(), f[i].c_str(), iniPath().c_str());
@@ -1437,8 +1478,8 @@ struct FolderNames {
 std::vector<std::string> currentFolders(Db& d) {
     std::string sig;
     {
-        Stmt st(d.handle(), "SELECT count(*), coalesce(max(id),0) FROM images");
-        if (st.step()) sig = std::to_string(st.i64(0)) + "/" + std::to_string(st.i64(1));
+        Stmt st(d.handle(), "SELECT count(*), coalesce(max(id),0), coalesce(sum(offline),0) FROM images");
+        if (st.step()) sig = std::to_string(st.i64(0)) + "/" + std::to_string(st.i64(1)) + "/" + std::to_string(st.i64(2));
     }
     std::lock_guard<std::mutex> lock(folderNames.m);
     if (folderNames.signature != sig) {
@@ -2883,7 +2924,8 @@ void teachFolderUi(const std::wstring& dirIn) {
         std::set<std::string> names;
         try {
             const std::string prefix = under.empty() ? std::string() : under + "\\";
-            Stmt q(db->handle(), under.empty() ? "SELECT path FROM images" : "SELECT path FROM images WHERE path > ? AND path < ?");
+            Stmt q(db->handle(), under.empty() ? "SELECT path FROM images WHERE offline=0"
+                                               : "SELECT path FROM images WHERE path > ? AND path < ? AND offline=0");
             if (!under.empty()) q.bind(1, prefix).bind(2, prefix + "\xff");
             while (q.step()) {
                 const std::string p = q.text(0);
@@ -5221,6 +5263,164 @@ void refreshView() {
     logs::info("更新した");
 }
 
+// 保管したデータ（データ保護の実装仕様 1.4）: 見つからなくなった画像の、守ったタグ・CLIP の一覧。選んだもの・古いものを消せる
+void archiveUi() {
+    Db* db = uiDb();
+    if (!db) return;
+    const std::string file = archiveFileOf(narrow(app.dataDir));
+    enum { ID_LIST = 100, ID_DELETE, ID_OLD };
+    struct State {
+        bool done = false;
+        int command = 0;
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDOK) st->done = true;
+                else st->command = LOWORD(wp);
+                return 0;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeArchive";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(820), h = px(480);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeArchive", L"保管したデータ", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                               app.inst, nullptr);
+    if (!dlg) return;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    HWND tip = makeTooltip(dlg, px(320));
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cw, int ch, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cw, ch, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int m = px(12), bw = px(150), bh = px(28);
+    HWND summary = child(WC_STATICW, L"", SS_NOPREFIX, -1, m, m, w - 2 * m, px(40));
+    HWND list = child(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, ID_LIST, m, m + px(44), w - 2 * m,
+                      h - 3 * m - px(44) - bh, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT);
+    addColumn(list, 0, L"保管した日時", px(130));
+    addColumn(list, 1, L"パス", px(400));
+    addColumn(list, 2, L"大きさ", px(80));
+    addColumn(list, 3, L"守ったタグ", px(70));
+    addColumn(list, 4, L"CLIP", px(50));
+    addColumn(list, 5, L"理由", px(70));
+    HWND del = child(WC_BUTTONW, L"選んだものを消す", WS_TABSTOP, ID_DELETE, m, h - m - bh, bw, bh);
+    HWND old = child(WC_BUTTONW, L"古いものを消す…", WS_TABSTOP, ID_OLD, m + bw + px(8), h - m - bh, bw, bh);
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, w - m - px(100), h - m - bh, px(100), bh);
+    addTooltip(tip, del, L"一覧で選んだ画像の保管を消します（元に戻せません。画像のファイルには触れません）");
+    addTooltip(tip, old, L"指定した月数より前に保管したものを、まとめて消します（元に戻せません）");
+
+    constexpr size_t kShow = 5000;  // 一覧に出す数（古い順）
+    std::vector<ArchivedImage> rows;
+    auto fill = [&] {
+        ArchiveSummary sum;
+        try {
+            sum = archiveSummary(*db, file);
+            rows = listArchived(*db, file, kShow);
+        } catch (const std::exception& e) {
+            rows.clear();
+            setText(summary, L"保管の DB を読めませんでした: " + widen(e.what()));
+        }
+        std::wstring t = L"保管: " + withCommas(static_cast<uint64_t>(sum.images)) + L" 枚・ファイル " +
+                         sizeText(static_cast<uint64_t>(sum.fileBytes)) + L"（" + widen(file) + L"）";
+        if (sum.images) t += L"\r\n一番古いもの: " + dateText(sum.oldest) +
+                             (sum.images > static_cast<int64_t>(kShow) ? L"。一覧には古い順に " + withCommas(kShow) + L" 件まで出します" : L"");
+        else t += L"\r\n見つからなくなった画像（消した・動かした・ゴミ箱を空にした）は、ここに保管します（自動では消しません）";
+        setText(summary, t);
+        SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(list);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            const std::wstring cells[] = {dateText(r.archived), widen(r.path),
+                                          sizeText(static_cast<uint64_t>(r.size)), std::to_wstring(r.tags), r.vector ? L"あり" : L"",
+                                          widen(r.reason)};
+            LVITEMW it{};
+            it.mask = LVIF_TEXT;
+            it.iItem = static_cast<int>(i);
+            it.pszText = const_cast<wchar_t*>(cells[0].c_str());
+            const int k = ListView_InsertItem(list, &it);
+            for (int c = 1; c < 6; ++c) ListView_SetItemText(list, k, c, const_cast<wchar_t*>(cells[c].c_str()));
+        }
+        SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    };
+    fill();
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(list);
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!st.command) continue;
+        const int cmd = st.command;
+        st.command = 0;
+        try {
+            if (cmd == ID_DELETE) {
+                std::vector<int64_t> aids;
+                for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(list, i, LVNI_SELECTED))
+                    if (i < static_cast<int>(rows.size())) aids.push_back(rows[static_cast<size_t>(i)].aid);
+                if (aids.empty()) {
+                    logBox(dlg, L"消すものを一覧で選んでください（Ctrl・Shift を押しながらクリックでいくつも）。", L"保管したデータ", MB_ICONINFORMATION);
+                } else if (logBox(dlg, (withCommas(aids.size()) + L" 件の保管を消しますか？\n\n守ってあったタグ（タガー・手動の確定）と CLIP のベクトルも消えます。元に戻せません。")
+                                           .c_str(),
+                                  L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                    const size_t n = deleteArchived(*db, file, aids);
+                    logs::info("保管を消した: " + std::to_string(n) + " 件（選んだもの）");
+                    fill();
+                }
+            } else if (cmd == ID_OLD) {
+                const auto months = promptText(L"古いものを消す", L"何ヶ月より前に保管したものを消しますか（数字）", L"6");
+                EnableWindow(app.hwnd, FALSE);
+                if (months && _wtoi(months->c_str()) >= 0) {
+                    const int mo = _wtoi(months->c_str());
+                    const int64_t before = static_cast<int64_t>(std::time(nullptr)) - static_cast<int64_t>(mo) * 30 * 24 * 3600;
+                    if (logBox(dlg, (std::to_wstring(mo) + L" ヶ月（" + std::to_wstring(mo * 30) +
+                                     L" 日）より前に保管したものを全部消しますか？\n\n元に戻せません。")
+                                        .c_str(),
+                               L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                        const size_t n = deleteArchivedBefore(*db, file, before);
+                        logs::info("保管を消した: " + std::to_string(n) + " 件（" + std::to_string(mo) + " ヶ月より前）");
+                        logBox(dlg, (withCommas(n) + L" 件を消しました。").c_str(), L"保管したデータ", MB_ICONINFORMATION);
+                        fill();
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            logBox(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"保管したデータ", MB_ICONWARNING);
+        }
+    }
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    SetActiveWindow(app.hwnd);
+}
+
 // DB を詰めて小さくする: 大きさと空き容量を見せて確かめてから、バックグラウンドの解析に頼む
 void compactDbUi() {
     Db* db = uiDb();
@@ -6640,6 +6840,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
         case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（バックグラウンドの解析が行います）";
+        case CMD_ARCHIVE: return L"見つからなくなった画像（消した・動かした・ゴミ箱を空にした）のタグ・CLIP などを保管してあります。一覧を見て、要らないものを消せます";
         case CMD_REFRESH: return L"画面の控え（フォルダの中身・サムネイル・画像の情報）を捨てて、今の場所を読み直します。移動したファイルが残っている時など（Ctrl+F5）。"
                                  L"バックグラウンドの解析はしません（要る時はタスクトレイの解析から）";
         case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、今いるフォルダに関係なく調べた全部のフォルダから探して一覧に出します（Ctrl+M）";
@@ -6782,7 +6983,7 @@ void appendMainMenus(HMENU root) {
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, CMD_COMPACT_DB, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
+    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, CMD_COMPACT_DB, CMD_ARCHIVE, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
     popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, 0, CMD_ABOUT});
 }
 
@@ -7124,6 +7325,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_STATS: showStatsWindow(); break;
                 case CMD_REFRESH: refreshView(); break;
                 case CMD_COMPACT_DB: compactDbUi(); break;
+                case CMD_ARCHIVE: archiveUi(); break;
                 case CMD_INFER_RULES: teachFolderUi(L""); break;
                 case CMD_TAG_YES:
                 case CMD_TAG_NO:
@@ -7248,6 +7450,19 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_APP_OFFLINE:
+            if (wp == static_cast<WPARAM>(-1)) {
+                refreshOfflineAsync();
+            } else if (wp) {
+                app.infoCache.clear();
+                if (ex.view) ex.view->RefreshStates();
+                refreshSearchIfShown();
+            }
+            return 0;
+        case WM_DEVICECHANGE:
+            // ドライブをつないだ・外した: 外してある画像の印を付け直す
+            if (wp == 0x8000 /* DBT_DEVICEARRIVAL */ || wp == 0x8004 /* DBT_DEVICEREMOVECOMPLETE */) refreshOfflineAsync();
+            return TRUE;
         case WM_APP_PROGRESS:
             onProgress(reinterpret_cast<ProgressDone*>(lp));
             return 0;
@@ -7581,6 +7796,8 @@ int runIndexCli(int argc, wchar_t** argv) {
     IndexOptions opt;
     opt.dbFile = narrow(dbPath());
     opt.packDir = narrow(app.dataDir);
+    opt.archiveFile = archiveFileOf(opt.packDir);
+    opt.vectorFile = narrow(clip::vectorPath(app.dataDir));
     for (int i = 2; i < argc; ++i) {
         const std::wstring a = argv[i];
         if (a == L"--no-thumbs") opt.thumbnails = false;
@@ -7816,6 +8033,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     app.thumbThread = std::thread(thumbLoop);
     loadTagLabels();
     syncMenuChecks();
+    refreshOfflineAsync();  // 外したドライブの画像を検索などに出さない（起動した時のつながり方で）
     switchTab(std::clamp(iniInt(L"tab", 2), 0, 3));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");
