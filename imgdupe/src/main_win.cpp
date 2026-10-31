@@ -57,6 +57,8 @@
 #include "sqlite3.h"
 #include "tagstore.hpp"
 #include "pathinfer.hpp"
+#include "names.hpp"
+#include "quality.hpp"
 #include "log.hpp"
 #include "log_win.hpp"
 #include "update_win.hpp"
@@ -95,6 +97,7 @@ constexpr UINT WM_APP_QUERY_FILE = WM_APP + 11;  // lParam: QueryFetched*（URL 
 constexpr UINT WM_APP_QUERY_VEC = WM_APP + 12;   // lParam: QueryVector*（似た画像を探す画像のベクトル）
 constexpr UINT WM_APP_QUERY_TAGS = WM_APP + 13;  // lParam: QueryTagsDone*（生成したタグ）
 constexpr UINT WM_APP_CONVERT = WM_APP + 14;     // lParam: std::wstring*（DB の変換の様子。空なら済んだ）
+constexpr UINT WM_APP_PROGRESS = WM_APP + 56;  // lParam: ProgressDone*（詳細表示のインデックスの進み具合）
 constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
@@ -337,6 +340,7 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerRemoveRoot(const std::wstring& dir) override;
     void ExplorerSettingsChanged(const ExplorerSettings& s) override;
     std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
+    void ExplorerRequestProgress(const std::wstring& dir) override;
     std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) override;
     void ExplorerSearchTags(const std::vector<std::wstring>& tags) override;
     void ExplorerFindSimilarAi(const std::wstring& path) override;
@@ -5007,6 +5011,9 @@ void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
     put(L"sortKey", s.sortKey);
     put(L"sortDesc", s.sortDesc ? 1 : 0);
     put(L"previewMode", s.previewMode);
+    std::wstring cols;
+    for (int w : s.detailCols) cols += (cols.empty() ? L"" : L",") + std::to_wstring(w);
+    WritePrivateProfileStringW(L"Explorer", L"detailCols", cols.c_str(), ini.c_str());
     // 取り置いたタグ（タブで区切る）。ini はシステムの文字コードなので、どの文字でも残せる DB に持つ
     std::string tray;
     for (const auto& t : s.tray) tray += (tray.empty() ? "" : "\t") + narrow(t);
@@ -5035,6 +5042,15 @@ ExplorerSettings loadExplorerSettings() {
     s.sortKey = get(L"sortKey", s.sortKey);
     s.sortDesc = get(L"sortDesc", 0) != 0;
     s.previewMode = std::clamp(get(L"previewMode", s.previewMode), 0, 2);
+    {
+        wchar_t buf[128] = L"";
+        GetPrivateProfileStringW(L"Explorer", L"detailCols", L"", buf, 128, ini.c_str());
+        for (const wchar_t* p = buf; *p;) {
+            s.detailCols.push_back(std::clamp(_wtoi(p), 0, 4000));
+            while (*p && *p != L',') ++p;
+            if (*p) ++p;
+        }
+    }
     std::string tray, frequent;
     if (Db* db = uiDb()) {
         try {
@@ -5097,6 +5113,91 @@ std::vector<int> ExplorerApp::ExplorerStates(const std::wstring& dir, const std:
         }
     }
     return out;
+}
+
+// ---------------------------------------------------------------- 詳細表示の進み具合
+
+struct ProgressDone {
+    std::wstring dir;
+    std::vector<ExplorerProgress> items;
+};
+struct ProgressState {
+    std::wstring dir;                      // 数えている・数え終えたフォルダ
+    bool busy = false;
+    ULONGLONG at = 0;                      // 数え終えた時刻
+    std::vector<ExplorerProgress> cache;   // 数え終えた結果（今のフォルダの分だけ）
+    std::shared_ptr<std::atomic<bool>> cancel;
+};
+ProgressState progressState;
+
+// 進み具合に数える段階（解析の総合の数と同じ。入れていない AI の部品の段階は数えない）
+std::vector<StageKey> progressStages() {
+    std::vector<StageKey> st = {{stage::kHash, kHashVersion}, {stage::kThumb, kThumbVersion}, {stage::kMeta, kMetaVersion},
+                                {kStageNames, kNamesVersion}};
+    if (const int tv = tagger::stageVersion(app.dataDir)) st.push_back({stage::kTagger, tv});
+    if (const int cv = clip::stageVersion(app.dataDir)) st.push_back({kStageClip, cv});
+    if (clip::qualityEnabled(app.dataDir)) st.push_back({kStageQuality, kQualityVersion});
+    return st;
+}
+
+// フォルダの直下の進み具合を裏で数える（同じフォルダは 15 秒に 1 回まで。フォルダを移ったら前のは止める）
+void ExplorerApp::ExplorerRequestProgress(const std::wstring& dir) {
+    ProgressState& ps = progressState;
+    const bool same = _wcsicmp(ps.dir.c_str(), dir.c_str()) == 0;
+    if (same && ps.busy) return;
+    if (same && ps.at && GetTickCount64() - ps.at < 15 * 1000) {
+        if (ex.view) ex.view->SetProgress(dir, ps.cache);
+        return;
+    }
+    if (ps.cancel) ps.cancel->store(true);
+    ps.dir = dir;
+    ps.busy = true;
+    ps.at = 0;
+    ps.cache.clear();
+    ps.cancel = std::make_shared<std::atomic<bool>>(false);
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    const std::vector<StageKey> stages = progressStages();
+    const std::string db = narrow(dbPath());
+    HWND hwnd = app.hwnd;
+    auto cancel = ps.cancel;
+    std::thread([dir, roots, stages, db, hwnd, cancel] {
+        auto* done = new ProgressDone{dir, {}};
+        try {
+            Db d;
+            if (d.open(db)) {
+                const auto counts = childProgress(d, narrow(dir), roots, stages, cancel.get());
+                const double kinds = static_cast<double>(std::max<size_t>(1, stages.size()));
+                for (const auto& [name, c] : counts) {
+                    if (!c.images) continue;
+                    ExplorerProgress p;
+                    p.name = widen(name);
+                    p.ratio = std::clamp(static_cast<double>(c.done) / (static_cast<double>(c.images) * kinds), 0.0, 1.0);
+                    const int pct = static_cast<int>(p.ratio * 100);  // 切り捨て（全部済むまで 100% にしない）
+                    p.text = L"[" + std::to_wstring(pct) + L"%] ";
+                    if (c.images == 1) p.text += std::to_wstring(c.done) + L"/" + std::to_wstring(stages.size()) + L" 種類";
+                    else
+                        p.text += withCommas(static_cast<uint64_t>(c.done)) + L"/" +
+                                  withCommas(static_cast<uint64_t>(c.images) * static_cast<uint64_t>(stages.size())) + L"（" +
+                                  withCommas(static_cast<uint64_t>(c.images)) + L" 枚×" + std::to_wstring(stages.size()) + L" 種類）";
+                    done->items.push_back(std::move(p));
+                }
+            }
+        } catch (const std::exception& e) {
+            logs::warn("インデックスの進み具合を数えられなかった: " + std::string(e.what()));
+        }
+        if (cancel->load() || !PostMessageW(hwnd, WM_APP_PROGRESS, 0, reinterpret_cast<LPARAM>(done))) delete done;
+    }).detach();
+}
+
+void onProgress(ProgressDone* p) {
+    std::unique_ptr<ProgressDone> done(p);
+    ProgressState& ps = progressState;
+    if (_wcsicmp(ps.dir.c_str(), done->dir.c_str()) != 0) return;
+    ps.busy = false;
+    ps.at = GetTickCount64();
+    ps.cache = std::move(done->items);
+    if (ex.view) ex.view->SetProgress(done->dir, ps.cache);
 }
 
 // 更新: 画面の控えを捨てて今の場所を読み直す（DB の接続・画像の情報・タグの表示名も読み直す）。バックグラウンドの解析はしない
@@ -7136,6 +7237,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_APP_PROGRESS:
+            onProgress(reinterpret_cast<ProgressDone*>(lp));
+            return 0;
         case WM_APP_SOURCES: {
             std::unique_ptr<std::vector<std::pair<std::string, int64_t>>> counts(
                 reinterpret_cast<std::vector<std::pair<std::string, int64_t>>*>(lp));

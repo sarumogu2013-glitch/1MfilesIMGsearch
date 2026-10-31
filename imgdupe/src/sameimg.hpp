@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +87,18 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
 IndexState folderIndexState(const std::string& dir, const std::vector<std::string>& roots);
 // パスの画像の ID（無ければ 0）。roots と大文字小文字だけが違う・区切りが / と \ で違うものも探す
 int64_t findImageId(Db& db, const std::string& path, const std::vector<std::string>& roots);
+// インデックスの進み具合（詳細表示の「インデックス」の列）。stages の段階（と版）のうち、済んだ（失敗も済み）延べの数
+struct StageKey {
+    std::string stage;
+    int version = 0;
+};
+struct ProgressCount {
+    int64_t images = 0;  // 画像の枚数
+    int64_t done = 0;    // 済んだ（画像, 段階）の延べ数。割合 = done / (images × 段階の数)
+};
+// フォルダ dir の直下の名前ごと（ファイルはその画像、フォルダはその下の全部の画像）の進み具合。cancel が立つと途中で空を返す
+std::unordered_map<std::string, ProgressCount> childProgress(Db& db, const std::string& dir, const std::vector<std::string>& roots,
+                                                             const std::vector<StageKey>& stages, const std::atomic<bool>* cancel = nullptr);
 // フォルダの下（いくつ下でも）の画像が DB にあるか（roots から外したフォルダや --index で作ったもの）
 bool folderHasIndexed(Db& db, const std::string& dir);
 

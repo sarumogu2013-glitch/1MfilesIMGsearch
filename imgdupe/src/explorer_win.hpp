@@ -32,8 +32,16 @@ struct ExplorerSettings {
   int sortKey = 0;          // 0 = 名前、1 = 更新日時、2 = 種類、3 = サイズ
   int previewMode = 1;      // 右のプレビュー: 0 = 画像だけ、1 = タグ、2 = プロパティ
   bool sortDesc = false;
+  std::vector<int> detailCols;  // 詳細表示の列の幅（96 dpi の px。名前・更新日時・種類・サイズ・インデックス。0 か無ければ既定）
   std::vector<std::wstring> tray;  // 取り置いたタグ
   std::vector<std::pair<std::wstring, int>> frequent;  // よく行く場所（パスと開いた回数。起動した時に中身を先読みする）
+};
+
+// インデックスの進み具合（詳細表示の「インデックス」の列）
+struct ExplorerProgress {
+  std::wstring name;  // フォルダの直下の名前
+  double ratio = 0;   // 0〜1
+  std::wstring text;  // 「[55%] 1,234 枚」など
 };
 
 // 画像のタグ（プレビューに出す）
@@ -75,6 +83,8 @@ class ExplorerHost {
   virtual void ExplorerSettingsChanged(const ExplorerSettings& s) = 0;
   // dir の中の items（名前・フォルダか）の状態（ExplorerState）
   virtual std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) = 0;
+  // 詳細表示で、フォルダ dir の直下の進み具合を求める（裏で数えて Explorer::SetProgress で返す）
+  virtual void ExplorerRequestProgress(const std::wstring& dir) { (void)dir; }
   virtual std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) = 0;      // 画像のタグ（確度の高い順）
   virtual void ExplorerSearchTags(const std::vector<std::wstring>& tags) = 0;       // タグ（すべてを持つ画像）で検索する
   virtual void ExplorerFindSimilarAi(const std::wstring& path) = 0;                 // 似た画像（CLIP）を探す
@@ -122,6 +132,7 @@ class Explorer {
   void ShowList(const std::wstring& title, std::vector<std::vector<std::wstring>> entries, int select = -1);
   // 下のステータスバーの文
   void SetSameStatus(const std::wstring& text);
+  void SetProgress(const std::wstring& dir, const std::vector<ExplorerProgress>& progress);  // 詳細表示の進み具合
   // 同じ画像（全部の調べたフォルダから）を真ん中の一覧に出す。original があれば先頭に置いて選ぶ
   void SetSame(const std::wstring& title, std::vector<ExplorerMatch> matches, const std::wstring& original = L"");
   // 重複のまとまりを真ん中の一覧に出す（まとまりは重なった絵）

@@ -2693,6 +2693,15 @@ static void testSameImage() {
         auto byName = fileIndexStates(db, "d:\\pics\\a", roots, kHashVersion, &names);
         CHECK(byName.size() == 2 && byName["1.jpg"] == IndexState::Indexed && byName["7.jpg"] == IndexState::Pending);
     }
+    {
+        // 進み具合: 直下の名前ごと（フォルダは下の全部）。済んだ段階の延べ数
+        auto pr = childProgress(db, "d:\\pics", roots, {{"hash", kHashVersion}, {"nothing", 1}});
+        CHECK(pr["a"].images == 3 && pr["a"].done == 2 && pr.count("b") && pr["b"].images >= 2);
+        auto pa = childProgress(db, "D:\\Pics\\a", roots, {{"hash", kHashVersion}});
+        CHECK(pa["1.jpg"].images == 1 && pa["1.jpg"].done == 1 && pa["7.jpg"].done == 0);
+        std::atomic<bool> stop{true};
+        CHECK(childProgress(db, "D:\\Pics", roots, {}, &stop).size() <= 1024);
+    }
     CHECK(folderIndexState("d:\\pics\\b\\sub", roots) == IndexState::Indexed && folderIndexState("D:\\Pics", roots) == IndexState::Indexed &&
           folderIndexState("D:\\", roots) == IndexState::Partial && folderIndexState("D:\\Other", roots) == IndexState::None &&
           folderIndexState("D:\\Pictures", roots) == IndexState::None);

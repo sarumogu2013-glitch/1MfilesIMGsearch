@@ -59,6 +59,8 @@ enum {
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
        MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_REMOVE, MENU_TEACH, MENU_TAG_PAGE };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
+constexpr int kFolderSort = 5;  // 詳細表示の「フォルダ」の列（検索の結果）
+constexpr int kIndexSort = 6;   // 詳細表示の「インデックス」の列（進み具合）
 
 const int kPresetSizes[3] = {96, 160, 256};
 // IImageList の IID (mingw のライブラリには無いのでここで定義する)
@@ -74,6 +76,8 @@ struct Item {
   bool dir = false;
   bool image = false;
   int state = kStateNoBadge;  // インデックスの状態
+  double progress = -1;       // インデックスの進み具合（0〜1。-1 = まだ数えていない・DB に無い）
+  std::wstring progressText;  // 「[55%] 1,234 枚」など
   uint64_t mtime = 0, size = 0;  // 更新日時 (FILETIME)・大きさ
   size_t order = 0;              // 読んだ順 (検索の結果は関連度などの順)
   bool picked = false;           // 複数選んでいる時に選ばれている (並べ替えても付いていく)
@@ -483,6 +487,8 @@ class ExplorerImpl {
   }
   int scrollY = 0;
   bool tracking = false;
+  int resizeCol = -1;           // 詳細表示の列の幅を変えている（列の番号）
+  int resizeFromX = 0, resizeFromW = 0;
 
 
   // サムネイル
@@ -591,6 +597,13 @@ class ExplorerImpl {
         case 2: c = _wcsicmp(TypeName(a).c_str(), TypeName(b).c_str()); break;
         case 3: c = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
         case kListOrder: c = a.order < b.order ? -1 : a.order > b.order ? 1 : 0; break;
+        case kFolderSort: c = StrCmpLogicalW(FolderOf(a.path).c_str(), FolderOf(b.path).c_str()); break;
+        case kIndexSort: {
+          const double pa = a.progress >= 0 ? a.progress : a.state == kStateNoBadge ? -2 : -1;
+          const double pb = b.progress >= 0 ? b.progress : b.state == kStateNoBadge ? -2 : -1;
+          c = pa < pb ? -1 : pa > pb ? 1 : a.state < b.state ? -1 : a.state > b.state ? 1 : 0;
+          break;
+        }
       }
       if (c == 0 && key != kListOrder) c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
       return desc ? c > 0 : c < 0;
@@ -973,6 +986,7 @@ class ExplorerImpl {
     names.reserve(items.size());
     for (auto& it : items) names.push_back({it.name, it.dir});
     std::vector<int> st = host->ExplorerStates(dir, names);
+    if (Details()) host->ExplorerRequestProgress(dir);  // 進み具合は裏で数えて SetProgress で来る
     bool changed = false;
     for (size_t i = 0; i < items.size(); i++) {
       int s = i < st.size() ? st[i] : kStateNoBadge;
@@ -1570,6 +1584,35 @@ class ExplorerImpl {
     CloseClipboard();
   }
 
+  // 詳細表示の進み具合（裏で数えた結果）
+  void SetProgress(const std::wstring& d, const std::vector<ExplorerProgress>& progress) {
+    if (listMode || _wcsicmp(d.c_str(), dir.c_str()) != 0) return;
+    std::unordered_map<std::wstring, const ExplorerProgress*> byName;
+    for (const auto& p : progress) {
+      std::wstring k = p.name;
+      CharLowerBuffW(&k[0], DWORD(k.size()));
+      byName[k] = &p;
+    }
+    for (auto& it : items) {
+      std::wstring k = it.name;
+      CharLowerBuffW(&k[0], DWORD(k.size()));
+      auto f = byName.find(k);
+      it.progress = f != byName.end() ? f->second->ratio : -1;
+      it.progressText = f != byName.end() ? f->second->text : L"";
+    }
+    if (SortKey() == kIndexSort) Resort();
+    else InvalidateRect(grid, nullptr, FALSE);
+  }
+
+  // 詳細表示の見出しで、列の境目（右端）の上か。境目なら列の番号
+  int ColumnEdgeAt(POINT pt) const {
+    if (!Details() || pt.y >= HeaderH()) return -1;
+    const auto cols = DetailColumns();
+    for (size_t i = 0; i < cols.size(); i++)
+      if (abs(pt.x - cols[i].right) <= Px(4)) return int(i);
+    return -1;
+  }
+
   void RefreshStates() {
     if (LoadStates()) {
       InvalidateRect(grid, nullptr, FALSE);
@@ -2121,12 +2164,20 @@ class ExplorerImpl {
     int sortKey;  // 見出しをクリックした時の並び順 (-1 = 並べ替えない)
     int left, right;
   };
+  // 列の幅（自分で変えた幅。無ければ既定。名前は既定なら残りの幅）
+  int ColWidth(size_t i) const {
+    if (i < settings.detailCols.size() && settings.detailCols[i] > 0) return Px(settings.detailCols[i]);
+    static const int defaults[] = {0, 140, 150, 90, 150};
+    if (i == 2 && listMode) return Px(280);
+    return Px(defaults[i]);
+  }
   std::vector<Column> DetailColumns() const {
     int w = GridW();
-    int dateW = Px(140), typeW = listMode ? Px(280) : Px(150), sizeW = Px(90), stateW = Px(96);
-    int nameW = std::max(Px(160), w - dateW - typeW - sizeW - stateW);
-    std::vector<Column> cols = {{L"名前", 0, 0, 0}, {L"更新日時", 1, 0, 0}, {listMode ? L"フォルダ" : L"種類", listMode ? -1 : 2, 0, 0},
-                                {L"サイズ", 3, 0, 0}, {L"インデックス", -1, 0, 0}};
+    int dateW = ColWidth(1), typeW = ColWidth(2), sizeW = ColWidth(3), stateW = ColWidth(4);
+    int nameW = settings.detailCols.size() > 0 && settings.detailCols[0] > 0 ? ColWidth(0)
+                                                                           : std::max(Px(160), w - dateW - typeW - sizeW - stateW);
+    std::vector<Column> cols = {{L"名前", 0, 0, 0}, {L"更新日時", 1, 0, 0}, {listMode ? L"フォルダ" : L"種類", listMode ? kFolderSort : 2, 0, 0},
+                                {L"サイズ", 3, 0, 0}, {L"インデックス", kIndexSort, 0, 0}};
     int widths[] = {nameW, dateW, typeW, sizeW, stateW};
     int x = 0;
     for (size_t i = 0; i < cols.size(); i++) {
@@ -2170,7 +2221,8 @@ class ExplorerImpl {
         StateBadge(dc, {cx - r * 2, cy - r * 2, cx + r * 2 - Px(1), cy + r * 2 - Px(1)}, it.state);
         RECT tr = {cols[4].left + pad + r * 3, row.top, cols[4].right - pad, row.bottom};
         static const wchar_t* names[] = {L"未作成", L"処理待ち", L"作成済み", L"一部"};
-        DrawTextW(dc, names[it.state], -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const std::wstring t = !it.progressText.empty() ? it.progressText : names[it.state];
+        DrawTextW(dc, t.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
       }
     }
     // 列の見出し (スクロールしない)
@@ -3355,6 +3407,7 @@ class ExplorerImpl {
             if (HIWORD(wp) == CBN_SELCHANGE) {
               self->settings.viewMode = int(SendMessageW(self->viewBox, CB_GETCURSEL, 0, 0));
               self->host->ExplorerSettingsChanged(self->settings);
+              if (self->Details() && !self->listMode) self->host->ExplorerRequestProgress(self->dir);
               self->scrollY = 0;
               self->UpdateScroll();
               self->EnsureVisible(self->sel);
@@ -3606,6 +3659,13 @@ class ExplorerImpl {
         return 0;
       }
       case WM_MOUSEMOVE: {
+        if (resizeCol >= 0) {
+          const int w = std::max(Px(40), resizeFromW + GET_X_LPARAM(lp) - resizeFromX);
+          if (settings.detailCols.size() < 5) settings.detailCols.resize(5, 0);
+          settings.detailCols[size_t(resizeCol)] = std::max(1, w * 96 / std::max(1, Px(96)));
+          InvalidateRect(grid, nullptr, FALSE);
+          return 0;
+        }
         if (banding) {
           UpdateBand(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
           return 0;
@@ -3640,6 +3700,16 @@ class ExplorerImpl {
       case WM_RBUTTONDOWN: {
         SetFocus(grid);
         if (msg == WM_LBUTTONDOWN && GET_Y_LPARAM(lp) < HeaderH()) {
+          // 列の境目: ドラッグで幅を変える
+          const int edge = ColumnEdgeAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+          if (edge >= 0) {
+            const auto cols = DetailColumns();
+            resizeCol = edge;
+            resizeFromX = GET_X_LPARAM(lp);
+            resizeFromW = cols[size_t(edge)].right - cols[size_t(edge)].left;
+            SetCapture(grid);
+            return 0;
+          }
           // 列の見出し: その列で並べる (同じ列なら向きを変える)
           for (const auto& c : DetailColumns())
             if (GET_X_LPARAM(lp) >= c.left && GET_X_LPARAM(lp) < c.right && c.sortKey >= 0)
@@ -3681,6 +3751,12 @@ class ExplorerImpl {
         return 0;
       }
       case WM_LBUTTONUP:
+        if (resizeCol >= 0) {
+          resizeCol = -1;
+          ReleaseCapture();
+          host->ExplorerSettingsChanged(settings);  // 幅を覚える
+          return 0;
+        }
         if (dragArmed) {
           dragArmed = false;
           ReleaseCapture();
@@ -3704,6 +3780,10 @@ class ExplorerImpl {
         }
         return 0;
       case WM_CAPTURECHANGED:
+        if (resizeCol >= 0) {
+          resizeCol = -1;
+          host->ExplorerSettingsChanged(settings);
+        }
         dragArmed = false;
         if (banding) {
           banding = false;
@@ -3719,7 +3799,27 @@ class ExplorerImpl {
         }
         return 0;
       }
+      case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(grid, &pt);
+        if (LOWORD(lp) == HTCLIENT && (resizeCol >= 0 || ColumnEdgeAt(pt) >= 0)) {
+          SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+          return TRUE;
+        }
+        return DefWindowProcW(grid, msg, wp, lp);
+      }
       case WM_LBUTTONDBLCLK: {
+        if (GET_Y_LPARAM(lp) < HeaderH()) {
+          // 列の境目をダブルクリック: その列を既定の幅に戻す
+          const int edge = ColumnEdgeAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+          if (edge >= 0 && size_t(edge) < settings.detailCols.size()) {
+            settings.detailCols[size_t(edge)] = 0;
+            host->ExplorerSettingsChanged(settings);
+            InvalidateRect(grid, nullptr, FALSE);
+          }
+          return 0;
+        }
         int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
         if (h >= 0) Open(h);
         return 0;
@@ -4044,6 +4144,8 @@ std::vector<std::pair<std::wstring, int>> Explorer::Frequent() const { return im
 
 void Explorer::RefreshTags() { impl_->RefreshTags(); }
 void Explorer::PreviewFile(const std::wstring& path) { impl_->PreviewFile(path); }
+
+void Explorer::SetProgress(const std::wstring& dir, const std::vector<ExplorerProgress>& progress) { impl_->SetProgress(dir, progress); }
 
 void Explorer::SetSameStatus(const std::wstring& text) { SetWindowTextW(impl_->sameText, text.c_str()); }
 

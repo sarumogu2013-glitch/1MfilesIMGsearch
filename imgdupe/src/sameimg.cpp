@@ -216,6 +216,50 @@ std::unordered_map<std::string, IndexState> fileIndexStates(Db& db, const std::s
     return out;
 }
 
+std::unordered_map<std::string, ProgressCount> childProgress(Db& db, const std::string& dir, const std::vector<std::string>& roots,
+                                                             const std::vector<StageKey>& stages, const std::atomic<bool>* cancel) {
+    std::unordered_map<std::string, ProgressCount> out;
+    std::string prefix = trimSep(dir);
+    const std::string nd = normPath(dir);
+    size_t best = 0;
+    for (const auto& r : roots) {
+        const std::string nr = normPath(r);
+        if (under(nd, nr) && nr.size() >= best) {
+            best = nr.size();
+            prefix = trimSep(r) + trimSep(dir).substr(trimSep(r).size());
+        }
+    }
+    std::string match;  // 済んだ段階（版も同じ）を数える
+    for (size_t i = 0; i < stages.size(); ++i) match += std::string(i ? " OR " : "") + "(s.stage=? AND s.version=?)";
+    const std::string sql = "SELECT i.path, " +
+                            (stages.empty() ? std::string("0")
+                                            : "(SELECT count(*) FROM stages s WHERE s.image_id=i.id AND s.state<>0 AND (" + match + "))") +
+                            " FROM images i WHERE i.path >= ? AND i.path < ?";
+    for (const char sep : {'\\', '/'}) {
+        std::string p = prefix;
+        if (sep == '/') std::replace(p.begin(), p.end(), '\\', '/');
+        else std::replace(p.begin(), p.end(), '/', '\\');
+        p += sep;
+        Stmt st(db.handle(), sql.c_str());
+        int n = 1;
+        for (const auto& k : stages) {
+            st.bind(n++, k.stage);
+            st.bind(n++, static_cast<int64_t>(k.version));
+        }
+        st.bind(n++, p).bind(n, p + "\xff");
+        int64_t rows = 0;
+        while (st.step()) {
+            if (cancel && (++rows & 1023) == 0 && cancel->load()) return {};
+            const std::string rest = st.text(0).substr(p.size());
+            const size_t cut = rest.find_first_of("\\/");
+            ProgressCount& c = out[cut == std::string::npos ? rest : rest.substr(0, cut)];
+            ++c.images;
+            c.done += st.i64(1);
+        }
+    }
+    return out;
+}
+
 int64_t findImageId(Db& db, const std::string& path, const std::vector<std::string>& roots) {
     std::vector<std::string> cands = {path};
     const std::string np = normPath(path);
