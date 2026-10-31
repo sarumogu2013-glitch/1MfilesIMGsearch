@@ -3490,6 +3490,17 @@ class ExplorerImpl {
       self->EndEditPath();
       return r;
     }
+    // フォルダ一覧: Shift + ホイール（とチルトホイール）は横にスクロールする。
+    // ツリーは Shift の付いたホイールを親に回すので、ここで受けて回さない（回すとカーソルの下のフォルダに移ることがあった）
+    if (hwnd == self->tree && ((msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT)) || msg == WM_MOUSEHWHEEL)) {
+      static int acc = 0;
+      // 縦のホイールは上へ回すと左へ、チルトは右へ倒すと右へ
+      acc += msg == WM_MOUSEWHEEL ? GET_WHEEL_DELTA_WPARAM(wp) : -GET_WHEEL_DELTA_WPARAM(wp);
+      const int steps = acc * 3 / WHEEL_DELTA;  // 1 目盛りで 3 段
+      acc -= steps * WHEEL_DELTA / 3;
+      for (int i = 0; i < abs(steps); i++) SendMessageW(hwnd, WM_HSCROLL, steps > 0 ? SB_LINELEFT : SB_LINERIGHT, 0);
+      return msg == WM_MOUSEHWHEEL ? TRUE : 0;
+    }
     if (msg == WM_XBUTTONUP) {
       if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) self->Back();
       else self->Forward();
