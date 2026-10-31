@@ -7836,13 +7836,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             if (wheelOnTabs(pt, GET_WHEEL_DELTA_WPARAM(msg.wParam))) continue;
             HWND under = WindowFromPoint(pt);
             if (under == app.s.sources && !(GET_KEYSTATE_WPARAM(msg.wParam) & (MK_CONTROL | MK_SHIFT))) {
-                // 探す所の一覧は、普段の 1/4 の速さで（行が少ないので行き過ぎないように）
+                // 探す所の一覧は、普段の 1/2 の速さで（行が少ないので行き過ぎないように）
                 static int acc = 0;
                 UINT lines = 3;
                 SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
                 if (lines == WHEEL_PAGESCROLL || lines == 0) lines = 3;
                 acc += GET_WHEEL_DELTA_WPARAM(msg.wParam) * static_cast<int>(lines);
-                const int step = 4 * WHEEL_DELTA;
+                const int step = 2 * WHEEL_DELTA;
                 const int n = acc / step;  // 動かす行（上へが正）
                 acc -= n * step;
                 RECT ir{};
