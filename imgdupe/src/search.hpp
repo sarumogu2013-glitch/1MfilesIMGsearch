@@ -22,11 +22,27 @@ enum class DateField { Taken, Modified, Created };
 // 品質での絞り込み（quality.hpp の段階 quality が済んだ画像だけ）
 enum class QualityFilter { Any, Good, Blurry, Soft, LowRes };
 
+// フリーワードを探す所（v2.22。タグの出どころは excludeSources で）。前の版の freeScope は、これに読み替える
+struct SearchIn {
+    bool tags = true;         // タグ（名前どおり）
+    bool partialTags = true;  // 語を含むタグ（miku → hatsune_miku）
+    bool title = true;        // タイトル
+    bool text = true;         // 件名・コメント・キーワード・PNG の文字
+    bool fileName = true;     // ファイル名
+    bool folderName = true;   // 名前が合うフォルダ（結果の先頭に出すのは画面の側）
+    bool operator==(const SearchIn& o) const {
+        return tags == o.tags && partialTags == o.partialTags && title == o.title && text == o.text && fileName == o.fileName &&
+               folderName == o.folderName;
+    }
+};
+
 struct SearchQuery {
     // フリーワード（空白で区切る。どの語にも合う画像。"-語" は合うものを除く）。関連度 = 語ごとの合い方の和
     // （タグがそのまま合う = 確度、タグの頭が合う = 確度 × 0.7、タイトル = 1、ほかの文字 = 0.6、ファイル名 = 0.5）
+    // " で囲んだ語は、タグの名前どおりにだけ合う（tags と同じ）。-語 は除く
     std::string freeText;
-    FreeScope freeScope = FreeScope::All;
+    FreeScope freeScope = FreeScope::All;  // 前の版の保存した条件のため（All 以外なら in より先に読み替える）
+    SearchIn in;
     // タグ（別名は tag_dict でまとめる）。tags は全部を持つもの、excludeTags はどれも持たないもの
     std::vector<std::string> tags;
     std::vector<std::string> excludeTags;
@@ -47,6 +63,7 @@ struct SearchQuery {
     bool animatedOnly = false;
     bool unclassified = false;           // 未分類: 確度 minConfidence 以上のタグ（出どころで絞った合成）が 1 つも無い画像
     std::string pathContains;            // パス（フォルダ名・ファイル名）の部分一致
+    std::string underFolder;             // このフォルダとその下の画像だけ（DB のパスと同じ書き方。区切りで終わらない）
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
     bool deadLinks = false;              // 出典の投稿が消えている（リンク切れ）画像
     // Good: くっきりしていて画素ほどの細かさがある、Blurry: ぼやけている、Soft: 拡大された・ぼやけた（細かさが足りない）、
@@ -74,6 +91,14 @@ struct SearchResult {
 
 // タグの文字列（空白区切り。"-タグ" は除外）を分ける
 void parseTagQuery(const std::string& text, std::vector<std::string>& tags, std::vector<std::string>& exclude);
+// フリーワードを分ける: 語・" で囲んだ語（タグの名前どおり。中に空白があってもよい）・除く語（-語、-"…"）
+void parseFreeText(const std::string& text, std::vector<std::string>& words, std::vector<std::string>& exactTags,
+                   std::vector<std::string>& exclude);
+// 語を含むタグに合った時の点数（語の確からしさ w）。文字ごとの重み（記号 0.5、英数字・かな 1、第 1 水準の漢字 2、
+// 第 2 水準 3、それ以外の漢字 4）を足した S から決める。0 なら部分一致しない（短すぎる語）
+double partialMatchWeight(const std::string& word);
+// 前の版の freeScope を探す所に読み替えたもの
+SearchIn effectiveSearchIn(const SearchQuery& q);
 
 SearchResult search(Db& db, const SearchQuery& q);
 

@@ -2727,10 +2727,11 @@ static void testFreeSearch() {
     SearchQuery q;
     q.freeText = "miku";
     auto r = search(db, q).ids;
-    // a（語を含むタグ 0.9×0.7=0.63）、b（タグそのもの 0.6）、miku_live.jpg（ファイル名 0.5）。c はフォルダの名前だけ、d は手動で「違う」
-    CHECK(r.size() == 3 && r[0] == I("C:\\p\\a.jpg") && r[1] == I("C:\\p\\b.jpg") && r[2] == I("C:\\p\\miku_live.jpg"));
+    // miku_live.jpg（ファイル名 1.0）、a（語を含むタグ。miku の確からしさ 0.7）、b（タグそのもの。確度 0.6）。
+    // c はフォルダの名前だけ、d は手動で「違う」
+    CHECK(r.size() == 3 && r[0] == I("C:\\p\\miku_live.jpg") && r[1] == I("C:\\p\\a.jpg") && r[2] == I("C:\\p\\b.jpg"));
     q.descending = true;  // 関連度の低い順
-    CHECK(search(db, q).ids.front() == I("C:\\p\\miku_live.jpg"));
+    CHECK(search(db, q).ids.front() == I("C:\\p\\b.jpg"));
     q.descending = false;
     q.freeScope = FreeScope::Tags;
     CHECK(search(db, q).ids.size() == 2);
@@ -2780,6 +2781,48 @@ static void testFreeSearch() {
     CHECK(search(db, s).ids.size() == 2);
     SearchQuery s2;
     CHECK(queryFromJson(queryToJson(s), s2) && s2.ids == s.ids);
+    // " で囲んだ語はタグの名前どおりだけ（部分一致・ファイル名には合わない）
+    {
+        SearchQuery e;
+        e.freeText = "\"miku\"";
+        CHECK(search(db, e).ids == std::vector<int64_t>({I("C:\\p\\b.jpg")}));
+        e.freeText = "\"miku\" -stage";  // b はファイル埋め込みの stage を持つので除かれる
+        CHECK(search(db, e).ids.empty());
+        // 探す所: タグの部分一致を外すと a は合わない。ファイル名を外すと miku_live は合わない
+        SearchQuery f;
+        f.freeText = "miku";
+        f.in.partialTags = false;
+        f.in.fileName = false;
+        CHECK(search(db, f).ids == std::vector<int64_t>({I("C:\\p\\b.jpg")}));
+        f.in = SearchIn{false, false, false, false, false, false};  // どこも探さない
+        CHECK(search(db, f).ids.empty());
+        // このフォルダの下だけ
+        SearchQuery u;
+        u.freeText = "miku";
+        u.underFolder = "C:\\miku";
+        CHECK(search(db, u).ids.empty());
+        u.underFolder = "C:\\p\\";
+        CHECK(search(db, u).ids.size() == 3);
+        SearchQuery back;
+        f.in = SearchIn{true, false, true, false, true, false};
+        f.underFolder = "C:\\p";
+        CHECK(queryFromJson(queryToJson(f), back) && back.in == f.in && back.underFolder == "C:\\p");
+        // 前の版の範囲は探す所に読み替える
+        SearchQuery old;
+        old.freeScope = FreeScope::Title;
+        CHECK(effectiveSearchIn(old) == (SearchIn{false, false, true, false, false, false}));
+    }
+    {
+        std::vector<std::string> w, e, x;
+        parseFreeText("miku \"long hair\" -stage “初音”　-\"a b\"", w, e, x);
+        CHECK(w == std::vector<std::string>({"miku"}) && e == std::vector<std::string>({"long hair", "初音"}) &&
+              x == std::vector<std::string>({"stage", "a b"}));
+        // 語の確からしさ: 短い語・よく使う文字は低く、長い語・珍しい漢字は高く
+        CHECK(partialMatchWeight("a") == 0 && partialMatchWeight("の") == 0 && partialMatchWeight("ab") == 0.4 &&
+              partialMatchWeight("赤") == 0.4 && partialMatchWeight("red") == 0.55 && partialMatchWeight("miku") == 0.7 &&
+              partialMatchWeight("初音") == 0.7 && partialMatchWeight("hatsune") == 0.9 && partialMatchWeight("初音ミク") == 0.9);
+        CHECK(partialMatchWeight("鬱") == 0.55 && partialMatchWeight("--") == 0 && partialMatchWeight("ｍｉｋｕ") == 0.7);
+    }
     // ファイル名に限る（タグ・タイトルは見ない）
     SearchQuery n;
     n.freeText = "miku";

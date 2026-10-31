@@ -3508,6 +3508,7 @@ class ExplorerImpl {
               POINT sp = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
               ClientToScreen(hwnd, &sp);
               if (WindowFromPoint(sp) == self->trayWnd) self->AddTray(tag);
+              else self->host->ExplorerDropTag(tag, sp);  // 検索のフリーワードの欄なら、語として足す
             } else {
               self->host->ExplorerSearchTags({tag});
             }
