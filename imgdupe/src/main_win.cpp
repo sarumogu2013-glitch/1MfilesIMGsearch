@@ -1988,7 +1988,6 @@ SearchQuery searchQueryFromUi() {
     q.minWidth = _wtoi(editText(app.s.minW).c_str());
     q.minSize = static_cast<int64_t>(_wtoi(editText(app.s.minKb).c_str())) * 1024;
     q.maxSize = static_cast<int64_t>(_wtoi(editText(app.s.maxKb).c_str())) * 1024;
-    q.pathContains = narrow(editText(app.s.path));
     q.downloadContains = narrow(editText(app.s.download));
     const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
     q.sort = kSortChoices[std::min<int>(sort, static_cast<int>(std::size(kSortChoices)) - 1)];
@@ -2552,7 +2551,7 @@ void applyQueryToUi(const SearchQuery& q) {
     setNum(app.s.minW, q.minWidth);
     setNum(app.s.minKb, q.minSize / 1024);
     setNum(app.s.maxKb, q.maxSize / 1024);
-    SetWindowTextW(app.s.path, widen(q.pathContains).c_str());
+    // パスの一部は v2.22 でなくした（フリーワードと「このフォルダ内で探す」で代わりに）。前に保存した条件の値は使わない
     SetWindowTextW(app.s.download, widen(q.downloadContains).c_str());
     for (size_t i = 0; i < std::size(kSortChoices); ++i)
         if (kSortChoices[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
@@ -5314,8 +5313,6 @@ void layoutAdvanced(int y, int W, int h) {
     put(app.s.deadLinks, px(90));
     cy += rowH + px(5);
     x = m;
-    lbl(app.s.lPath, px(80));
-    put(app.s.path, px(200));
     lbl(app.s.lDownload, px(130));
     put(app.s.download, px(200));
     lbl(app.s.lConf, px(30));
@@ -5405,8 +5402,12 @@ void createSearchControls() {
     app.s.minKb = edit(IDC_S_MINKB, ap, ES_NUMBER);
     app.s.lSizeTo = label(L"〜", ap);
     app.s.maxKb = edit(IDC_S_MAXKB, ap, ES_NUMBER);
-    app.s.lPath = label(L"パス（一部）", ap);
-    app.s.path = edit(IDC_S_PATH, ap);
+    {  // パス（一部）は v2.22 でなくした（部品だけ残していつも隠す）
+        std::vector<HWND> hidden;
+        app.s.lPath = label(L"パス（一部）", hidden);
+        app.s.path = edit(IDC_S_PATH, hidden);
+        for (HWND h : hidden) ShowWindow(h, SW_HIDE);
+    }
     app.s.lDownload = label(L"ダウンロード元（URL）", ap);
     app.s.download = edit(IDC_S_DOWNLOAD, ap);
     app.s.lDate = label(L"日付", ap);
@@ -5467,7 +5468,7 @@ void createSearchControls() {
         {app.s.confDefault, L"確度を既定の 0.50 に戻します"},
         {app.s.sort, L"結果の並べ方"},
         {app.s.desc, L"チェックすると逆の順（大きい・新しいものから）に並べます"},
-        {app.s.advanced, L"星・形式・品質・大きさ・日付・パス・出どころなどの細かい条件を出す・隠す"},
+        {app.s.advanced, L"星・形式・品質・大きさ・日付・ダウンロード元・探す所などの細かい条件を出す・隠す"},
         {app.s.clear, L"入力した条件を初めの状態に戻します（探しません。並び順と確度はそのまま）"},
         {app.s.clip,
          L"画像に写っているものを言葉で探します（AI の CLIP が画像と言葉の近さを比べます。タグが付いていなくても探せます）。"
@@ -5496,7 +5497,6 @@ void createSearchControls() {
          L"（クリックして ↑↓ キーでも。PageUp / PageDown で 10 ずつ）"},
         {app.s.unclassified, L"タグが 1 つも無い画像だけ"},
         {app.s.deadLinks, L"出典の投稿が消えている画像だけ（出典を確かめる設定にしてある時）"},
-        {app.s.path, L"パスにこの文字を含む画像だけ"},
         {app.s.download, L"ダウンロード元の URL にこの文字を含む画像だけ"},
         {app.s.conf, L"タグの確度がこれ以上のものだけをタグとして使います"},
         {app.s.sources,
