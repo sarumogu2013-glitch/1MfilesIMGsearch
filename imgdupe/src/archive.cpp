@@ -1,6 +1,8 @@
 #include "archive.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <optional>
 #include <ctime>
 #include <stdexcept>
 #include <unordered_map>
@@ -9,6 +11,7 @@
 #include "log.hpp"
 #include "sqlite3.h"
 #include "platform.hpp"
+#include "tagstore.hpp"
 #include "vectors.hpp"
 
 namespace imgdupe {
@@ -241,6 +244,264 @@ size_t deleteArchived(Db& db, const std::string& archiveFile, const std::vector<
 
 size_t deleteArchivedBefore(Db& db, const std::string& archiveFile, int64_t before) {
     return deleteWhere(db, archiveFile, "archived < ?", {before}, true);
+}
+
+namespace {
+
+std::string fileNameOf(const std::string& p) {
+    const size_t e = p.find_last_of("\\/");
+    return e == std::string::npos ? p : p.substr(e + 1);
+}
+
+bool sameNameNoCase(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    return true;
+}
+
+// 見つからない画像・保管の画像の、見分ける情報
+struct Candidate {
+    int64_t id = 0;  // images.id か archived.aid
+    std::string path;
+    int64_t mtime = 0;
+    uint64_t fileId = 0;
+    std::vector<uint8_t> sha;
+    bool used = false;
+};
+
+// 新しく見つけた newPath が、c と同じ画像か
+bool sameImage(const std::string& newPath, const Candidate& c, std::optional<Sha256>& newSha) {
+    // 1. 同じドライブで、ファイル ID が同じ（動かしても名前を変えても変わらない）
+    if (c.fileId && driveOf(newPath) == driveOf(c.path)) {
+        FileIdentity fi;
+        if (fileIdentity(newPath, fi) && fi.index == c.fileId) return true;
+    }
+    // 2. 中身の SHA-256 が同じ
+    if (c.sha.size() == 32) {
+        if (!newSha) {
+            Sha256 h{};
+            if (!sha256File(newPath, h)) return false;
+            newSha = h;
+        }
+        return std::equal(newSha->begin(), newSha->end(), c.sha.begin());
+    }
+    // 3. SHA が無い（同じ大きさの画像が無かった）: 大きさ・更新日時に加えて、ファイル名が同じ
+    return sameNameNoCase(fileNameOf(newPath), fileNameOf(c.path));
+}
+
+}  // namespace
+
+MoveReport matchMovedImages(Db& db, const std::vector<ScannedFile>& files, const std::vector<std::string>& under,
+                            const std::string& archiveFile, const std::string& vectorFile) {
+    MoveReport rep;
+    if (files.empty()) return rep;
+    // DB の画像: 今回見つかったか（見つからないものは、under の下なら引き継ぎの候補）
+    std::unordered_set<std::string> found;
+    found.reserve(files.size());
+    for (const auto& f : files) found.insert(f.path);
+    std::unordered_set<std::string> known;
+    std::unordered_map<int64_t, std::vector<Candidate>> gone;  // 大きさ → 見つからない画像
+    {
+        Stmt st(db.handle(), "SELECT id, path, size, mtime, file_id, sha FROM images");
+        while (st.step()) {
+            std::string p = st.text(1);
+            if (found.count(p)) {
+                known.insert(std::move(p));
+                continue;
+            }
+            bool inside = false;
+            for (const auto& r : under) inside = inside || underRoot(p, r);
+            if (!inside) continue;
+            Candidate c;
+            c.id = st.i64(0);
+            c.path = std::move(p);
+            c.mtime = st.i64(3);
+            c.fileId = static_cast<uint64_t>(st.isNull(4) ? 0 : st.i64(4));
+            c.sha = st.blob(5);
+            gone[st.i64(2)].push_back(std::move(c));
+        }
+    }
+    std::vector<const ScannedFile*> fresh;  // DB に無い（新しく見つけた）ファイル
+    for (const auto& f : files)
+        if (!known.count(f.path)) fresh.push_back(&f);
+    if (fresh.empty()) return rep;
+
+    // 1. 見つからない画像と同じなら、パスを書き換える
+    std::vector<const ScannedFile*> rest;
+    if (!gone.empty()) {
+        Stmt upd(db.handle(), "UPDATE images SET path=?, drive=? WHERE id=?");
+        db.begin();
+        try {
+            for (const ScannedFile* f : fresh) {
+                bool moved = false;
+                auto it = gone.find(static_cast<int64_t>(f->size));
+                if (it != gone.end()) {
+                    std::optional<Sha256> sha;
+                    for (Candidate& c : it->second) {
+                        if (c.used || c.mtime != f->mtime || !sameImage(f->path, c, sha)) continue;
+                        upd.bind(1, f->path).bind(2, driveOf(f->path)).bind(3, c.id);
+                        upd.step();
+                        upd.reset();
+                        c.used = true;
+                        moved = true;
+                        ++rep.moved;
+                        break;
+                    }
+                }
+                if (!moved) rest.push_back(f);
+            }
+            db.commit();
+        } catch (...) {
+            db.rollback();
+            throw;
+        }
+    } else {
+        rest = fresh;
+    }
+
+    // 2. 保管にあるものと同じなら、保管から戻す
+    if (rest.empty() || archiveFile.empty() || fileSize(archiveFile) < 0) return rep;
+    Attach a(db, archiveFile, false);
+    if (!a.ok()) return rep;
+    // ベクトルは、今のファイルと同じモデル・次元の時だけ戻す（違えば CLIP は作り直し）
+    std::string curModel;
+    uint32_t curDim = 0;
+    std::unordered_map<int64_t, std::vector<uint16_t>> none;
+    const bool haveVectors = !vectorFile.empty() && readVectorsOf(vectorFile, {}, none, curModel, curDim);
+    VectorWriter vw;
+    bool vwOpen = false;
+    Stmt find(db.handle(), "SELECT aid, path, mtime, file_id, sha FROM arc.archived WHERE size=? AND mtime=?");
+    db.begin();
+    try {
+        Stmt ins(db.handle(), "INSERT INTO images(path,drive,size,mtime,file_id,sha,added) "
+                              "SELECT ?,?,size,mtime,file_id,sha,added FROM arc.archived WHERE aid=?");
+        Stmt tags(db.handle(), "SELECT tag, kind, source, confidence, manual FROM arc.archived_tags WHERE aid=?");
+        Stmt stages(db.handle(), "SELECT stage, version, state, updated FROM arc.archived_stages WHERE aid=?");
+        Stmt insStage(db.handle(), "INSERT OR REPLACE INTO stages(image_id,stage,state,version,updated) VALUES(?,?,?,?,?)");
+        Stmt vec(db.handle(), "SELECT model, dim, data FROM arc.archived_vectors WHERE aid=?");
+        std::vector<int64_t> restoredAids;
+        TagWriter tw(db, TagConflict::KeepManual);
+        for (const ScannedFile* f : rest) {
+            find.bind(1, static_cast<int64_t>(f->size)).bind(2, f->mtime);
+            std::vector<Candidate> cands;
+            while (find.step()) {
+                Candidate c;
+                c.id = find.i64(0);
+                c.path = find.text(1);
+                c.mtime = find.i64(2);
+                c.fileId = static_cast<uint64_t>(find.isNull(3) ? 0 : find.i64(3));
+                c.sha = find.blob(4);
+                cands.push_back(std::move(c));
+            }
+            find.reset();
+            std::optional<Sha256> sha;
+            for (const Candidate& c : cands) {
+                if (std::find(restoredAids.begin(), restoredAids.end(), c.id) != restoredAids.end() || !sameImage(f->path, c, sha))
+                    continue;
+                ins.bind(1, f->path).bind(2, driveOf(f->path)).bind(3, c.id);
+                ins.step();
+                ins.reset();
+                const int64_t id = sqlite3_last_insert_rowid(db.handle());
+                tags.bind(1, c.id);
+                while (tags.step()) tw.put(id, tags.text(0), tags.text(1), tags.f64(3), tags.text(2), tags.i64(4) != 0);
+                tags.reset();
+                // CLIP のベクトルを戻せた時だけ、CLIP の段階も済みにする
+                bool vectorBack = false;
+                vec.bind(1, c.id);
+                if (vec.step() && haveVectors && vec.text(0) == curModel && static_cast<uint32_t>(vec.i64(1)) == curDim) {
+                    const auto blob = vec.blob(2);
+                    if (blob.size() == 2ull * curDim) {
+                        if (!vwOpen) vwOpen = vw.open(vectorFile, curDim, curModel);
+                        if (vwOpen) {
+                            std::vector<float> v(curDim);
+                            for (uint32_t k = 0; k < curDim; ++k)
+                                v[k] = halfToFloat(static_cast<uint16_t>(blob[2 * k] | (blob[2 * k + 1] << 8)));
+                            vectorBack = vw.append(id, v.data());
+                        }
+                    }
+                }
+                vec.reset();
+                stages.bind(1, c.id);
+                while (stages.step()) {
+                    if (stages.text(0) == "clip" && !vectorBack) continue;
+                    insStage.bind(1, id).bind(2, stages.text(0)).bind(3, stages.i64(2)).bind(4, stages.i64(1)).bind(5, stages.i64(3));
+                    insStage.step();
+                    insStage.reset();
+                }
+                stages.reset();
+                restoredAids.push_back(c.id);
+                ++rep.restored;
+                break;
+            }
+        }
+        // 戻したものは保管から消す
+        for (int64_t aid : restoredAids)
+            for (const char* t : {"archived_tags", "archived_stages", "archived_vectors", "archived"}) {
+                Stmt del(db.handle(), (std::string("DELETE FROM arc.") + t + " WHERE aid=?").c_str());
+                del.bind(1, aid);
+                del.step();
+            }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+    if (vwOpen) vw.close();
+    return rep;
+}
+
+size_t moveRootPaths(Db& db, const std::string& oldRoot, const std::string& newRoot) {
+    auto trim = [](std::string s) {
+        while (s.size() > 1 && (s.back() == '\\' || s.back() == '/')) s.pop_back();
+        return s;
+    };
+    const std::string from = trim(oldRoot), to = trim(newRoot);
+    if (from.empty() || to.empty() || from == to) return 0;
+    struct Row {
+        int64_t id;
+        std::string path;
+    };
+    std::vector<Row> rows;
+    {
+        Stmt st(db.handle(), "SELECT id, path FROM images");
+        while (st.step()) {
+            std::string p = st.text(1);
+            if (underRoot(p, from)) rows.push_back({st.i64(0), std::move(p)});
+        }
+    }
+    if (rows.empty()) return 0;
+    size_t n = 0;
+    db.begin();
+    try {
+        Stmt find(db.handle(), "SELECT id FROM images WHERE path=?");
+        Stmt del(db.handle(), "DELETE FROM images WHERE id=?");
+        Stmt upd(db.handle(), "UPDATE images SET path=?, drive=? WHERE id=?");
+        for (const Row& r : rows) {
+            const std::string np = to + r.path.substr(from.size());
+            find.bind(1, np);
+            if (find.step()) {
+                // 新しい場所を先に調べて、同じ画像が新しい行で入っていた: 手動の確定をこちらへ移して、その行を消す
+                const int64_t other = find.i64(0);
+                find.reset();
+                copyManualTags(db, other, r.id);
+                del.bind(1, other);
+                del.step();
+                del.reset();
+            } else {
+                find.reset();
+            }
+            upd.bind(1, np).bind(2, driveOf(np)).bind(3, r.id);
+            upd.step();
+            upd.reset();
+            ++n;
+        }
+        db.commit();
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+    return n;
 }
 
 }  // namespace imgdupe

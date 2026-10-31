@@ -143,6 +143,8 @@ std::vector<int64_t> pendingImages(Db& db, const std::string& stage, int version
 
 // パスのドライブ（"D:"、"\\server\share"、"/"）
 std::string driveOf(const std::string& path);
+// path が root の下か（root の書き方で始まり、続きが区切り）
+bool underRoot(const std::string& path, const std::string& root);
 
 // 調べるフォルダ（settings の "roots"、改行区切り）
 void setRoots(Db& db, const std::vector<std::string>& roots);

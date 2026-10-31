@@ -204,11 +204,15 @@ CREATE TABLE IF NOT EXISTS smart_folders(
 )SQL";
 
 
+}  // namespace
+
 bool underRoot(const std::string& path, const std::string& root) {
     if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0) return false;
     const char last = root.empty() ? '/' : root.back();
     return last == '/' || last == '\\' || path[root.size()] == '/' || path[root.size()] == '\\';
 }
+
+namespace {
 
 int64_t packColor(const Features& f) { return (int64_t(f.r) << 16) | (int64_t(f.g) << 8) | f.b; }
 

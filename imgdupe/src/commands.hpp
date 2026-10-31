@@ -68,6 +68,7 @@ enum Cmd : int {
     CMD_REFRESH,          // 更新（画面の控えを捨てて読み直す）
     CMD_COMPACT_DB,       // DB を詰めて小さくする
     CMD_ARCHIVE,          // 保管したデータ（見つからなくなった画像のタグ・CLIP など）
+    CMD_REMAP_ROOT,       // 調べるフォルダの場所を付け替える（ドライブレター・フォルダ名が変わった）
 };
 
 struct CmdInfo {

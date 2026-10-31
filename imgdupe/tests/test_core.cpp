@@ -819,6 +819,102 @@ static void testArchive() {
     fs::remove_all(dir);
 }
 
+
+// データ保護の 2 回目: 動かした画像の引き継ぎ・保管から戻す・調べるフォルダの付け替え
+static void testMoveCarry() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-move";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "pics" / "sub");
+    auto write = [](const fs::path& p, const std::string& body) {
+        std::ofstream o(p, std::ios::binary);
+        o << body;
+    };
+    const std::string pics = (dir / "pics").string();
+    const std::string a = (dir / "pics" / "a.png").string(), moved = (dir / "pics" / "sub" / "renamed.png").string();
+    write(a, "AAAA-content");
+    Db d;
+    CHECK(d.open((dir / "imgdupe.db").string()));
+    auto ids = upsertScanned(d, {{a, 12, 100}});
+    const int64_t id = ids[a];
+    FileIdentity fi;
+    CHECK(fileIdentity(a, fi));
+    d.exec(("UPDATE images SET file_id=" + std::to_string(fi.index) + " WHERE id=" + std::to_string(id)).c_str());
+    setManualTag(d, id, "miku", true);
+    // 名前を変えて動かした（同じドライブ: ファイル ID で分かる）
+    fs::rename(a, moved);
+    MoveReport r = matchMovedImages(d, {{moved, 12, 100}}, {pics}, "", "");
+    CHECK(r.moved == 1 && r.restored == 0);
+    {
+        Stmt st(d.handle(), "SELECT path FROM images WHERE id=?");
+        st.bind(1, id);
+        CHECK(st.step() && st.text(0) == moved);
+    }
+    // 更新日時が違えば別の画像
+    fs::rename(moved, a);
+    r = matchMovedImages(d, {{a, 12, 999}}, {pics}, "", "");
+    CHECK(r.moved == 0);
+    // ファイル ID も SHA も無い時は、ファイル名が同じなら同じ画像（違えば別）
+    d.exec("UPDATE images SET file_id=NULL");
+    r = matchMovedImages(d, {{(dir / "pics" / "other.png").string(), 12, 100}}, {pics}, "", "");
+    CHECK(r.moved == 0);
+    fs::create_directories(dir / "pics" / "x");
+    const std::string sameName = (dir / "pics" / "x" / "renamed.png").string();
+    fs::copy_file(a, sameName);
+    r = matchMovedImages(d, {{sameName, 12, 100}}, {pics}, "", "");
+    CHECK(r.moved == 1);
+    // SHA があれば中身で確かめる
+    Sha256 h{};
+    CHECK(sha256File(a, h));
+    {
+        Stmt st(d.handle(), "UPDATE images SET sha=? WHERE id=?");
+        st.bindBlob(1, h.data(), h.size()).bind(2, id);
+        st.step();
+    }
+    r = matchMovedImages(d, {{a, 12, 100}}, {pics}, "", "");
+    CHECK(r.moved == 1);  // a に戻した（中身が同じ）
+    // 見つかっている画像は動かさない（コピー）
+    r = matchMovedImages(d, {{a, 12, 100}, {sameName, 12, 100}}, {pics}, "", "");
+    CHECK(r.moved == 0);
+
+    // 保管から戻す: 保管した後、同じ画像が見つかった
+    const std::string arc = archiveFileOf(dir.string());
+    CHECK(archiveImages(d, arc, {id}, "", "見つからない") == 1);
+    CHECK(imageCount(d) == 0);
+    r = matchMovedImages(d, {{sameName, 12, 100}}, {pics}, arc, "");
+    CHECK(r.restored == 1 && imageCount(d) == 1 && archiveSummary(d, arc).images == 0);
+    {
+        Stmt st(d.handle(), "SELECT id FROM images WHERE path=?");
+        st.bind(1, sameName);
+        CHECK(st.step());
+        bool manual = false;
+        for (const auto& t : tagsOf(d, st.i64(0))) manual |= t.tag == "miku" && t.manual;
+        CHECK(manual);  // 手動の確定が戻った
+    }
+
+    // 調べるフォルダの付け替え（ドライブレターが変わった）
+    upsertScanned(d, {{"E:\\x\\1.jpg", 1, 1}, {"E:\\x\\2.jpg", 1, 1}, {"E:\\xy\\3.jpg", 1, 1}, {"F:\\x\\2.jpg", 1, 1}});
+    {
+        Stmt st(d.handle(), "SELECT id FROM images WHERE path='F:\\x\\2.jpg'");
+        CHECK(st.step());
+        setManualTag(d, st.i64(0), "new_side", true);
+    }
+    CHECK(moveRootPaths(d, "E:\\x\\", "F:\\x") == 2);  // E:\xy は別のフォルダ
+    {
+        Stmt st(d.handle(), "SELECT count(*) FROM images WHERE path LIKE 'F:\\x\\%' ESCAPE '|'");
+        CHECK(st.step() && st.i64(0) == 2);  // 先にあった F:\x\2.jpg の行は消え、E: の行が付け替わった
+        Stmt e(d.handle(), "SELECT count(*) FROM images WHERE path LIKE 'E:%'");
+        CHECK(e.step() && e.i64(0) == 1);
+        Stmt m(d.handle(), "SELECT id FROM images WHERE path='F:\\x\\2.jpg'");
+        CHECK(m.step());
+        bool kept = false;
+        for (const auto& t : tagsOf(d, m.i64(0))) kept |= t.tag == "new_side" && t.manual;
+        CHECK(kept);  // 消した行の手動の確定は移した
+    }
+    CHECK(moveRootPaths(d, "G:\\none", "H:\\none") == 0);
+    d.close();
+    fs::remove_all(dir);
+}
+
 static void testScanTasks() {
     // 調べるフォルダの書き方にそろえる（同じ画像を別のパスで二重に登録しない）
     CHECK(spellLikeRoot("d:\\Pics\\a\\b.jpg", {"D:\\pics"}) == "D:\\pics\\a\\b.jpg");
@@ -3332,6 +3428,7 @@ int main() {
     testIndexer();
     testScanTasks();
     testArchive();
+    testMoveCarry();
     testMeta();
     testSearch();
     testLinks();

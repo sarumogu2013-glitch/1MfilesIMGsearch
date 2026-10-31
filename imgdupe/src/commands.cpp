@@ -37,6 +37,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_SCAN_TASKS, "ScanTasks", L"スキャンタスクの一覧(&K)", ""},
     {CMD_ADD_FOLDER, "AddFolder", L"調べるフォルダを追加(&A)...", ""},
     {CMD_REMOVE_FOLDER, "RemoveFolder", L"調べるフォルダを外す(&R)", ""},
+    {CMD_REMAP_ROOT, "RemapFolder", L"調べるフォルダの場所を付け替える(&M)...", ""},
     {CMD_EXPORT, "Export", L"結果を保存(&S)...", "Ctrl+S"},
     {CMD_EXIT, "Exit", L"終了(&X)", ""},
     {CMD_SEARCH, "Search", L"検索開始 / 中止(&S)", "F5"},

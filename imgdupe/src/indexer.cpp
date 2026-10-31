@@ -471,13 +471,25 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
                 files.end());
     s.rep.files += files.size();
     const int64_t before = imageCount(db);
-    const auto ids = upsertScanned(db, files);
     // 読めないフォルダ（外したドライブなど）の下は消さない（つなぎ直した時にタグ・CLIP などを作り直さずに済むように）
     std::vector<std::string> removable;
     for (const auto& r : removeUnder) {
         if (!s.cb.rootAvailable || s.cb.rootAvailable(r)) removable.push_back(r);
         else logs::warn("調べるフォルダが見つからない（ドライブを外した・名前を変えたなど）ので、その下の画像は消さずに残す: " + r);
     }
+    // 動かした・名前を変えた画像は、パスだけ書き換えて引き継ぐ。保管にある画像が戻ってきたら、保管から戻す
+    size_t carried = 0;
+    if (!s.opt.archiveFile.empty()) {
+        try {
+            const MoveReport mr = matchMovedImages(db, files, removable, s.opt.archiveFile, s.opt.vectorFile);
+            carried = mr.moved + mr.restored;
+            if (mr.moved) logs::info("動かした・名前を変えた画像 " + std::to_string(mr.moved) + " 枚を見つけて、解析の結果を引き継いだ");
+            if (mr.restored) logs::info("保管にあった画像 " + std::to_string(mr.restored) + " 枚が戻ってきたので、保管から戻した");
+        } catch (const std::exception& e) {
+            logs::error(std::string("動かした画像を見分けられなかった（新しい画像として登録する）: ") + e.what());
+        }
+    }
+    const auto ids = upsertScanned(db, files);
     size_t removed = 0;
     if (!removable.empty()) {
         if (s.opt.archiveFile.empty()) {

@@ -99,6 +99,7 @@ constexpr UINT WM_APP_QUERY_VEC = WM_APP + 12;   // lParam: QueryVector*（似�
 constexpr UINT WM_APP_QUERY_TAGS = WM_APP + 13;  // lParam: QueryTagsDone*（生成したタグ）
 constexpr UINT WM_APP_CONVERT = WM_APP + 14;     // lParam: std::wstring*（DB の変換の様子。空なら済んだ）
 constexpr UINT WM_APP_PROGRESS = WM_APP + 56;  // lParam: ProgressDone*（詳細表示のインデックスの進み具合）
+constexpr UINT WM_APP_REMAP = WM_APP + 58;    // lParam: std::vector<std::pair<std::wstring, std::wstring>>*（付け替えた調べるフォルダ）
 constexpr UINT WM_APP_OFFLINE = WM_APP + 57;  // wParam: 外してある印を付け直した数（-1 = もう一度やり直す）
 constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
@@ -428,7 +429,35 @@ void saveSearchSettings();
 
 void saveExplorerDir();
 
-// 外してある画像の印を、今の調べるフォルダとつながっているドライブで付け直す（裏のスレッド。全部の画像を 1 回読む）
+std::wstring stripTrailingSlash(std::wstring p);
+
+// フォルダのドライブのシリアル番号とファイル ID（ドライブレターが変わっても同じフォルダだと分かる）
+bool folderIdentity(const std::wstring& dir, uint32_t& serial, uint64_t& index) {
+    HANDLE h = CreateFileW(dir.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION fi;
+    const bool ok = GetFileInformationByHandle(h, &fi) != 0;
+    CloseHandle(h);
+    if (!ok) return false;
+    serial = fi.dwVolumeSerialNumber;
+    index = (static_cast<uint64_t>(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+    return true;
+}
+
+std::string rootIdKey(const std::wstring& root) {
+    std::wstring r = stripTrailingSlash(root);
+    CharLowerBuffW(&r[0], static_cast<DWORD>(r.size()));
+    return "rootid:" + narrow(r);
+}
+
+bool isFolder(const std::wstring& p) {
+    const DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// 外してある画像の印を、今の調べるフォルダとつながっているドライブで付け直す（裏のスレッド。全部の画像を 1 回読む）。
+// 見つからない調べるフォルダは、同じシリアル番号のドライブに同じフォルダ（ファイル ID が同じ）があれば、聞かずに付け替える（仕様 2.2）
 std::atomic<bool> offlineBusy{false}, offlineAgain{false};
 void refreshOfflineAsync() {
     if (app.dataDir.empty() || !app.hwnd) return;
@@ -444,12 +473,41 @@ void refreshOfflineAsync() {
         WPARAM changed = 0;
         try {
             std::vector<std::string> online;
-            for (const auto& r : roots) {
-                const DWORD a = GetFileAttributesW(r.c_str());
-                if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) online.push_back(narrow(r));
-            }
             Db d;
-            if (d.open(db)) changed = updateOffline(d, online);
+            if (!d.open(db)) throw std::runtime_error(d.error());
+            auto* remaps = new std::vector<std::pair<std::wstring, std::wstring>>;
+            const DWORD drives = GetLogicalDrives();
+            for (const auto& r : roots) {
+                uint32_t serial = 0;
+                uint64_t index = 0;
+                if (isFolder(r)) {
+                    online.push_back(narrow(r));
+                    if (folderIdentity(r, serial, index)) {
+                        const std::string v = std::to_string(serial) + ":" + std::to_string(index);
+                        if (d.setting(rootIdKey(r)) != v) d.setSetting(rootIdKey(r), v);
+                    }
+                    continue;
+                }
+                // 見つからない: ドライブレターが変わっただけか
+                const std::string known = d.setting(rootIdKey(r));
+                if (known.empty() || r.size() < 2 || r[1] != L':') continue;
+                for (int k = 0; k < 26; ++k) {
+                    if (!(drives & (1u << k))) continue;
+                    std::wstring cand = r;
+                    cand[0] = static_cast<wchar_t>(L'A' + k);
+                    if (_wcsicmp(cand.c_str(), r.c_str()) == 0 || !isFolder(cand) || !folderIdentity(cand, serial, index)) continue;
+                    if (std::to_string(serial) + ":" + std::to_string(index) != known) continue;
+                    const size_t n = moveRootPaths(d, narrow(r), narrow(cand));
+                    d.setSetting(rootIdKey(cand), known);
+                    logs::info("調べるフォルダのドライブレターが変わった: " + narrow(r) + " → " + narrow(cand) + "（画像 " + std::to_string(n) +
+                               " 枚のパスを付け替えた。解析はやり直さない）");
+                    remaps->emplace_back(r, cand);
+                    online.push_back(narrow(cand));
+                    break;
+                }
+            }
+            if (remaps->empty() || !PostMessageW(hwnd, WM_APP_REMAP, 0, reinterpret_cast<LPARAM>(remaps))) delete remaps;
+            changed = updateOffline(d, online);
             if (changed) logs::info("外してある画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
         } catch (const std::exception& e) {
             logs::warn(std::string("外してある画像の印を付け直せなかった: ") + e.what());
@@ -533,10 +591,12 @@ std::wstring stripTrailingSlash(std::wstring p) {
     return p;
 }
 
-void addFolder(const std::wstring& raw) {
+// mustExist: 今あるフォルダだけ足す（自分で足す時）。前回の設定を読む時は、外したドライブのフォルダも残す（数ヶ月外しておいてもよい）
+void addFolder(const std::wstring& raw, bool mustExist = true) {
     const std::wstring p = stripTrailingSlash(raw);
+    if (p.empty()) return;
     const DWORD attr = GetFileAttributesW(p.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (mustExist && (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))) return;
     for (const auto& f : folderList())
         if (lstrcmpiW(f.c_str(), p.c_str()) == 0) return;
     ListBox_AddString(app.folders, p.c_str());
@@ -5018,6 +5078,62 @@ void removeRoot(const std::wstring& dir) {
 
 void ExplorerApp::ExplorerRemoveRoot(const std::wstring& dir) { removeRoot(dir); }
 
+// 調べるフォルダの一覧の from を to に置き換える
+void replaceRoot(const std::wstring& from, const std::wstring& to) {
+    const int n = ListBox_GetCount(app.folders);
+    for (int i = 0; i < n; ++i) {
+        std::wstring s(ListBox_GetTextLen(app.folders, i), L'\0');
+        ListBox_GetText(app.folders, i, &s[0]);
+        if (lstrcmpiW(stripTrailingSlash(s.c_str()).c_str(), stripTrailingSlash(from).c_str()) == 0) {
+            ListBox_DeleteString(app.folders, i);
+            ListBox_InsertString(app.folders, i, to.c_str());
+            return;
+        }
+    }
+}
+
+// 「調べるフォルダの場所を付け替える」: 付け替える調べるフォルダと新しい場所を選んで、その下の画像のパスを書き換える（解析はやり直さない）
+void remapRootUi() {
+    const auto f = folderList();
+    if (f.empty()) {
+        logBox(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
+        return;
+    }
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"付け替える調べるフォルダ（前の場所）:");
+    for (size_t i = 0; i < f.size(); ++i) AppendMenuW(menu, MF_STRING, i + 1, f[i].c_str());
+    POINT pt;
+    GetCursorPos(&pt);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd < 1 || cmd > f.size()) return;
+    const std::wstring from = stripTrailingSlash(f[cmd - 1]);
+    const auto picked = pickFolders(L"新しい場所（中身が同じフォルダ）を選ぶ");
+    if (picked.empty()) return;
+    const std::wstring to = stripTrailingSlash(picked[0]);
+    if (lstrcmpiW(from.c_str(), to.c_str()) == 0) return;
+    if (logBox(app.hwnd,
+               (L"「" + from + L"」の画像を「" + to + L"」の下にあるものとして付け替えますか？\n\n作ったタグ・CLIP などはそのまま引き継ぎ、"
+                L"解析はやり直しません。中身が違うフォルダを選ぶと、タグが別の画像に付いてしまうので気をつけてください。")
+                   .c_str(),
+               L"調べるフォルダの場所を付け替える", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    Db* db = uiDb();
+    if (!db) return;
+    try {
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        const size_t n = moveRootPaths(*db, narrow(from), narrow(to));
+        logs::info("調べるフォルダを付け替えた（手で）: " + narrow(from) + " → " + narrow(to) + "（画像 " + std::to_string(n) + " 枚）");
+        replaceRoot(from, to);
+        saveSettings();
+        app.infoCache.clear();
+        if (ex.view) ex.view->RefreshStates();
+        logBox(app.hwnd, (withCommas(n) + L" 枚のパスを付け替えました。").c_str(), L"調べるフォルダの場所を付け替える", MB_ICONINFORMATION);
+    } catch (const std::exception& e) {
+        logBox(app.hwnd, (L"付け替えられませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+    }
+}
+
 // 「調べるフォルダを外す」: 今の調べるフォルダをメニューに並べて、選んだものを外す
 void removeRootMenu() {
     const auto f = folderList();
@@ -6840,6 +6956,8 @@ const wchar_t* commandHelp(int id) {
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
         case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（バックグラウンドの解析が行います）";
+        case CMD_REMAP_ROOT:
+            return L"ドライブレターやフォルダの名前が変わった調べるフォルダを、新しい場所に付け替えます（作ったタグ・CLIP などはそのまま引き継ぎ、解析をやり直しません）";
         case CMD_ARCHIVE: return L"見つからなくなった画像（消した・動かした・ゴミ箱を空にした）のタグ・CLIP などを保管してあります。一覧を見て、要らないものを消せます";
         case CMD_REFRESH: return L"画面の控え（フォルダの中身・サムネイル・画像の情報）を捨てて、今の場所を読み直します。移動したファイルが残っている時など（Ctrl+F5）。"
                                  L"バックグラウンドの解析はしません（要る時はタスクトレイの解析から）";
@@ -6977,7 +7095,7 @@ void appendMainMenus(HMENU root) {
         }
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
-    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, 0, CMD_EXPORT, 0, CMD_EXIT});
+    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, CMD_REMAP_ROOT, 0, CMD_EXPORT, 0, CMD_EXIT});
     popup(L"表示(&V)", {CMD_REFRESH, 0, CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
@@ -7199,6 +7317,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case CMD_REMOVE_FOLDER:
                     if (!app.running) removeRootMenu();
+                    break;
+                case CMD_REMAP_ROOT:
+                    if (!app.running) remapRootUi();
                     break;
                 case CMD_SCAN_FOLDER:
                 case CMD_SCAN_FOLDER_TOP: {
@@ -7448,6 +7569,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 ex.view->SetSameStatus(*text);
             }
+            return 0;
+        }
+        case WM_APP_REMAP: {
+            std::unique_ptr<std::vector<std::pair<std::wstring, std::wstring>>> remaps(
+                reinterpret_cast<std::vector<std::pair<std::wstring, std::wstring>>*>(lp));
+            std::wstring msg;
+            for (const auto& [from, to] : *remaps) {
+                replaceRoot(from, to);
+                msg += (msg.empty() ? L"" : L"、") + from + L" → " + to;
+            }
+            saveSettings();
+            if (ex.view) ex.view->SetSameStatus(L"ドライブレターが変わった調べるフォルダを付け替えました（解析はやり直しません）: " + msg);
             return 0;
         }
         case WM_APP_OFFLINE:
@@ -8004,7 +8137,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     for (const auto& f : argFolders) addFolder(f);
     const bool autoStart = ListBox_GetCount(app.folders) > 0;
     if (!autoStart)
-        for (const auto& f : loadFolders()) addFolder(f);
+        for (const auto& f : loadFolders()) addFolder(f, false);  // 見つからないフォルダ（外したドライブ）も一覧に残す
     const int t = std::clamp(iniInt(L"threshold", kDefaultThreshold), 0, kMaxThreshold);
     SendMessageW(app.threshold, TBM_SETPOS, TRUE, t);
     setText(app.thresholdLabel, thresholdText(t));
