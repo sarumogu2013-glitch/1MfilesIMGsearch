@@ -524,7 +524,7 @@ void setScanExcludes(const std::vector<std::string>& dirs) {
 
 bool isSystemDirName(const std::wstring& name) {
     return _wcsicmp(name.c_str(), L"$Recycle.Bin") == 0 || _wcsicmp(name.c_str(), L"System Volume Information") == 0 ||
-           _wcsicmp(name.c_str(), L"RECYCLER") == 0;
+           _wcsicmp(name.c_str(), L"RECYCLER") == 0 || _wcsicmp(name.c_str(), L".imgdupe") == 0;  // .imgdupe: ドライブの正本
 }
 
 bool inSystemDir(const std::wstring& path) {

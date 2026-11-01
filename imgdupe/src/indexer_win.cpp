@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <ctime>
+#include <stdexcept>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -83,7 +85,7 @@ struct Resident {
     NOTIFYICONDATAW nid{};
     std::wstring dataDir;
 
-    std::thread worker, watcher;
+    std::thread worker, watcher, drives;
     std::mutex m;
     std::condition_variable cv;
     std::atomic<bool> quit{false}, paused{false}, cancelRun{false}, running{false};
@@ -239,6 +241,31 @@ void watchLoop() {
             }
         }
         for (HANDLE h : handles) FindCloseChangeNotification(h);
+    }
+}
+
+// ---------------------------------------------------------------- ドライブの正本
+
+// 10 分ごとに、つながっているドライブの正本と合わせて、変わった分を書き戻す（最初は起動して 1 分後）
+void driveLoop() {
+    ULONGLONG next = GetTickCount64() + 60 * 1000;
+    while (!g->quit) {
+        {
+            std::unique_lock<std::mutex> lock(g->m);
+            g->cv.wait_for(lock, std::chrono::seconds(5), [] { return g->quit.load(); });
+        }
+        if (g->quit || GetTickCount64() < next) continue;
+        next = GetTickCount64() + 10 * 60 * 1000;
+        std::vector<std::wstring> roots;
+        {
+            std::lock_guard<std::mutex> lock(g->m);
+            roots = g->roots;
+        }
+        try {
+            syncDrives(g->dataDir, roots, true, &g->quit);
+        } catch (const std::exception& e) {
+            logs::error(std::string("ドライブの正本に書き戻せなかった: ") + e.what());
+        }
     }
 }
 
@@ -1297,6 +1324,7 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
     SetTimer(r.hwnd, kTipTimer, 1000, nullptr);
     r.worker = std::thread(workLoop);
     r.watcher = std::thread(watchLoop);
+    r.drives = std::thread(driveLoop);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -1308,11 +1336,88 @@ int runResident(HINSTANCE inst, const std::wstring& dataDir, bool waitForOld) {
     r.cv.notify_all();
     if (r.worker.joinable()) r.worker.join();
     if (r.watcher.joinable()) r.watcher.join();
+    if (r.drives.joinable()) r.drives.join();
     g = nullptr;
     logwin::stop();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     return 0;
+}
+
+std::vector<imgdupe::DriveRef> masterDrives(const std::vector<std::wstring>& roots) {
+    std::vector<imgdupe::DriveRef> out;
+    wchar_t win[MAX_PATH] = L"";
+    GetSystemWindowsDirectoryW(win, MAX_PATH);
+    const wchar_t sys = static_cast<wchar_t>(towupper(win[0]));
+    std::vector<wchar_t> seen;
+    for (const auto& r : roots) {
+        if (r.size() < 2 || r[1] != L':') continue;
+        const wchar_t letter = static_cast<wchar_t>(towupper(r[0]));
+        if (letter == sys || std::find(seen.begin(), seen.end(), letter) != seen.end()) continue;
+        seen.push_back(letter);
+        const std::wstring root = std::wstring(1, letter) + L":\\";
+        const UINT type = GetDriveTypeW(root.c_str());
+        if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) continue;  // ネットワーク・CD などには置かない
+        wchar_t label[MAX_PATH + 1] = L"";
+        DWORD serial = 0;
+        if (!GetVolumeInformationW(root.c_str(), label, MAX_PATH + 1, &serial, nullptr, nullptr, nullptr, 0)) continue;  // つながっていない
+        const std::wstring dir = root + widen(imgdupe::kMasterDirName);
+        if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) continue;  // 書けない
+        SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_HIDDEN);
+        out.push_back({narrow(root), static_cast<uint32_t>(serial), narrow(label)});
+    }
+    return out;
+}
+
+int syncDrives(const std::wstring& dataDir, const std::vector<std::wstring>& roots, bool writeback, const std::atomic<bool>* cancel) {
+    HANDLE mx = CreateMutexW(nullptr, FALSE, L"Local\\imgdupe-drivestore");
+    if (mx) WaitForSingleObject(mx, INFINITE);
+    int conflicts = 0;
+    try {
+        Db db;
+        if (!db.open(dbFileOf(dataDir))) throw std::runtime_error(db.error());
+        const std::string vec = narrow(clip::vectorPath(dataDir));
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        std::vector<imgdupe::DriveRef> ok;
+        std::vector<int64_t> seen;
+        for (const auto& d : masterDrives(roots)) {
+            try {
+                const imgdupe::DriveSyncResult r = imgdupe::syncDriveOnConnect(db, d, vec, now);
+                seen.push_back(r.driveRow);
+                if (r.kind == imgdupe::DriveSync::Conflict) {
+                    ++conflicts;
+                    continue;
+                }
+                if (r.kind == imgdupe::DriveSync::Imported)
+                    logs::info("ドライブ " + d.root + " の正本から読み戻した（画像 " + std::to_string(r.imported) + " 枚）");
+                ok.push_back(d);
+            } catch (const std::exception& e) {
+                logs::warn("ドライブ " + d.root + " の正本を開けなかった: " + e.what());
+                imgdupe::markWritebackFailed(db, d.root, now);
+            }
+        }
+        imgdupe::markDrivesSeen(db, seen, now);
+        if (writeback && !ok.empty()) {
+            for (const auto& r : imgdupe::writebackDrives(db, ok, vec, now, cancel)) {
+                if (r.failed) logs::warn("ドライブ " + r.root + " の正本に書き戻せなかった: " + r.error);
+                else if (r.images || r.removed || r.vectors)
+                    logs::info("ドライブ " + r.root + " の正本に書き戻した: 画像 " + std::to_string(r.images) + " 枚・消えた " +
+                               std::to_string(r.removed) + "・CLIP " + std::to_string(r.vectors));
+                if (r.conflict) ++conflicts;
+            }
+        }
+    } catch (...) {
+        if (mx) {
+            ReleaseMutex(mx);
+            CloseHandle(mx);
+        }
+        throw;
+    }
+    if (mx) {
+        ReleaseMutex(mx);
+        CloseHandle(mx);
+    }
+    return conflicts;
 }
 
 bool isRunning() {

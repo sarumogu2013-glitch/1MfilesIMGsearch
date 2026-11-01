@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "drivestore.hpp"
+
 namespace indexer {
 
 // 常駐を始める（すでに動いていれば何もせず 0）。dataDir: DB とパックの場所。
@@ -33,6 +35,13 @@ void setRoots(const std::wstring& dataDir, const std::vector<std::wstring>& root
 void addScanTask(const std::wstring& dataDir, const std::wstring& label, const std::vector<std::wstring>& paths, bool top);
 // GUI から: タスクトレイの状況の窓を「タスク」の表示で出してもらう
 void requestShowTasks(const std::wstring& dataDir);
+
+// ドライブの正本（データ保護の実装仕様 3）: 調べるフォルダのあるドライブのうち、正本を置けるもの
+// （システムのドライブ・ネットワーク・CD などと、直下に書けないドライブは除く。<ドライブ>:\.imgdupe を作って隠す）
+std::vector<imgdupe::DriveRef> masterDrives(const std::vector<std::wstring>& roots);
+// つながっているドライブの正本と合わせ（無ければ作る・クローンが無ければ読み戻す・食い違いの印）、writeback なら書き戻す。
+// 解析と画面が同時にしないよう、名前付きのミューテックスで順番にする。食い違っているドライブの数を返す
+int syncDrives(const std::wstring& dataDir, const std::vector<std::wstring>& roots, bool writeback, const std::atomic<bool>* cancel);
 
 // 処理の負荷（imgdupe.ini の indexerLoad）。GUI の設定の画面とタスクトレイのメニューで変える
 enum LoadLevel : int {

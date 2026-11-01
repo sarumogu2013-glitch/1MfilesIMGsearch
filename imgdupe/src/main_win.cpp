@@ -99,13 +99,15 @@ constexpr UINT WM_APP_QUERY_VEC = WM_APP + 12;   // lParam: QueryVector*（似�
 constexpr UINT WM_APP_QUERY_TAGS = WM_APP + 13;  // lParam: QueryTagsDone*（生成したタグ）
 constexpr UINT WM_APP_CONVERT = WM_APP + 14;     // lParam: std::wstring*（DB の変換の様子。空なら済んだ）
 constexpr UINT WM_APP_PROGRESS = WM_APP + 56;  // lParam: ProgressDone*（詳細表示のインデックスの進み具合）
+constexpr UINT WM_APP_DRIVES = WM_APP + 59;   // ドライブの正本と合わせ終えた（食い違い・片付け・書き戻しの失敗を見る）
 constexpr UINT WM_APP_REMAP = WM_APP + 58;    // lParam: std::vector<std::pair<std::wstring, std::wstring>>*（付け替えた調べるフォルダ）
 constexpr UINT WM_APP_OFFLINE = WM_APP + 57;  // wParam: 外してある印を付け直した数（-1 = もう一度やり直す）
 constexpr UINT WM_APP_SOURCES = WM_APP + 10;        // lParam: std::vector<std::pair<std::string, int64_t>>*（出どころの数）
 constexpr UINT_PTR kProgressTimer = 1;
 constexpr UINT_PTR kSearchTimer = 3;
 constexpr UINT_PTR kExitTimer = 2;
-constexpr UINT_PTR kSameTimer = 4;  // エクスプローラーで画像を選んでから、少し待って同じ画像を探す
+constexpr UINT_PTR kSameTimer = 4;
+constexpr UINT_PTR kDriveTimer = 5;  // 10 分ごとにドライブの正本と合わせる（解析が動いていなければ書き戻しも）  // エクスプローラーで画像を選んでから、少し待って同じ画像を探す
 constexpr UINT kExitCheckTimeoutMs = 20000;  // 終了時の確認を待つのはここまで
 
 enum CheckMode : WPARAM { kManual = 0, kOnExit = 1 };
@@ -469,7 +471,8 @@ void refreshOfflineAsync() {
     roots.push_back(clip::refsDir(app.dataDir));  // 見本画像のフォルダも調べるフォルダ（解析と同じ）
     const std::string db = narrow(dbPath());
     HWND hwnd = app.hwnd;
-    std::thread([roots, db, hwnd] {
+    const std::wstring dataDir = app.dataDir;
+    std::thread([roots, db, hwnd, dataDir] {
         WPARAM changed = 0;
         try {
             std::vector<std::string> online;
@@ -508,6 +511,12 @@ void refreshOfflineAsync() {
             }
             if (remaps->empty() || !PostMessageW(hwnd, WM_APP_REMAP, 0, reinterpret_cast<LPARAM>(remaps))) delete remaps;
             changed = updateOffline(d, online);
+            d.close();
+            // ドライブの正本と合わせる（つないだ時に読み戻す・食い違いに気づく。解析が動いていなければ書き戻しも）
+            std::vector<std::wstring> now;
+            for (const auto& o : online) now.push_back(widen(o));
+            indexer::syncDrives(dataDir, now, !indexer::isRunning(), nullptr);
+            PostMessageW(hwnd, WM_APP_DRIVES, 0, 0);
             if (changed) logs::info("外してある画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
         } catch (const std::exception& e) {
             logs::warn(std::string("外してある画像の印を付け直せなかった: ") + e.what());
@@ -516,6 +525,134 @@ void refreshOfflineAsync() {
         if (offlineAgain.exchange(false)) changed = static_cast<WPARAM>(-1);
         PostMessageW(hwnd, WM_APP_OFFLINE, changed, 0);
     }).detach();
+}
+
+Db* uiDb();
+std::wstring withCommas(uint64_t v);
+void refreshSearchIfShown();
+
+// 10 分ごと: ドライブの正本と合わせる（解析が動いていれば、書き戻しは解析がする）
+std::atomic<bool> driveBusy{false};
+void driveSyncAsync() {
+    if (driveBusy.exchange(true)) return;
+    auto roots = folderList();
+    const std::wstring dataDir = app.dataDir;
+    HWND hwnd = app.hwnd;
+    std::thread([roots, dataDir, hwnd] {
+        try {
+            indexer::syncDrives(dataDir, roots, !indexer::isRunning(), nullptr);
+        } catch (const std::exception& e) {
+            logs::warn(std::string("ドライブの正本と合わせられなかった: ") + e.what());
+        }
+        driveBusy = false;
+        PostMessageW(hwnd, WM_APP_DRIVES, 0, 0);
+    }).detach();
+}
+
+std::wstring unixDateText(int64_t t) {
+    if (t <= 0) return L"なし";
+    const time_t tt = static_cast<time_t>(t);
+    struct tm lt;
+    localtime_s(&lt, &tt);
+    wchar_t buf[40];
+    swprintf(buf, 40, L"%04d/%02d/%02d %02d:%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+    return buf;
+}
+
+// ドライブの正本の様子を見て、要るなら聞く: 食い違い（どちらを使うか）・12 時間以上の書き戻しの失敗・外して 1 日たったクローンの片付け
+void checkDrivesUi() {
+    static bool busy = false;
+    static std::set<int64_t> failNotified;
+    if (busy) return;
+    Db* db = uiDb();
+    if (!db) return;
+    busy = true;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const std::string arc = archiveFileOf(narrow(app.dataDir));
+    const std::string vec = narrow(clip::vectorPath(app.dataDir));
+    std::vector<DriveRow> rows;
+    try {
+        rows = driveRows(*db);
+    } catch (const std::exception&) {
+    }
+    const DWORD present = GetLogicalDrives();
+    auto letterPresent = [&](const std::string& root) {
+        return root.size() >= 2 && root[1] == ':' && (present & (1u << (std::toupper(static_cast<unsigned char>(root[0])) - 'A')));
+    };
+    auto name = [](const DriveRow& r) {
+        return widen(r.root) + (r.label.empty() ? L"" : L"（" + widen(r.label) + L"）") + L" シリアル番号 " +
+               std::to_wstring(r.serial);
+    };
+    bool changed = false;
+    for (const DriveRow& r : rows) {
+        try {
+            const DriveRef ref{r.root, r.serial, r.label};
+            if (r.conflict && r.goneSince == 0) {
+                // 食い違い: 正本とクローンを見比べて選んでもらう
+                const DriveSide m = masterSide(*db, ref), c = cloneSide(*db, r.root);
+                auto side = [](const DriveSide& s) {
+                    wchar_t pct[16];
+                    swprintf(pct, 16, L"%d%%", static_cast<int>(s.progress * 100));  // 切り捨て（全部済むまで 100% にしない）
+                    return L"  タガーの版: " + (s.taggerVersion ? std::to_wstring(s.taggerVersion) : std::wstring(L"なし")) + L"\n  対象の枚数: " +
+                           withCommas(static_cast<uint64_t>(s.images)) + L" 枚\n  作成の進み具合: " + pct + L"\n  作り終えた枚数: " +
+                           withCommas(static_cast<uint64_t>(s.complete)) + L" 枚\n  最後に書いた日時: " + unixDateText(s.updated);
+                };
+                const std::wstring msg = L"ドライブ " + name(r) +
+                                         L" の正本（ドライブの中の DB）と、この PC の DB が食い違っています（別の PC で使った・書き戻す前に抜いた など）。\n\n"
+                                         L"■ ドライブの正本\n" + side(m) + L"\n\n■ この PC の DB（クローン）\n" + side(c) +
+                                         L"\n\nはい: ドライブの正本を使う（この PC の側は保管へ移す）\nいいえ: この PC の DB を使う（正本は保管のフォルダに写して残す）\n"
+                                         L"キャンセル: 後で決める（その間、このドライブには書き戻しません）";
+                const int a = logBox(app.hwnd, msg.c_str(), L"ドライブの正本が食い違っています", MB_YESNOCANCEL | MB_ICONWARNING);
+                if (a == IDYES || a == IDNO) {
+                    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+                    resolveConflict(*db, ref, a == IDYES, arc, vec, now);
+                    changed = true;
+                }
+                continue;
+            }
+            if (r.failSince && r.goneSince == 0 && now - r.failSince >= 12 * 3600 && !failNotified.count(r.id)) {
+                failNotified.insert(r.id);
+                const std::wstring msg = L"ドライブ " + name(r) + L" の正本に、" + unixDateText(r.failSince) +
+                                         L" から 12 時間以上書き戻せていません（ドライブがいっぱい・読み取り専用・権限が無い など）。\n\n"
+                                         L"この PC の DB には残っています。ドライブの空きや設定を確かめてください。";
+                if (ex.view) ex.view->SetSameStatus(L"ドライブ " + widen(r.root) + L" の正本に 12 時間以上書き戻せていません");
+                logBox(app.hwnd, msg.c_str(), L"ドライブの正本への書き戻しの失敗", MB_ICONWARNING);
+                continue;
+            }
+            if (r.goneSince && !r.cloneDeleted && now - r.goneSince >= 24 * 3600 && now >= r.snoozeUntil && r.cloneImages > 0 &&
+                !letterPresent(r.root)) {
+                // 外して 1 日: クローンを消すか聞く（書き戻しの様子を見せる）
+                std::wstring msg = L"ドライブ " + name(r) + L" が " + unixDateText(r.goneSince) +
+                                   L" から見つかりません。この PC の DB にある、このドライブの分（クローン）を消しますか？\n"
+                                   L"（正本はドライブにあるので、つなぎ直せば読み戻します）\n\n■ 書き戻しの様子\n  最後に見えたドライブレター: " +
+                                   widen(r.root) + L"\n  見つからなくなった日時: " + unixDateText(r.goneSince) + L"\n  最後に書き戻した日時: " +
+                                   unixDateText(r.lastWriteback) + L"\n  クローンの画像: " + withCommas(static_cast<uint64_t>(r.cloneImages)) +
+                                   L" 枚\n  書き戻していない画像: " + withCommas(static_cast<uint64_t>(r.unwritten)) + L" 枚" +
+                                   (r.unwritten ? L"（消す前に保管へ移します）" : L"") + L"\n  12 時間以上の書き戻しの失敗: " +
+                                   (r.failSince && r.goneSince - r.failSince >= 12 * 3600 ? L"あり（" + unixDateText(r.failSince) + L" から）" : L"なし") +
+                                   L"\n\nはい: 消す\nいいえ: 残す（1 日後にまた聞きます）";
+                const int a = logBox(app.hwnd, msg.c_str(), L"外したドライブのクローンの片付け", MB_YESNO | MB_ICONQUESTION);
+                if (a == IDYES) {
+                    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+                    const size_t n = deleteClone(*db, r.id, arc, vec);
+                    logBox(app.hwnd, (L"クローンを消しました（" + withCommas(n) + L" 枚）。").c_str(), L"外したドライブのクローンの片付け",
+                           MB_ICONINFORMATION);
+                    changed = true;
+                } else {
+                    snoozeDrive(*db, r.id, now + 24 * 3600);
+                }
+            }
+        } catch (const std::exception& e) {
+            logBox(app.hwnd, (L"ドライブの正本を扱えませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        }
+    }
+    busy = false;
+    if (changed) {
+        app.infoCache.clear();
+        if (ex.view) ex.view->RefreshStates();
+        refreshSearchIfShown();
+        driveSyncAsync();  // 選んだ結果をすぐ正本に書く
+    }
 }
 
 void saveSettings() {
@@ -7540,6 +7677,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kProgressTimer) updateProgress();
             if (wp == kSearchTimer) runSearch(true);
+            if (wp == kDriveTimer) driveSyncAsync();
             if (wp == kSameTimer) {
                 KillTimer(hwnd, kSameTimer);
                 if (!ex.pendingSel.empty()) ex.ExplorerFindSameFile(ex.pendingSel);
@@ -7571,6 +7709,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_APP_DRIVES:
+            checkDrivesUi();
+            return 0;
         case WM_APP_REMAP: {
             std::unique_ptr<std::vector<std::pair<std::wstring, std::wstring>>> remaps(
                 reinterpret_cast<std::vector<std::pair<std::wstring, std::wstring>>*>(lp));
@@ -8167,6 +8308,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     loadTagLabels();
     syncMenuChecks();
     refreshOfflineAsync();  // 外したドライブの画像を検索などに出さない（起動した時のつながり方で）
+    SetTimer(hwnd, kDriveTimer, 10 * 60 * 1000, nullptr);
     switchTab(std::clamp(iniInt(L"tab", 2), 0, 3));
     UpdateWindow(hwnd);
     if (autoStart) startSearch(L"");

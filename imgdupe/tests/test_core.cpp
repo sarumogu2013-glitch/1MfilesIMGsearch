@@ -11,6 +11,7 @@
 
 #include "analyzer.hpp"
 #include "archive.hpp"
+#include "drivestore.hpp"
 #include "commands.hpp"
 #include "db.hpp"
 #include "indexer.hpp"
@@ -912,6 +913,134 @@ static void testMoveCarry() {
     }
     CHECK(moveRootPaths(d, "G:\\none", "H:\\none") == 0);
     d.close();
+    fs::remove_all(dir);
+}
+
+
+// データ保護の 3 回目: ドライブの正本（ドライブの代わりに一時フォルダを使う。パスは "Q:" で始まる形にして、正本のフォルダだけ差し替える）
+static void testDriveStore() {
+    CHECK(relativeOnDrive("E:\\a\\b.jpg") == "\\a\\b.jpg" && pathOnDrive("F:\\", "\\a\\b.jpg") == "F:\\a\\b.jpg");
+    CHECK(driveRootOf("e:\\x.jpg") == "E:\\" && driveRootOf("/x.jpg").empty());
+    CHECK(masterFileOf("E:\\") == "E:\\.imgdupe\\drive.db");
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-drives";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    // ホストのテストでは、ドライブの直下 = dir/"Q:\\"（名前に : と \\ を含むフォルダ）。masterFileOf("Q:\\") がそのまま使える
+    const std::string root = (dir / "Q:\\").string();
+    const std::string qroot = "Q:\\";
+    Db d;
+    CHECK(d.open((dir / "imgdupe.db").string()));
+    auto ids = upsertScanned(d, {{"Q:\\pics\\a.jpg", 10, 1}, {"Q:\\pics\\b.jpg", 20, 1}, {"R:\\c.jpg", 30, 1}});
+    const int64_t a = ids["Q:\\pics\\a.jpg"], b = ids["Q:\\pics\\b.jpg"];
+    d.begin();
+    {
+        TagWriter w(d, TagConflict::Replace);
+        w.put(a, "long_hair", "general", 0.9, "tagger", false);
+        w.put(a, "from_folder", "general", 0.8, "folder", false);
+    }
+    d.commit();
+    setManualTag(d, b, "miku", true);
+    d.exec(("INSERT INTO stages(image_id,stage,state,version,updated) VALUES(" + std::to_string(a) + ",'tagger',1,7,100),(" +
+            std::to_string(a) + ",'clip',1,3,100)").c_str());
+    const std::string vec = (dir / "vectors_clip.bin").string();
+    {
+        VectorWriter vw;
+        CHECK(vw.open(vec, 2, "clip-v3"));
+        const float v[2] = {1, 0};
+        vw.append(a, v);
+    }
+    // 作業の都合で、ドライブの直下を dir/"Q:\\" に置く: DriveRef.root は "Q:\\" のまま、正本のパスだけ差し替えたいので、
+    // masterFileOf と同じ形のフォルダを dir の下に作り、作業のフォルダを dir にして相対で開く
+    const fs::path cwd = fs::current_path();
+    fs::current_path(dir);
+    const DriveRef q{qroot, 1234, "テスト"};
+    DriveSyncResult r = syncDriveOnConnect(d, q, vec, 1000);
+    CHECK(r.kind == DriveSync::Created && r.driveRow > 0);
+    CHECK(fileSize(masterFileOf(qroot)) > 0);
+    // 書き戻し: Q: の 2 枚（タガーのタグ・手動の確定・段階・ベクトル）。R: は正本が無いので書かない
+    auto wb = writebackDrives(d, {q}, vec, 1100);
+    CHECK(wb.size() == 1 && !wb[0].failed && !wb[0].conflict && wb[0].images == 2 && wb[0].vectors == 1);
+    {
+        const DriveSide m = masterSide(d, q), c = cloneSide(d, qroot);
+        CHECK(m.exists && m.images == 2 && m.complete == 1 && m.taggerVersion == 7 && m.updated == 1100);
+        CHECK(c.images == 2 && c.complete == 1 && c.taggerVersion == 7);
+        CHECK(std::abs(m.progress - 0.5) < 1e-9 && std::abs(c.progress - 0.5) < 1e-9);
+    }
+    // 2 回目は書くものが無い
+    wb = writebackDrives(d, {q}, vec, 1200);
+    CHECK(wb[0].images == 0 && wb[0].vectors == 0);
+    // タグを変えると、その画像だけ書く。消すと正本からも消える
+    setManualTag(d, a, "smile", true);
+    wb = writebackDrives(d, {q}, vec, 1300);
+    CHECK(wb[0].images == 1);
+    // つなぎ直し: 合っている
+    r = syncDriveOnConnect(d, q, vec, 1400);
+    CHECK(r.kind == DriveSync::Same);
+    // 外して片付け: 書き戻していない分（b のタグを変えた）は保管へ、ほかは消える
+    markDrivesSeen(d, {}, 2000);
+    setManualTag(d, b, "unsaved", true);
+    auto rows = driveRows(d);
+    CHECK(rows.size() == 1 && rows[0].goneSince == 2000 && rows[0].cloneImages == 2 && rows[0].unwritten == 1 && rows[0].lastWriteback == 1300);
+    const std::string arc = archiveFileOf(dir.string());
+    CHECK(deleteClone(d, rows[0].id, arc, vec) == 2);
+    CHECK(imageCount(d) == 1 && archiveSummary(d, arc).images == 1);
+    CHECK(driveRows(d)[0].cloneDeleted);
+    // つなぎ直すと正本から読み戻す（タグ・手動の確定・段階。CLIP はベクトルも）
+    r = syncDriveOnConnect(d, q, vec, 3000);
+    CHECK(r.kind == DriveSync::Imported && r.imported == 2 && imageCount(d) == 3);
+    {
+        Stmt st(d.handle(), "SELECT id FROM images WHERE path='Q:\\pics\\a.jpg'");
+        CHECK(st.step());
+        const int64_t na = st.i64(0);
+        bool tagger = false, smile = false, folder = false;
+        for (const auto& t : tagsOf(d, na)) {
+            tagger |= t.tag == "long_hair" && t.source == "tagger";
+            smile |= t.tag == "smile" && t.manual;
+            folder |= t.source == "folder";
+        }
+        CHECK(tagger && smile && !folder);  // 作り直せるタグは守らない
+        Stmt sg(d.handle(), "SELECT count(*) FROM stages WHERE image_id=? AND stage IN ('tagger','clip')");
+        sg.bind(1, na);
+        CHECK(sg.step() && sg.i64(0) == 2);
+        VectorIndex vi;
+        CHECK(vi.load(vec) && vi.has(na));
+    }
+    CHECK(driveRows(d)[0].unwritten == 0);  // 読み戻した分は書き戻さない
+    // 別の所で正本が書き換わった: 食い違い（書き戻さない）
+    {
+        Db other;
+        CHECK(other.open((dir / "other.db").string()));
+        other.exec(("ATTACH DATABASE '" + masterFileOf(qroot) + "' AS x").c_str());
+        other.exec("UPDATE x.meta SET value=value+5 WHERE key='seq'");
+        other.exec("DETACH DATABASE x");
+    }
+    r = syncDriveOnConnect(d, q, vec, 4000);
+    CHECK(r.kind == DriveSync::Conflict);
+    wb = writebackDrives(d, {q}, vec, 4100);
+    CHECK(wb[0].conflict);
+    // この PC の側を使う: 正本は写して残し、作り直す
+    resolveConflict(d, q, false, arc, vec, 4200);
+    CHECK(!driveRows(d)[0].conflict);
+    wb = writebackDrives(d, {q}, vec, 4300);
+    CHECK(!wb[0].conflict && wb[0].images == 2 && wb[0].vectors >= 1);
+    bool copied = false;
+    for (const auto& e : fs::directory_iterator(fs::path(arc).parent_path())) copied |= e.path().filename().string().rfind("drive-Q-", 0) == 0;
+    CHECK(copied);
+    // ドライブの正本を使う: この PC の側は保管へ、正本から読み戻す
+    {
+        Db other;
+        CHECK(other.open((dir / "other.db").string()));
+        other.exec(("ATTACH DATABASE '" + masterFileOf(qroot) + "' AS x").c_str());
+        other.exec("UPDATE x.meta SET value=value+1 WHERE key='seq'");
+        other.exec("DETACH DATABASE x");
+    }
+    CHECK(syncDriveOnConnect(d, q, vec, 5000).kind == DriveSync::Conflict);
+    const int64_t before = archiveSummary(d, arc).images;
+    resolveConflict(d, q, true, arc, vec, 5100);
+    CHECK(archiveSummary(d, arc).images == before + 2 && imageCount(d) == 3);
+    CHECK(syncDriveOnConnect(d, q, vec, 5200).kind == DriveSync::Same);
+    d.close();
+    fs::current_path(cwd);
     fs::remove_all(dir);
 }
 
@@ -3429,6 +3558,7 @@ int main() {
     testScanTasks();
     testArchive();
     testMoveCarry();
+    testDriveStore();
     testMeta();
     testSearch();
     testLinks();

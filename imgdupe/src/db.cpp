@@ -294,6 +294,60 @@ CREATE TABLE IF NOT EXISTS infer_dirs(
 const char* const kSchemaV13Columns[] = {"images.offline INTEGER NOT NULL DEFAULT 0"};
 const char* const kSchemaV13 = "SELECT 1;";
 
+// 版 14: ドライブの正本（データ保護の実装仕様 3）。drives: 正本のあるドライブ（drive_id は正本の中の番号）。
+// dirty_*: 正本へまだ書き戻していない変更（画像の行・守るタグ・段階は dirty_images、消えた・動かしたパスは dirty_removed、
+// CLIP のベクトルを書けなかった画像は dirty_vectors）。最初は全部の画像を書き戻す（今の DB から正本を作る）
+const char* const kSchemaV14 = R"SQL(
+CREATE TABLE IF NOT EXISTS drives(
+    id INTEGER PRIMARY KEY,
+    drive_id TEXT NOT NULL UNIQUE,
+    serial INTEGER,
+    root TEXT,
+    label TEXT,
+    last_seen INTEGER NOT NULL DEFAULT 0,
+    gone_since INTEGER NOT NULL DEFAULT 0,
+    last_writeback INTEGER NOT NULL DEFAULT 0,
+    fail_since INTEGER NOT NULL DEFAULT 0,
+    master_seq INTEGER NOT NULL DEFAULT 0,
+    clone_deleted INTEGER NOT NULL DEFAULT 0,
+    snooze_until INTEGER NOT NULL DEFAULT 0,
+    conflict INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS dirty_images(image_id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS dirty_removed(path TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS dirty_vectors(image_id INTEGER PRIMARY KEY);
+-- 中の INSERT は OR IGNORE にしない（外の文の ON CONFLICT が中にも効いてしまうので、重ならないように NOT EXISTS で）
+CREATE TRIGGER IF NOT EXISTS images_dirty_ins AFTER INSERT ON images BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS images_dirty_upd AFTER UPDATE OF path ON images WHEN NEW.path <> OLD.path BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.id);
+    INSERT INTO dirty_removed(path) SELECT OLD.path WHERE NOT EXISTS (SELECT 1 FROM dirty_removed WHERE path = OLD.path);
+END;
+CREATE TRIGGER IF NOT EXISTS images_dirty_del AFTER DELETE ON images BEGIN
+    DELETE FROM dirty_images WHERE image_id = OLD.id;
+    DELETE FROM dirty_vectors WHERE image_id = OLD.id;
+    INSERT INTO dirty_removed(path) SELECT OLD.path WHERE NOT EXISTS (SELECT 1 FROM dirty_removed WHERE path = OLD.path);
+END;
+CREATE TRIGGER IF NOT EXISTS tag_rows_dirty_ins AFTER INSERT ON tag_rows BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.image_id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS tag_rows_dirty_upd AFTER UPDATE ON tag_rows BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.image_id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS tag_rows_dirty_del AFTER DELETE ON tag_rows BEGIN
+    INSERT INTO dirty_images(image_id) SELECT OLD.image_id WHERE EXISTS (SELECT 1 FROM images WHERE id = OLD.image_id)
+        AND NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = OLD.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS stages_dirty_ins AFTER INSERT ON stages WHEN NEW.stage IN ('tagger', 'clip') BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.image_id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.image_id);
+END;
+CREATE TRIGGER IF NOT EXISTS stages_dirty_upd AFTER UPDATE ON stages WHEN NEW.stage IN ('tagger', 'clip') BEGIN
+    INSERT INTO dirty_images(image_id) SELECT NEW.image_id WHERE NOT EXISTS (SELECT 1 FROM dirty_images WHERE image_id = NEW.image_id);
+END;
+INSERT OR IGNORE INTO dirty_images(image_id) SELECT id FROM images;
+)SQL";
+
 const char* const kSchemaV12 = R"SQL(
 CREATE TABLE IF NOT EXISTS tag_keys(
     id INTEGER PRIMARY KEY,
@@ -447,7 +501,7 @@ bool Db::migrate() {
     }
     if (v == kSchemaVersion) return true;
     // 版ごとの変更を順に当てる（版を足す時は、ここに 1 行足す）
-    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11, kSchemaV12, kSchemaV13};
+    const char* const steps[] = {kSchemaV1, kSchemaV2, kSchemaV3, kSchemaV4, kSchemaV5, kSchemaV6, kSchemaV7, kSchemaV8, kSchemaV9, kSchemaV10, kSchemaV11, kSchemaV12, kSchemaV13, kSchemaV14};
     if (!exec("BEGIN IMMEDIATE")) return false;
     for (int i = v; i < kSchemaVersion; ++i) {
         std::vector<const char*> columns;  // 無ければ足す列（ALTER TABLE は 2 回当てられないので確かめてから）

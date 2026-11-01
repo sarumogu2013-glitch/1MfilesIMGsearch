@@ -9,7 +9,7 @@ mkdir -p out
 
 # SQLite（third_party/sqlite のアマルガメーション）。大きいので、ソースが変わった時だけコンパイルする
 SQLITE_FLAGS="-O2 -DSQLITE_THREADSAFE=1 -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
-  -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0"
+  -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0 -DSQLITE_MAX_ATTACHED=30"
 sqlite_obj() {  # $1: C コンパイラ, $2: 出力（ソースかフラグが変わった時だけ作り直す）
   if [ ! -f "$2" ] || [ third_party/sqlite/sqlite3.c -nt "$2" ] || [ "$(cat "$2.flags" 2>/dev/null)" != "$SQLITE_FLAGS" ]; then
     echo "SQLite をコンパイルしています ($2)"
@@ -19,7 +19,7 @@ sqlite_obj() {  # $1: C コンパイラ, $2: 出力（ソースかフラグが�
   fi
 }
 
-CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/search.cpp src/json.cpp src/update_logic.cpp src/commands.cpp src/links.cpp src/names.cpp src/models.cpp src/tagger.cpp src/vectors.cpp src/clip.cpp src/ann.cpp src/dict.cpp src/refs.cpp src/tagrel.cpp src/lookup.cpp src/stats.cpp src/quality.cpp src/sameimg.cpp src/tagnames.cpp src/log.cpp src/pathinfer.cpp src/tagstore.cpp src/archive.cpp"
+CORE_SRC="src/core.cpp src/db.cpp src/analyzer.cpp src/pack.cpp src/indexer.cpp src/meta.cpp src/search.cpp src/json.cpp src/update_logic.cpp src/commands.cpp src/links.cpp src/names.cpp src/models.cpp src/tagger.cpp src/vectors.cpp src/clip.cpp src/ann.cpp src/dict.cpp src/refs.cpp src/tagrel.cpp src/lookup.cpp src/stats.cpp src/quality.cpp src/sameimg.cpp src/tagnames.cpp src/log.cpp src/pathinfer.cpp src/tagstore.cpp src/archive.cpp src/drivestore.cpp"
 
 if [ "${1:-}" = "test" ]; then
   sqlite_obj "${CC:-gcc}" out/sqlite3_host.o
