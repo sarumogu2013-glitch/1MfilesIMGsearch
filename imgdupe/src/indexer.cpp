@@ -1,8 +1,10 @@
 #include "indexer.hpp"
 
 #include "archive.hpp"
+#include "drivestore.hpp"
 
 #include <algorithm>
+#include <map>
 #include <chrono>
 #include <ctime>
 #include <cstdio>
@@ -481,7 +483,13 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
     size_t carried = 0;
     if (!s.opt.archiveFile.empty()) {
         try {
-            const MoveReport mr = matchMovedImages(db, files, removable, s.opt.archiveFile, s.opt.vectorFile);
+            MoveReport mr = matchMovedImages(db, files, removable, s.opt.archiveFile, s.opt.vectorFile);
+            // つながっているドライブの保管からも戻す（ドライブの正本のフォルダの中の保管）
+            for (const auto& f : archiveFilesInUse(db, s.opt.archiveFile)) {
+                if (f == s.opt.archiveFile) continue;
+                const MoveReport more = matchMovedImages(db, files, {}, f, s.opt.vectorFile);
+                mr.restored += more.restored;
+            }
             carried = mr.moved + mr.restored;
             if (mr.moved) logs::info("動かした・名前を変えた画像 " + std::to_string(mr.moved) + " 枚を見つけて、解析の結果を引き継いだ");
             if (mr.restored) logs::info("保管にあった画像 " + std::to_string(mr.restored) + " 枚が戻ってきたので、保管から戻した");
@@ -496,9 +504,23 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
             removed = removeMissing(db, removable, ids);
         } else {
             // 消さずに保管へ移す（タガーのタグ・手動の確定・CLIP のベクトルを守る）
+            // 保管する所: そのドライブに正本があればドライブの保管（ドライブと一緒に残る）、なければこの PC の保管
             const std::vector<int64_t> gone = missingImages(db, removable, ids);
-            removed = archiveImages(db, s.opt.archiveFile, gone, s.opt.vectorFile, "見つからない");
-            if (removed) logs::info("見つからなくなった画像 " + std::to_string(removed) + " 枚を保管へ移した（" + s.opt.archiveFile + "）");
+            std::map<std::string, std::vector<int64_t>> byFile;
+            {
+                Stmt st(db.handle(), "SELECT path FROM images WHERE id=?");
+                for (int64_t id : gone) {
+                    st.bind(1, id);
+                    const std::string p = st.step() ? st.text(0) : std::string();
+                    st.reset();
+                    byFile[archiveFileForPath(db, p, s.opt.archiveFile)].push_back(id);
+                }
+            }
+            for (const auto& [file, list] : byFile) {
+                const size_t n = archiveImages(db, file, list, s.opt.vectorFile, "見つからない");
+                if (n) logs::info("見つからなくなった画像 " + std::to_string(n) + " 枚を保管へ移した（" + file + "）");
+                removed += n;
+            }
         }
     }
     s.rep.removed += removed;

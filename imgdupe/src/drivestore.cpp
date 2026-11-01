@@ -761,6 +761,33 @@ size_t deleteClone(Db& db, int64_t driveRow, const std::string& archiveFile, con
     return n + archived;
 }
 
+std::string driveArchiveFileOf(const std::string& driveRoot) {
+    std::string r = driveRoot;
+    if (!r.empty() && r.back() != '\\' && r.back() != '/') r += '\\';
+    return r + kMasterDirName + "\\archive.db";
+}
+
+std::string archiveFileForPath(Db& db, const std::string& path, const std::string& fallback) {
+    const std::string l = letterOf(path);
+    if (l.empty()) return fallback;
+    Stmt st(db.handle(), "SELECT root FROM drives WHERE upper(substr(root,1,2)) = ? AND gone_since=0 AND clone_deleted=0 AND conflict=0");
+    st.bind(1, l);
+    if (!st.step()) return fallback;
+    const std::string root = st.text(0);
+    return fileSize(masterFileOf(root)) > 0 ? driveArchiveFileOf(root) : fallback;
+}
+
+std::vector<std::string> archiveFilesInUse(Db& db, const std::string& fallback) {
+    std::vector<std::string> out;
+    if (fileSize(fallback) > 0) out.push_back(fallback);
+    Stmt st(db.handle(), "SELECT root FROM drives WHERE gone_since=0 ORDER BY root");
+    while (st.step()) {
+        const std::string f = driveArchiveFileOf(st.text(0));
+        if (fileSize(f) > 0 && std::find(out.begin(), out.end(), f) == out.end()) out.push_back(f);
+    }
+    return out;
+}
+
 void snoozeDrive(Db& db, int64_t driveRow, int64_t until) {
     Stmt st(db.handle(), "UPDATE drives SET snooze_until=? WHERE id=?");
     st.bind(1, until).bind(2, driveRow);

@@ -96,4 +96,11 @@ std::vector<DriveRow> driveRows(Db& db);
 size_t deleteClone(Db& db, int64_t driveRow, const std::string& archiveFile, const std::string& vectorFile);
 void snoozeDrive(Db& db, int64_t driveRow, int64_t until);
 
+// ドライブの保管（仕様 3.1）: <ドライブ>:\.imgdupe\archive.db。正本があってつながっているドライブの画像は、ここに保管する
+std::string driveArchiveFileOf(const std::string& driveRoot);
+// path の画像を保管する所（そのドライブに正本があってつながっていればドライブの保管、なければ fallback = この PC の保管）
+std::string archiveFileForPath(Db& db, const std::string& path, const std::string& fallback);
+// 今ある保管の全部（この PC の保管と、つながっているドライブの保管。ファイルがあるものだけ）
+std::vector<std::string> archiveFilesInUse(Db& db, const std::string& fallback);
+
 }  // namespace imgdupe

@@ -5586,11 +5586,12 @@ void archiveUi() {
                       h - 3 * m - px(44) - bh, WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT);
     addColumn(list, 0, L"保管した日時", px(130));
-    addColumn(list, 1, L"パス", px(400));
+    addColumn(list, 1, L"パス", px(320));
     addColumn(list, 2, L"大きさ", px(80));
     addColumn(list, 3, L"守ったタグ", px(70));
     addColumn(list, 4, L"CLIP", px(50));
     addColumn(list, 5, L"理由", px(70));
+    addColumn(list, 6, L"置き場", px(110));
     HWND del = child(WC_BUTTONW, L"選んだものを消す", WS_TABSTOP, ID_DELETE, m, h - m - bh, bw, bh);
     HWND old = child(WC_BUTTONW, L"古いものを消す…", WS_TABSTOP, ID_OLD, m + bw + px(8), h - m - bh, bw, bh);
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, w - m - px(100), h - m - bh, px(100), bh);
@@ -5598,18 +5599,40 @@ void archiveUi() {
     addTooltip(tip, old, L"指定した月数より前に保管したものを、まとめて消します（元に戻せません）");
 
     constexpr size_t kShow = 5000;  // 一覧に出す数（古い順）
+    // 保管はこの PC の分と、つながっているドライブの分（ドライブの正本のフォルダの中）
     std::vector<ArchivedImage> rows;
+    std::vector<std::string> rowFile;  // rows と同じ並びの、その行の保管のファイル
+    auto placeOf = [&](const std::string& f) {
+        return f == file ? std::wstring(L"この PC") : L"ドライブ " + widen(f.substr(0, 3));
+    };
     auto fill = [&] {
         ArchiveSummary sum;
+        rows.clear();
+        rowFile.clear();
+        std::wstring places;
         try {
-            sum = archiveSummary(*db, file);
-            rows = listArchived(*db, file, kShow);
+            std::vector<std::string> files = archiveFilesInUse(*db, file);
+            if (std::find(files.begin(), files.end(), file) == files.end()) files.insert(files.begin(), file);
+            std::vector<std::pair<ArchivedImage, std::string>> all;
+            for (const auto& f : files) {
+                const ArchiveSummary s1 = archiveSummary(*db, f);
+                sum.images += s1.images;
+                sum.fileBytes += s1.fileBytes;
+                if (s1.oldest && (!sum.oldest || s1.oldest < sum.oldest)) sum.oldest = s1.oldest;
+                if (s1.images) places += (places.empty() ? L"" : L"・") + placeOf(f) + L" " + withCommas(static_cast<uint64_t>(s1.images)) + L" 枚";
+                for (auto& r : listArchived(*db, f, kShow)) all.emplace_back(std::move(r), f);
+            }
+            std::stable_sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x.first.archived < y.first.archived; });
+            if (all.size() > kShow) all.resize(kShow);
+            for (auto& [r, f] : all) {
+                rows.push_back(std::move(r));
+                rowFile.push_back(f);
+            }
         } catch (const std::exception& e) {
-            rows.clear();
             setText(summary, L"保管の DB を読めませんでした: " + widen(e.what()));
         }
         std::wstring t = L"保管: " + withCommas(static_cast<uint64_t>(sum.images)) + L" 枚・ファイル " +
-                         sizeText(static_cast<uint64_t>(sum.fileBytes)) + L"（" + widen(file) + L"）";
+                         sizeText(static_cast<uint64_t>(sum.fileBytes)) + (places.empty() ? L"" : L"（" + places + L"）");
         if (sum.images) t += L"\r\n一番古いもの: " + dateText(sum.oldest) +
                              (sum.images > static_cast<int64_t>(kShow) ? L"。一覧には古い順に " + withCommas(kShow) + L" 件まで出します" : L"");
         else t += L"\r\n見つからなくなった画像（消した・動かした・ゴミ箱を空にした）は、ここに保管します（自動では消しません）";
@@ -5620,13 +5643,13 @@ void archiveUi() {
             const auto& r = rows[i];
             const std::wstring cells[] = {dateText(r.archived), widen(r.path),
                                           sizeText(static_cast<uint64_t>(r.size)), std::to_wstring(r.tags), r.vector ? L"あり" : L"",
-                                          widen(r.reason)};
+                                          widen(r.reason), placeOf(rowFile[i])};
             LVITEMW it{};
             it.mask = LVIF_TEXT;
             it.iItem = static_cast<int>(i);
             it.pszText = const_cast<wchar_t*>(cells[0].c_str());
             const int k = ListView_InsertItem(list, &it);
-            for (int c = 1; c < 6; ++c) ListView_SetItemText(list, k, c, const_cast<wchar_t*>(cells[c].c_str()));
+            for (int c = 1; c < 7; ++c) ListView_SetItemText(list, k, c, const_cast<wchar_t*>(cells[c].c_str()));
         }
         SendMessageW(list, WM_SETREDRAW, TRUE, 0);
     };
@@ -5650,14 +5673,19 @@ void archiveUi() {
         try {
             if (cmd == ID_DELETE) {
                 std::vector<int64_t> aids;
+                std::map<std::string, std::vector<int64_t>> byFile;
                 for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(list, i, LVNI_SELECTED))
-                    if (i < static_cast<int>(rows.size())) aids.push_back(rows[static_cast<size_t>(i)].aid);
+                    if (i < static_cast<int>(rows.size())) {
+                        aids.push_back(rows[static_cast<size_t>(i)].aid);
+                        byFile[rowFile[static_cast<size_t>(i)]].push_back(rows[static_cast<size_t>(i)].aid);
+                    }
                 if (aids.empty()) {
                     logBox(dlg, L"消すものを一覧で選んでください（Ctrl・Shift を押しながらクリックでいくつも）。", L"保管したデータ", MB_ICONINFORMATION);
                 } else if (logBox(dlg, (withCommas(aids.size()) + L" 件の保管を消しますか？\n\n守ってあったタグ（タガー・手動の確定）と CLIP のベクトルも消えます。元に戻せません。")
                                            .c_str(),
                                   L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
-                    const size_t n = deleteArchived(*db, file, aids);
+                    size_t n = 0;
+                    for (const auto& [f, list2] : byFile) n += deleteArchived(*db, f, list2);
                     logs::info("保管を消した: " + std::to_string(n) + " 件（選んだもの）");
                     fill();
                 }
@@ -5671,7 +5699,8 @@ void archiveUi() {
                                      L" 日）より前に保管したものを全部消しますか？\n\n元に戻せません。")
                                         .c_str(),
                                L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
-                        const size_t n = deleteArchivedBefore(*db, file, before);
+                        size_t n = 0;
+                        for (const auto& f : archiveFilesInUse(*db, file)) n += deleteArchivedBefore(*db, f, before);
                         logs::info("保管を消した: " + std::to_string(n) + " 件（" + std::to_string(mo) + " ヶ月より前）");
                         logBox(dlg, (withCommas(n) + L" 件を消しました。").c_str(), L"保管したデータ", MB_ICONINFORMATION);
                         fill();

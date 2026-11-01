@@ -290,6 +290,15 @@ bool sameImage(const std::string& newPath, const Candidate& c, std::optional<Sha
     return sameNameNoCase(fileNameOf(newPath), fileNameOf(c.path));
 }
 
+// 同じ大きさ・更新日時の候補がいくつもある時は、ファイル ID が同じもの（確かに同じファイル）を先に
+void preferSameFile(const std::string& newPath, std::vector<Candidate>& v) {
+    if (v.size() < 2) return;
+    FileIdentity fi;
+    if (!fileIdentity(newPath, fi)) return;
+    const std::string drive = driveOf(newPath);
+    std::stable_partition(v.begin(), v.end(), [&](const Candidate& c) { return c.fileId == fi.index && driveOf(c.path) == drive; });
+}
+
 }  // namespace
 
 MoveReport matchMovedImages(Db& db, const std::vector<ScannedFile>& files, const std::vector<std::string>& under,
@@ -338,6 +347,7 @@ MoveReport matchMovedImages(Db& db, const std::vector<ScannedFile>& files, const
                 auto it = gone.find(static_cast<int64_t>(f->size));
                 if (it != gone.end()) {
                     std::optional<Sha256> sha;
+                    preferSameFile(f->path, it->second);
                     for (Candidate& c : it->second) {
                         if (c.used || c.mtime != f->mtime || !sameImage(f->path, c, sha)) continue;
                         upd.bind(1, f->path).bind(2, driveOf(f->path)).bind(3, c.id);
@@ -396,6 +406,7 @@ MoveReport matchMovedImages(Db& db, const std::vector<ScannedFile>& files, const
             }
             find.reset();
             std::optional<Sha256> sha;
+            preferSameFile(f->path, cands);
             for (const Candidate& c : cands) {
                 if (std::find(restoredAids.begin(), restoredAids.end(), c.id) != restoredAids.end() || !sameImage(f->path, c, sha))
                     continue;
