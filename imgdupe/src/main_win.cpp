@@ -1663,6 +1663,7 @@ struct SearchDone {
     std::vector<std::wstring> paths;  // ids と同じ並び
     std::vector<std::vector<size_t>> clusters;  // 重複・差分のまとまり（ids の添字の束）
     std::vector<std::wstring> folders;          // 名前がフリーワードに合うフォルダ（一覧の先頭に出す）
+    std::wstring notice;                        // 件数の横に出す（CLIP を作り直している途中など）
 };
 
 // インデックスのあるフォルダの一覧（フォルダを名前で探す時に使う。画像の数・一番新しい ID が変わったら作り直す）
@@ -2313,8 +2314,14 @@ void runSearch(bool fromAuto) {
                 // 内容（CLIP）: ほかの条件に合う画像を、似ている順に上位だけ
                 done->clip = true;
                 VectorIndex idx;
-                if (!idx.load(narrow(clip::vectorPath(dataDir))))
+                // 言葉・外の画像は今のモデルでベクトルにするので、CLIP の版が上がって作り直している途中なら新しい方（作り直した画像だけ）から。
+                // インデックスの画像どうし（似た画像）は、作り終えた前の版のベクトルで
+                const bool current = !q.clipText.empty() || !similarVec.empty();
+                const std::wstring vpath = clip::vectorPathFor(dataDir, current);
+                if (!idx.load(narrow(vpath)))
                     throw std::runtime_error("CLIP のベクトルがまだありません（AI 解析の部品の CLIP を入れると、バックグラウンドの解析で作ります）");
+                if (vpath == clip::nextVectorPath(dataDir))
+                    done->notice = L"CLIP を新しい版で作り直している途中なので、作り直した " + std::to_wstring(idx.size()) + L" 枚から探しました";
                 std::vector<float> qv;
                 if (!similarVec.empty()) {
                     qv = similarVec;  // インデックスに無い画像（画像で探す）
@@ -2331,6 +2338,12 @@ void runSearch(bool fromAuto) {
                         if (path.empty() || !clip::encodeImageFile(dataDir, widen(path), qv, err))
                             throw std::runtime_error("この画像の CLIP のベクトルを作れませんでした" + (err.empty() ? std::string() : "（" + narrow(err) + "）"));
                         logs::info("似た画像: 解析でまだ CLIP を作っていない画像なので、その場で作った（" + path + "）");
+                        // 今のモデルで作ったので、前の版のベクトルとは比べられない: 作り直している途中なら新しい方で
+                        if (idx.version() != clip::modelVersion(dataDir)) {
+                            const std::wstring np = clip::vectorPathFor(dataDir, true);
+                            if (np != clip::vectorPath(dataDir) && idx.load(narrow(np)))
+                                done->notice = L"CLIP を新しい版で作り直している途中なので、作り直した " + std::to_wstring(idx.size()) + L" 枚から探しました";
+                        }
                     }
                 } else {
                     std::shared_ptr<ClipModel> model;
@@ -2428,7 +2441,7 @@ void onSearched(SearchDone* p) {
         count = L"フォルダ " + withCommas(done->folders.size()) + L" 個・画像 " + (app.searchTotal ? count : L"0 件");
     const std::wstring from =
         app.idsFilter.empty() ? L"" : L"保存した " + withCommas(app.idsFilter.size()) + L" 枚（「条件をクリア」で外します）のうち ";
-    const std::wstring status = from + count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice);
+    const std::wstring status = from + count + (app.searchNotice.empty() ? L"" : L"　" + app.searchNotice) + (done->notice.empty() ? L"" : L"　" + done->notice);
     app.searchNotice.clear();
     std::wstring what = editText(app.s.free);
     if (what.empty() && !app.idsFilter.empty()) what = L"保存した画像";

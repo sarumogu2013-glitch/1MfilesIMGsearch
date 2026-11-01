@@ -13,7 +13,13 @@ namespace clip {
 
 // 段階 clip の版（入っているモデルの版から。入っていないか、設定で切ってあれば 0）
 int stageVersion(const std::wstring& dataDir);
-std::wstring vectorPath(const std::wstring& dataDir);  // <dataDir>\vectors_clip.bin
+std::wstring vectorPath(const std::wstring& dataDir);  // <dataDir>\vectors_clip.bin（検索に使う、作り終えたベクトル）
+// CLIP の版が上がった時（データ保護の実装仕様 4）: 新しい版のベクトルは <dataDir>\vectors_clip.next.bin に作り、全部できたら切り替える
+// （前の版のファイルは保管のフォルダへ）。作っている間も、前の版のベクトルで「似た画像」を探せる
+std::wstring nextVectorPath(const std::wstring& dataDir);
+std::string modelVersion(const std::wstring& dataDir);  // 入っている CLIP の版（無ければ空）
+// 検索に使うベクトルのファイル。currentModel: 今のモデルで作ったベクトルと比べる（言葉・外の画像）なら、作り直している途中は新しい方
+std::wstring vectorPathFor(const std::wstring& dataDir, bool currentModel);
 
 // 段階 clip の前に呼ぶ: ベクトルのファイルの版が今のモデルと違う（無い）なら、段階 clip の記録を消してやり直させる。
 // 古いレコードや消えた画像が多ければ、ファイルを作り直す

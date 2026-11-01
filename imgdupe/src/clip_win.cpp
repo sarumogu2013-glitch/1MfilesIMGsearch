@@ -4,7 +4,10 @@
 
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <cwctype>
 #include <unordered_set>
 
 #include "ann.hpp"
@@ -25,6 +28,7 @@ namespace clip {
 
 using winutil::narrow;
 using winutil::widen;
+namespace logs = imgdupe::logs;
 
 namespace {
 
@@ -182,18 +186,98 @@ int stageVersion(const std::wstring& dataDir) {
 }
 
 std::wstring vectorPath(const std::wstring& dataDir) { return dataDir + L"\\vectors_clip.bin"; }
+std::wstring nextVectorPath(const std::wstring& dataDir) { return dataDir + L"\\vectors_clip.next.bin"; }
+
+namespace {
+// ベクトルのファイルの頭（"IVEC" | 次元 | 版の長さ | 版）から版だけ読む（索引は作らない）。無い・壊れていれば空
+std::string fileVersion(const std::wstring& path) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return "";
+    char head[12];
+    std::string v;
+    if (std::fread(head, 1, 12, f) == 12 && std::memcmp(head, "IVEC", 4) == 0) {
+        uint32_t len;
+        std::memcpy(&len, head + 8, 4);
+        if (len > 0 && len < 4096) {
+            v.resize(len);
+            if (std::fread(&v[0], 1, len, f) != len) v.clear();
+        }
+    }
+    std::fclose(f);
+    return v;
+}
+
+// 今のモデルのベクトルを書くファイル: 検索に使うファイルが前の版なら、別のファイル（作り直し）に
+std::wstring writePath(const std::wstring& dataDir, const std::string& version) {
+    const std::string cur = fileVersion(vectorPath(dataDir));
+    return !cur.empty() && cur != version ? nextVectorPath(dataDir) : vectorPath(dataDir);
+}
+}  // namespace
+
+std::string modelVersion(const std::wstring& dataDir) {
+    const Files f = findFiles(dataDir);
+    return f.ok ? f.version : "";
+}
+
+std::wstring vectorPathFor(const std::wstring& dataDir, bool currentModel) {
+    if (!currentModel) return vectorPath(dataDir);
+    const Files f = findFiles(dataDir);
+    if (!f.ok || fileVersion(vectorPath(dataDir)) == f.version) return vectorPath(dataDir);
+    return fileVersion(nextVectorPath(dataDir)) == f.version ? nextVectorPath(dataDir) : vectorPath(dataDir);
+}
 
 void prepare(const std::wstring& dataDir, imgdupe::Db& db) {
     const Files f = findFiles(dataDir);
     if (!f.ok) return;
     imgdupe::VectorIndex idx;
     const std::string path = narrow(vectorPath(dataDir));
-    if (!idx.load(path) || idx.version() != f.version) {
-        // ベクトルが無い（消された・モデルが変わった）のに済んだ記録があれば、やり直させる
+    const std::string cur = fileVersion(vectorPath(dataDir));
+    if (cur.empty()) {
+        // 検索に使うベクトルが無い（消された）のに済んだ記録があれば、やり直させる
         imgdupe::Stmt st(db.handle(), "DELETE FROM stages WHERE stage='clip'");
         st.step();
         return;
     }
+    if (cur != f.version) {
+        // モデルの版が上がった: 前の版のベクトルは消さずに検索に使い続け、新しい版のベクトルを別のファイルに作る
+        // （段階の版が違うので、画像は 1 枚ずつ作り直しになる）。作り直しの途中でモデルがまた変わったら、作りかけは捨てる
+        const std::wstring next = nextVectorPath(dataDir);
+        const std::string nv = fileVersion(next);
+        if (!nv.empty() && nv != f.version) {
+            DeleteFileW(next.c_str());
+            logs::info("CLIP の作り直しの途中でモデルが変わったので、作りかけのベクトルを捨てた（" + nv + "）");
+            return;
+        }
+        if (nv != f.version) return;  // まだ作り始めていない
+        // 全部作り終えたら切り替える（前の版のファイルは保管のフォルダへ）
+        // （外してある画像は数えない。何ヶ月も外したドライブがあっても切り替えられるように。つないだ時に新しい版で作る）
+        {
+            imgdupe::Stmt st(db.handle(),
+                             "SELECT 1 FROM images i WHERE i.offline=0 AND i.readable=1 AND NOT EXISTS (SELECT 1 FROM stages s WHERE "
+                             "s.image_id=i.id AND s.stage='clip' AND s.version=? AND s.state<>0) LIMIT 1");
+            st.bind(1, static_cast<int64_t>(imgdupe::clipStageVersion(f.version)));
+            if (st.step()) return;
+        }
+        const std::wstring archiveDir = dataDir + L"\\archive";
+        CreateDirectoryW(archiveDir.c_str(), nullptr);
+        std::wstring tag = widen(cur.substr(0, std::min<size_t>(cur.size(), 12)));
+        for (auto& c : tag)
+            if (!iswalnum(c)) c = L'_';
+        const std::wstring old = archiveDir + L"\\vectors_clip-" + tag + L".bin";
+        if (!MoveFileExW(vectorPath(dataDir).c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            logs::warn("CLIP のベクトルを新しい版に切り替えられなかった（画面で検索中など。次の回にやり直す）");
+            return;
+        }
+        if (!MoveFileExW(next.c_str(), vectorPath(dataDir).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            MoveFileExW(old.c_str(), vectorPath(dataDir).c_str(), MOVEFILE_REPLACE_EXISTING);  // 戻す
+            logs::warn("CLIP のベクトルを新しい版に切り替えられなかった（次の回にやり直す）");
+            return;
+        }
+        DeleteFileW((dataDir + L"\\ann_clip.hnsw").c_str());  // 索引は新しい版で作り直す
+        logs::info("CLIP を新しい版で全部作り直したので切り替えた。前の版のベクトルは保管のフォルダへ: " + narrow(old));
+        return;
+    }
+    if (!idx.load(path)) return;
     // 古いレコード（作り直した画像）と消えた画像が 2 割を超えたら作り直す
     std::unordered_set<int64_t> live;
     {
@@ -354,7 +438,7 @@ LoadResult loadAnalyzer(const std::wstring& dataDir, int cpuThreads, std::functi
         return r;
     }
     auto writer = std::make_shared<imgdupe::VectorWriter>();
-    if (!writer->open(narrow(vectorPath(dataDir)), static_cast<uint32_t>(model->dim()), f.version)) {
+    if (!writer->open(narrow(writePath(dataDir, f.version)), static_cast<uint32_t>(model->dim()), f.version)) {
         r.error = L"ベクトルのファイルに書けません（画面で検索中なら、後でもう一度試します）";
         return r;
     }
