@@ -127,7 +127,7 @@ const char* phaseLogName(IndexPhase p) {
         case IndexPhase::Tagger: return "タグ付け";
         case IndexPhase::Clip: return "CLIP";
         case IndexPhase::Variants: return "差分のまとまり";
-        case IndexPhase::Quality: return "品質";
+        case IndexPhase::Quality: return "画質";
         case IndexPhase::Lookup: return "出典の照会";
         case IndexPhase::Merge: return "仕上げ";
         case IndexPhase::Convert: return "タグの置き場所の変換";
@@ -198,7 +198,7 @@ void logStage(IndexPhase phase, const StageReport& sr, uint64_t total, double se
     char t[256];
     std::snprintf(t, sizeof t, "段階 %s: %zu / %llu 枚（失敗 %zu）・%.1f 秒・%.1f 枚/秒%s", phaseLogName(phase), sr.processed,
                   static_cast<unsigned long long>(total), sr.failed, sec, sec > 0 ? double(sr.processed) / sec : 0.0,
-                  sr.yielded ? "・上のスキャンタスクに譲った" : sr.cancelled ? "・止めた" : "");
+                  sr.yielded ? "・上の解析の予約に譲った" : sr.cancelled ? "・止めた" : "");
     (sr.failed && sr.failed * 10 > sr.processed ? logs::warn : logs::info)(t);
 }
 
@@ -477,7 +477,7 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
     std::vector<std::string> removable;
     for (const auto& r : removeUnder) {
         if (!s.cb.rootAvailable || s.cb.rootAvailable(r)) removable.push_back(r);
-        else logs::warn("調べるフォルダが見つからない（ドライブを外した・名前を変えたなど）ので、その下の画像は消さずに残す: " + r);
+        else logs::warn("監視フォルダが見つからない（ドライブを外した・名前を変えたなど）ので、その下の画像は消さずに残す: " + r);
     }
     // 動かした・名前を変えた画像は、パスだけ書き換えて引き継ぐ。保管にある画像が戻ってきたら、保管から戻す
     size_t carried = 0;
@@ -492,7 +492,7 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
             }
             carried = mr.moved + mr.restored;
             if (mr.moved) logs::info("動かした・名前を変えた画像 " + std::to_string(mr.moved) + " 枚を見つけて、解析の結果を引き継いだ");
-            if (mr.restored) logs::info("保管にあった画像 " + std::to_string(mr.restored) + " 枚が戻ってきたので、保管から戻した");
+            if (mr.restored) logs::info("退避してあった画像 " + std::to_string(mr.restored) + " 枚が戻ってきたので、復元した");
         } catch (const std::exception& e) {
             logs::error(std::string("動かした画像を見分けられなかった（新しい画像として登録する）: ") + e.what());
         }
@@ -518,7 +518,7 @@ std::vector<int64_t> scanAndRegister(Db& db, RunState& s, const std::vector<std:
             }
             for (const auto& [file, list] : byFile) {
                 const size_t n = archiveImages(db, file, list, s.opt.vectorFile, "見つからない");
-                if (n) logs::info("見つからなくなった画像 " + std::to_string(n) + " 枚を保管へ移した（" + file + "）");
+                if (n) logs::info("見つからなくなった画像 " + std::to_string(n) + " 枚を退避した（" + file + "）");
                 removed += n;
             }
         }
@@ -610,8 +610,8 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
     {
         char t[160];
         const std::string threads = opt.threads ? std::to_string(opt.threads) : std::string("自動");
-        std::snprintf(t, sizeof t, "回を始める（%s・スレッド %s・調べるフォルダ %zu 個・DB の画像 %lld 枚）",
-                      opt.fullPass ? "フォルダ全体" : "スキャンタスクだけ", threads.c_str(), opt.roots.size(),
+        std::snprintf(t, sizeof t, "回を始める（%s・スレッド %s・監視フォルダ %zu 個・DB の画像 %lld 枚）",
+                      opt.fullPass ? "フォルダ全体" : "解析の予約だけ", threads.c_str(), opt.roots.size(),
                       static_cast<long long>(imageCount(db)));
         logs::info(t);
     }
@@ -634,7 +634,7 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             // 一番上のスキャンタスク: そのフォルダ・ファイルだけを調べ、全部の段階を済ませる
             const ScanTask& t = tasks.front();
             progress.task = t.id;
-            logs::info("スキャンタスクを始める: 「" + t.label + "」（" + std::to_string(t.paths.size()) + " 個のパス、残りのタスク " +
+            logs::info("解析の予約を始める: 「" + t.label + "」（" + std::to_string(t.paths.size()) + " 個のパス、残りのタスク " +
                        std::to_string(tasks.size()) + " 個）");
             // 調べるフォルダの中のパスは、調べるフォルダと同じ書き方にする（DB のパスは大文字・小文字や / と \ を区別するので、
             // 書き方が違うと同じ画像を別の画像としてもう一度登録してしまう）
@@ -648,10 +648,10 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
             const Outcome o = runStages(db, s, &ids);
             if (o == Outcome::Cancelled) return stop();
             if (o == Outcome::Yielded) {
-                logs::info("スキャンタスク「" + t.label + "」を中断して、上に来たタスクを先にする");
+                logs::info("解析の予約「" + t.label + "」を中断して、上に来たタスクを先にする");
                 continue;
             }
-            logs::info("スキャンタスクを終えた: 「" + t.label + "」（画像 " + std::to_string(ids.size()) + " 枚）");
+            logs::info("解析の予約を終えた: 「" + t.label + "」（画像 " + std::to_string(ids.size()) + " 枚）");
             removeScanTask(db, t.id);
             ++rep.tasks;
             tasksDone = true;
@@ -674,7 +674,7 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
                 for (const auto& r : opt.roots)
                     if (!cb.rootAvailable || cb.rootAvailable(r)) online.push_back(r);
                 if (const size_t n = updateOffline(db, online))
-                    logs::info("外してある画像の印を付け直した: " + std::to_string(n) + " 枚");
+                    logs::info("休止中画像の印を付け直した: " + std::to_string(n) + " 枚");
             }
             // 前の版のスキャンタスクで、書き方の違うパスで二重に登録した画像を消す
             if (const size_t n = removeMisspelled(db, opt.roots)) {
@@ -693,7 +693,7 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
     progress.phase = static_cast<int>(IndexPhase::Done);
     {
         char t[200];
-        std::snprintf(t, sizeof t, "回を終えた（%.0f 秒。スキャンタスク %zu 個、ハッシュ %zu・タグ付け %zu・CLIP %zu・失敗 %zu）",
+        std::snprintf(t, sizeof t, "回を終えた（%.0f 秒。解析の予約 %zu 個、ハッシュ %zu・タグ付け %zu・CLIP %zu・失敗 %zu）",
                       secondsSince(runStart), rep.tasks, rep.hashed, rep.tagged, rep.clipped, rep.failed);
         logs::info(t);
     }

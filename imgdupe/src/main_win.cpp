@@ -502,8 +502,8 @@ void refreshOfflineAsync() {
                     if (std::to_string(serial) + ":" + std::to_string(index) != known) continue;
                     const size_t n = moveRootPaths(d, narrow(r), narrow(cand));
                     d.setSetting(rootIdKey(cand), known);
-                    logs::info("調べるフォルダのドライブレターが変わった: " + narrow(r) + " → " + narrow(cand) + "（画像 " + std::to_string(n) +
-                               " 枚のパスを付け替えた。解析はやり直さない）");
+                    logs::info("監視フォルダのドライブレターが変わった: " + narrow(r) + " → " + narrow(cand) + "（画像 " + std::to_string(n) +
+                               " 枚のパスを場所を変更した。解析はやり直さない）");
                     remaps->emplace_back(r, cand);
                     online.push_back(narrow(cand));
                     break;
@@ -517,9 +517,9 @@ void refreshOfflineAsync() {
             for (const auto& o : online) now.push_back(widen(o));
             indexer::syncDrives(dataDir, now, !indexer::isRunning(), nullptr);
             PostMessageW(hwnd, WM_APP_DRIVES, 0, 0);
-            if (changed) logs::info("外してある画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
+            if (changed) logs::info("休止中画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
         } catch (const std::exception& e) {
-            logs::warn(std::string("外してある画像の印を付け直せなかった: ") + e.what());
+            logs::warn(std::string("休止中画像の印を付け直せなかった: ") + e.what());
         }
         offlineBusy = false;
         if (offlineAgain.exchange(false)) changed = static_cast<WPARAM>(-1);
@@ -542,7 +542,7 @@ void driveSyncAsync() {
         try {
             indexer::syncDrives(dataDir, roots, !indexer::isRunning(), nullptr);
         } catch (const std::exception& e) {
-            logs::warn(std::string("ドライブの正本と合わせられなかった: ") + e.what());
+            logs::warn(std::string("ドライブ記録と合わせられなかった: ") + e.what());
         }
         driveBusy = false;
         PostMessageW(hwnd, WM_APP_DRIVES, 0, 0);
@@ -598,11 +598,11 @@ void checkDrivesUi() {
                            withCommas(static_cast<uint64_t>(s.complete)) + L" 枚\n  最後に書いた日時: " + unixDateText(s.updated);
                 };
                 const std::wstring msg = L"ドライブ " + name(r) +
-                                         L" の正本（ドライブの中の DB）と、この PC の DB が食い違っています（別の PC で使った・書き戻す前に抜いた など）。\n\n"
-                                         L"■ ドライブの正本\n" + side(m) + L"\n\n■ この PC の DB（クローン）\n" + side(c) +
-                                         L"\n\nはい: ドライブの正本を使う（この PC の側は保管へ移す）\nいいえ: この PC の DB を使う（正本は保管のフォルダに写して残す）\n"
-                                         L"キャンセル: 後で決める（その間、このドライブには書き戻しません）";
-                const int a = logBox(app.hwnd, msg.c_str(), L"ドライブの正本が食い違っています", MB_YESNOCANCEL | MB_ICONWARNING);
+                                         L" のドライブ記録（ドライブの中の DB）と、PC 記録 が食い違っています（別の PC で使った・ドライブへ記録する前に抜いた など）。\n\n"
+                                         L"■ ドライブ記録\n" + side(m) + L"\n\n■ PC 記録\n" + side(c) +
+                                         L"\n\nはい: ドライブ記録を使う（この PC の側は退避する）\nいいえ: PC 記録 を使う（ドライブ記録は退避のフォルダに写して残す）\n"
+                                         L"キャンセル: 後で決める（その間、このドライブにはドライブへの記録ません）";
+                const int a = logBox(app.hwnd, msg.c_str(), L"ドライブ記録が食い違っています", MB_YESNOCANCEL | MB_ICONWARNING);
                 if (a == IDYES || a == IDNO) {
                     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
                     resolveConflict(*db, ref, a == IDYES, arc, vec, now);
@@ -612,30 +612,30 @@ void checkDrivesUi() {
             }
             if (r.failSince && r.goneSince == 0 && now - r.failSince >= 12 * 3600 && !failNotified.count(r.id)) {
                 failNotified.insert(r.id);
-                const std::wstring msg = L"ドライブ " + name(r) + L" の正本に、" + unixDateText(r.failSince) +
-                                         L" から 12 時間以上書き戻せていません（ドライブがいっぱい・読み取り専用・権限が無い など）。\n\n"
-                                         L"この PC の DB には残っています。ドライブの空きや設定を確かめてください。";
-                if (ex.view) ex.view->SetSameStatus(L"ドライブ " + widen(r.root) + L" の正本に 12 時間以上書き戻せていません");
-                logBox(app.hwnd, msg.c_str(), L"ドライブの正本への書き戻しの失敗", MB_ICONWARNING);
+                const std::wstring msg = L"ドライブ " + name(r) + L" のドライブ記録に、" + unixDateText(r.failSince) +
+                                         L" から 12 時間以上ドライブへ記録できていません（ドライブがいっぱい・読み取り専用・権限が無い など）。\n\n"
+                                         L"PC 記録 には残っています。ドライブの空きや設定を確かめてください。";
+                if (ex.view) ex.view->SetSameStatus(L"ドライブ " + widen(r.root) + L" のドライブ記録に 12 時間以上ドライブへ記録できていません");
+                logBox(app.hwnd, msg.c_str(), L"ドライブ記録へのドライブへの記録の失敗", MB_ICONWARNING);
                 continue;
             }
             if (r.goneSince && !r.cloneDeleted && now - r.goneSince >= 24 * 3600 && now >= r.snoozeUntil && r.cloneImages > 0 &&
                 !letterPresent(r.root)) {
                 // 外して 1 日: クローンを消すか聞く（書き戻しの様子を見せる）
                 std::wstring msg = L"ドライブ " + name(r) + L" が " + unixDateText(r.goneSince) +
-                                   L" から見つかりません。この PC の DB にある、このドライブの分（クローン）を消しますか？\n"
-                                   L"（正本はドライブにあるので、つなぎ直せば読み戻します）\n\n■ 書き戻しの様子\n  最後に見えたドライブレター: " +
-                                   widen(r.root) + L"\n  見つからなくなった日時: " + unixDateText(r.goneSince) + L"\n  最後に書き戻した日時: " +
-                                   unixDateText(r.lastWriteback) + L"\n  クローンの画像: " + withCommas(static_cast<uint64_t>(r.cloneImages)) +
-                                   L" 枚\n  書き戻していない画像: " + withCommas(static_cast<uint64_t>(r.unwritten)) + L" 枚" +
-                                   (r.unwritten ? L"（消す前に保管へ移します）" : L"") + L"\n  12 時間以上の書き戻しの失敗: " +
+                                   L" から見つかりません。PC 記録 にある、このドライブの分（PC 記録）を消しますか？\n"
+                                   L"（ドライブ記録はドライブにあるので、つなぎ直せばドライブから取り込みます）\n\n■ ドライブへの記録の様子\n  最後に見えたドライブレター: " +
+                                   widen(r.root) + L"\n  見つからなくなった日時: " + unixDateText(r.goneSince) + L"\n  最後にドライブへ記録した日時: " +
+                                   unixDateText(r.lastWriteback) + L"\n  PC 記録の画像: " + withCommas(static_cast<uint64_t>(r.cloneImages)) +
+                                   L" 枚\n  ドライブへ記録していない画像: " + withCommas(static_cast<uint64_t>(r.unwritten)) + L" 枚" +
+                                   (r.unwritten ? L"（消す前に退避します）" : L"") + L"\n  12 時間以上のドライブへの記録の失敗: " +
                                    (r.failSince && r.goneSince - r.failSince >= 12 * 3600 ? L"あり（" + unixDateText(r.failSince) + L" から）" : L"なし") +
                                    L"\n\nはい: 消す\nいいえ: 残す（1 日後にまた聞きます）";
-                const int a = logBox(app.hwnd, msg.c_str(), L"外したドライブのクローンの片付け", MB_YESNO | MB_ICONQUESTION);
+                const int a = logBox(app.hwnd, msg.c_str(), L"つながっていないドライブのPC 記録の片付け", MB_YESNO | MB_ICONQUESTION);
                 if (a == IDYES) {
                     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
                     const size_t n = deleteClone(*db, r.id, arc, vec);
-                    logBox(app.hwnd, (L"クローンを消しました（" + withCommas(n) + L" 枚）。").c_str(), L"外したドライブのクローンの片付け",
+                    logBox(app.hwnd, (L"PC 記録を消しました（" + withCommas(n) + L" 枚）。").c_str(), L"つながっていないドライブのPC 記録の片付け",
                            MB_ICONINFORMATION);
                     changed = true;
                 } else {
@@ -643,7 +643,7 @@ void checkDrivesUi() {
                 }
             }
         } catch (const std::exception& e) {
-            logBox(app.hwnd, (L"ドライブの正本を扱えませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+            logBox(app.hwnd, (L"ドライブ記録を扱えませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
         }
     }
     busy = false;
@@ -811,7 +811,7 @@ void addScanTask(const std::vector<std::wstring>& paths, bool top) {
         label += L"（" + nameOf(list[0]) + L" など）";
     }
     indexer::addScanTask(app.dataDir, label, list, top);
-    logs::info("スキャンタスクを足した: " + narrow(label) + (top ? "（一番上）" : "") + (rootsChanged ? "・調べるフォルダにも足した" : ""));
+    logs::info("解析の予約を足した: " + narrow(label) + (top ? "（一番上）" : "") + (rootsChanged ? "・監視フォルダにも足した" : ""));
     if (!indexer::isRunning()) indexer::start();
 }
 
@@ -823,7 +823,7 @@ std::wstring pickImage() {
         {L"画像", L"*.jpg;*.jpeg;*.jpe;*.jfif;*.png;*.bmp;*.dib;*.gif;*.tif;*.tiff;*.webp;*.heic;*.heif;*.avif;*.jxr;*.wdp"},
         {L"すべてのファイル", L"*.*"}};
     dlg->SetFileTypes(2, types);
-    dlg->SetTitle(L"この画像に似た画像を探す");
+    dlg->SetTitle(L"この画像に類似画像を探す");
     if (FAILED(dlg->Show(app.hwnd))) return L"";
     Com<IShellItem> item;
     PWSTR p = nullptr;
@@ -842,7 +842,7 @@ std::wstring pickSaveBase() {
     dlg->SetFileTypes(1, types);
     dlg->SetDefaultExtension(L"csv");
     dlg->SetFileName(L"imgdupe_result");
-    dlg->SetTitle(L"結果を保存（CSV と、サムネイル付きの HTML を書き出します）");
+    dlg->SetTitle(L"結果を書き出す（CSV と、サムネイル付きの HTML を書き出します）");
     if (FAILED(dlg->Show(app.hwnd))) return L"";
     Com<IShellItem> item;
     PWSTR p = nullptr;
@@ -1042,7 +1042,7 @@ void showResult(Result&& r, bool query) {
     std::wstring s;
     if (query) {
         const size_t hits = app.result.groups.empty() ? 0 : app.result.groups[0].members.size();
-        s = L"似た画像 " + withCommas(hits) + L" 枚（" + withCommas(app.result.files.size()) + L" 枚の中から）";
+        s = L"類似画像 " + withCommas(hits) + L" 枚（" + withCommas(app.result.files.size()) + L" 枚の中から）";
     } else {
         size_t exact = 0, similar = 0, variant = 0;
         for (const auto& g : app.result.groups) (g.kind == Kind::Exact ? exact : g.kind == Kind::Variant ? variant : similar)++;
@@ -1067,19 +1067,19 @@ void showResult(Result&& r, bool query) {
     for (size_t i = 0; i < app.result.groups.size(); ++i) {
         const Group& g = app.result.groups[i];
         ExplorerGroup eg;
-        eg.title = (query ? std::wstring(L"似た画像") : L"#" + std::to_wstring(i + 1) + L"　" + widen(kindName(g.kind))) + L"　" +
+        eg.title = (query ? std::wstring(L"類似画像") : L"#" + std::to_wstring(i + 1) + L"　" + widen(kindName(g.kind))) + L"　" +
                    withCommas(g.members.size()) + L" 枚" + (query ? L"" : L"・消せば " + sizeText(g.reclaim) + L" 空く");
         for (const auto& m : g.members) eg.paths.push_back(widen(app.result.files[m.index].path));
         groups.push_back(std::move(eg));
     }
-    ex.view->SetGroups(query ? L"1 枚で検索" : L"重複", std::move(groups));
+    ex.view->SetGroups(query ? L"1 枚の重複チェック" : L"重複", std::move(groups));
 }
 
 // ---------------------------------------------------------------- 検索
 
 void setRunning(bool on) {
     app.running = on;
-    tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"検索開始");
+    tbSetText(CMD_SEARCH, on ? L"検索を中止" : L"チェック開始");
     SendMessageW(app.dupBar, TB_CHANGEBITMAP, CMD_SEARCH, MAKELPARAM(on ? stopImage : startImage, 0));
     for (HWND h : {app.add, app.remove, app.folders, app.threshold, app.exact, app.flat, app.variants}) EnableWindow(h, !on);
     tbEnable(CMD_QUERY, !on);
@@ -1097,8 +1097,8 @@ void startSearch(const std::wstring& queryPath) {
     const auto folders = folderList();
     if (folders.empty()) {
         logBox(app.hwnd,
-                    L"調べるフォルダがありません。ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、"
-                    L"「ファイル → フォルダをスキャンタスクに追加」で足してください（ウィンドウにドラッグ＆ドロップしても足せます）。",
+                    L"監視フォルダがありません。ホームでフォルダを右クリックして「解析の予約に追加」を選ぶか、"
+                    L"「ファイル → フォルダを解析の予約に追加」で足してください（ウィンドウにドラッグ＆ドロップしても足せます）。",
                     L"imgdupe", MB_ICONINFORMATION);
         return;
     }
@@ -1127,7 +1127,7 @@ void startSearch(const std::wstring& queryPath) {
     app.runningQuery = query;
     setRunning(true);
     logs::info(std::string(query ? "1 枚で重複を探し始めた" : "重複を探し始めた") + "（フォルダ " + std::to_string(opt.roots.size()) +
-               " 個・しきい値 " + std::to_string(opt.threshold) + (reuse ? "・読み込み済みを使う" : "") + "）");
+               " 個・見た目一致の厳しさ " + std::to_string(opt.threshold) + (reuse ? "・読み込み済みを使う" : "") + "）");
 
     app.worker = std::thread([opt, queryPath, query, reuse, previous = std::move(previous)]() mutable {
         auto* out = new Outcome;
@@ -1339,7 +1339,7 @@ void startModelsDownload(std::vector<const imgdupe::Component*> comps, imgdupe::
 void onModelsChecked(const models::ManifestResult& r) {
     if (!r.ok) {
         if (modelsAsk == ModelsAsk::Offer)
-            logBox(app.hwnd, r.error.c_str(), L"AI 解析の部品", MB_ICONWARNING);
+            logBox(app.hwnd, r.error.c_str(), L"AI の部品", MB_ICONWARNING);
         return;  // アップデートの確認からなら、本体の結果を出した後なので何も言わない
     }
     const imgdupe::Installed installed = models::loadInstalled(app.dataDir);
@@ -1348,10 +1348,10 @@ void onModelsChecked(const models::ManifestResult& r) {
     if (!updates.empty()) {
         const std::wstring lines = componentLines(updates, total);
         if (logBox(app.hwnd,
-                        (L"AI 解析の部品に新しい版があります。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
+                        (L"AI の部品に新しい版があります。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
                          L"。ダウンロードして入れ替えますか？")
                             .c_str(),
-                        L"AI 解析の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                        L"AI の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
             startModelsDownload(updates, r.manifest);
         return;
     }
@@ -1370,7 +1370,7 @@ void onModelsChecked(const models::ManifestResult& r) {
         std::wstring lines;
         for (const auto& [id, c] : installed)
             if (const auto* m = r.manifest.find(id)) lines += L"・" + widen(m->name) + L"（" + widen(c.version) + L"）\r\n";
-        logBox(app.hwnd, (L"AI 解析の部品はすべて最新です。\r\n\r\n" + lines).c_str(), L"AI 解析の部品", MB_ICONINFORMATION);
+        logBox(app.hwnd, (L"AI の部品はすべて最新です。\r\n\r\n" + lines).c_str(), L"AI の部品", MB_ICONINFORMATION);
         return;
     }
     const std::wstring lines = componentLines(missing, total);
@@ -1378,7 +1378,7 @@ void onModelsChecked(const models::ManifestResult& r) {
                     (L"次の部品を入れます。\r\n\r\n" + lines + L"\r\n合計 約 " + models::sizeText(total) +
                      L"。ダウンロードしますか？\r\n（入れる場所: " + models::modelsDir(app.dataDir) + L"）")
                         .c_str(),
-                    L"AI 解析の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    L"AI の部品", MB_YESNO | MB_ICONQUESTION) == IDYES)
         startModelsDownload(missing, r.manifest);
 }
 
@@ -1392,16 +1392,16 @@ void onModelsDone(const std::wstring& err) {
         PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
         return;
     }
-    if (!err.empty()) logs::warn("AI 解析の部品を入れられなかった: " + narrow(err));
-    else logs::info("AI 解析の部品を入れた");
+    if (!err.empty()) logs::warn("AI の部品を入れられなかった: " + narrow(err));
+    else logs::info("AI の部品を入れた");
     if (!err.empty()) {
-        setText(app.status, L"AI 解析の部品を入れられませんでした");
-        logBox(app.hwnd, (L"AI 解析の部品を入れられませんでした。\r\n\r\n" + err).c_str(), L"AI 解析の部品", MB_ICONWARNING);
+        setText(app.status, L"AI の部品を入れられませんでした");
+        logBox(app.hwnd, (L"AI の部品を入れられませんでした。\r\n\r\n" + err).c_str(), L"AI の部品", MB_ICONWARNING);
         return;
     }
     restartIndexerAfterUpdate();  // 新しいモデルで解析し直す
-    setText(app.status, L"AI 解析の部品を入れました");
-    logBox(app.hwnd, L"AI 解析の部品を入れました。", L"AI 解析の部品", MB_ICONINFORMATION);
+    setText(app.status, L"AI の部品を入れました");
+    logBox(app.hwnd, L"AI の部品を入れました。", L"AI の部品", MB_ICONINFORMATION);
 }
 
 void startDownload(CheckMode mode, const imgdupe::ReleaseInfo& info) {
@@ -1461,7 +1461,7 @@ void onChecked(CheckMode mode, const upd::CheckResult& r) {
     }
     if (logBox(app.hwnd,
                     (L"新しい版があります。\r\n\r\n" + versions +
-                     L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます。AI 解析の部品の更新は、"
+                     L"\r\n\r\n更新して再起動しますか？\r\n（設定とキャッシュはそのまま使えます。AI の部品の更新は、"
                      L"再起動した後にもう一度「アップデートを確認」で確かめます）")
                         .c_str(),
                     L"imgdupe のアップデート", MB_YESNO | MB_ICONQUESTION) == IDYES)
@@ -1571,9 +1571,9 @@ void imageContextMenu(const std::wstring& path, int64_t imageId = 0) {
     AppendMenuW(menu, MF_STRING, CMD_COPY_PATH, L"パスをコピー(&C)");
     if (imageId) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kSimilar, L"似た画像を探す(&S)");
+        AppendMenuW(menu, MF_STRING, kSimilar, L"類似画像を探す(&S)");
         for (size_t i = 0; i < links.size() && i < 8; ++i) {
-            std::wstring label = L"出典のページを開く: " + widen(links[i].url) + (links[i].status == 0 ? L"（リンク切れ）" : L"");
+            std::wstring label = L"出典のページを開く: " + widen(links[i].url) + (links[i].status == 0 ? L"（出典切れ）" : L"");
             for (size_t k = 0; (k = label.find(L'&', k)) != std::wstring::npos; k += 2) label.insert(k, 1, L'&');
             AppendMenuW(menu, MF_STRING, kSourcePage + static_cast<int>(i), label.c_str());
         }
@@ -1616,15 +1616,15 @@ void exportResult() {
 
 void showHelp() {
     logBox(app.hwnd,
-                L"1. ホームでフォルダを右クリックして「スキャンタスクに追加」を選ぶか、「ファイル → フォルダをスキャンタスクに追加」で調べるフォルダを足します（ウィンドウへのドラッグ＆ドロップでも足せます。複数可）。\r\n"
-                L"2. 「検索開始」を押すと、同じ画像のまとまり（グループ）を左に出します。\r\n"
+                L"1. ホームでフォルダを右クリックして「解析の予約に追加」を選ぶか、「ファイル → フォルダを解析の予約に追加」で監視フォルダを足します（ウィンドウへのドラッグ＆ドロップでも足せます。複数可）。\r\n"
+                L"2. 「チェック開始」を押すと、同じ画像のまとまり（グループ）を左に出します。\r\n"
                 L"　・完全一致: 中身がまったく同じファイル\r\n"
                 L"　・見た目一致: 縮小・再圧縮・形式の違い（JPEG と PNG など）があっても見た目が同じ画像\r\n"
                 L"3. グループを選ぶと、右にサムネイルを出します。ダブルクリックで開き、右クリックで「エクスプローラーで表示」などができます。\r\n"
-                L"4. 「結果を保存」で CSV と、サムネイル付きの HTML を書き出します。\r\n\r\n"
-                L"・しきい値: 小さいほど厳しく（ほぼ同じものだけ）、大きいほどゆるく（似ているものまで）まとめます。\r\n"
+                L"4. 「結果を書き出す」で CSV と、サムネイル付きの HTML を書き出します。\r\n\r\n"
+                L"・見た目一致の厳しさ: 小さいほど厳しく（ほぼ同じものだけ）、大きいほどゆるく（似ているものまで）まとめます。\r\n"
                 L"・単色に近い画像（真っ白・真っ黒など）は見分けにくく、別の画像がまとまりやすいので、ふだんは見た目では比べません。\r\n"
-                L"・「1 枚で検索」で、選んだ画像に似た画像を探します。\r\n"
+                L"・「1 枚の重複チェック」で、選んだ画像に類似画像を探します。\r\n"
                 L"・キーの割り当ては「その他 → ショートカットキーの設定」（Ctrl+K）で変えられます。\r\n"
                 L"・2 回目からは読み込んだ結果（キャッシュ）を使うので、増えた・変わった画像だけを読み込みます。\r\n"
                 L"・このツールは画像を読むだけで、移動や削除はしません。",
@@ -2319,7 +2319,7 @@ void runSearch(bool fromAuto) {
                 const bool current = !q.clipText.empty() || !similarVec.empty();
                 const std::wstring vpath = clip::vectorPathFor(dataDir, current);
                 if (!idx.load(narrow(vpath)))
-                    throw std::runtime_error("CLIP のベクトルがまだありません（AI 解析の部品の CLIP を入れると、バックグラウンドの解析で作ります）");
+                    throw std::runtime_error("CLIP のベクトルがまだありません（AI の部品の CLIP を入れると、常駐解析で作ります）");
                 if (vpath == clip::nextVectorPath(dataDir))
                     done->notice = L"CLIP を新しい版で作り直している途中なので、作り直した " + std::to_wstring(idx.size()) + L" 枚から探しました";
                 std::vector<float> qv;
@@ -2337,7 +2337,7 @@ void runSearch(bool fromAuto) {
                         std::wstring err;
                         if (path.empty() || !clip::encodeImageFile(dataDir, widen(path), qv, err))
                             throw std::runtime_error("この画像の CLIP のベクトルを作れませんでした" + (err.empty() ? std::string() : "（" + narrow(err) + "）"));
-                        logs::info("似た画像: 解析でまだ CLIP を作っていない画像なので、その場で作った（" + path + "）");
+                        logs::info("類似画像: 解析でまだ CLIP を作っていない画像なので、その場で作った（" + path + "）");
                         // 今のモデルで作ったので、前の版のベクトルとは比べられない: 作り直している途中なら新しい方で
                         if (idx.version() != clip::modelVersion(dataDir)) {
                             const std::wstring np = clip::vectorPathFor(dataDir, true);
@@ -2548,7 +2548,7 @@ void showSearchInfo(int item) {
             };
             std::vector<std::pair<std::string, Agg>> agg;
             for (const auto& t : tagsOf(*db, info->id)) {
-                if (t.source == kSourceEmbedded) fileTags += (fileTags.empty() ? L"ファイルのタグ: " : L"、") + tagLabel(t.tag);
+                if (t.source == kSourceEmbedded) fileTags += (fileTags.empty() ? L"埋め込みタグ: " : L"、") + tagLabel(t.tag);
                 auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return a.first == t.tag; });
                 if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{}});
                 if (t.source != kSourceEmbedded) it->second.dbOnly = true;
@@ -2567,18 +2567,18 @@ void showSearchInfo(int item) {
                 lines.emplace_back(p, tagLabel(tag) + c + L"（" + a.detail + L"）");
             }
             std::stable_sort(lines.begin(), lines.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-            for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"検索用タグ: " : L"　") + lines[i].second;
+            for (size_t i = 0; i < lines.size() && i < 8; ++i) tags += (tags.empty() ? L"管理タグ: " : L"　") + lines[i].second;
             if (lines.size() > 8) tags += L"　ほか " + std::to_wstring(lines.size() - 8) + L" 個";
         } catch (const std::exception&) {
         }
     }
-    if (fileTags.empty()) fileTags = L"ファイルのタグ: なし";
-    if (tags.empty()) tags = L"検索用タグ: なし";
+    if (fileTags.empty()) fileTags = L"埋め込みタグ: なし";
+    if (tags.empty()) tags = L"管理タグ: なし";
     std::wstring sources;
     if (Db* db = uiDb()) {
         try {
             for (const auto& l : sourceLinks(*db, info->id))
-                sources += (sources.empty() ? L"　出典: " : L"　") + widen(l.url) + (l.status == 0 ? L"（リンク切れ）" : L"");
+                sources += (sources.empty() ? L"　出典: " : L"　") + widen(l.url) + (l.status == 0 ? L"（出典切れ）" : L"");
         } catch (const std::exception&) {
         }
     }
@@ -2589,7 +2589,7 @@ void showSearchInfo(int item) {
 void findSimilar(int64_t imageId, const std::wstring& name) {
     app.similarVec.clear();
     app.similarTo = imageId;
-    app.similarLabel = L"似た画像: " + name;
+    app.similarLabel = L"類似画像: " + name;
     SetWindowTextW(app.s.clip, app.similarLabel.c_str());  // EN_CHANGE が来ても同じ文字なので似た画像のまま
 }
 
@@ -2813,7 +2813,7 @@ void applyQueryToUi(const SearchQuery& q) {
     ComboBox_SetCurSel(app.s.dateField, static_cast<int>(q.dateField));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(app.s.review, q.review ? BST_CHECKED : BST_UNCHECKED);
-    searchStatus(L"保存した条件を読み込みました。「検索」（Enter）を押すと探します");
+    searchStatus(L"スマートフォルダを読み込みました。「検索」（Enter）を押すと探します");
 }
 
 // 名前を聞いて、q をスマートフォルダに保存する（同じ名前があれば置き換えてよいか聞く）
@@ -2846,7 +2846,7 @@ void saveSelectionSmartUi() {
     const std::vector<int64_t> ids = selectedImageIds(&missing);
     if (ids.empty()) {
         logBox(app.hwnd,
-                    missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像だけ保存できます）。"
+                    missing ? L"選んだ画像はまだ解析していません（解析した画像だけ保存できます）。"
                             : L"保存する画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
                     L"imgdupe", MB_ICONINFORMATION);
         return;
@@ -2855,12 +2855,12 @@ void saveSelectionSmartUi() {
     q.ids = ids;
     q.sort = SortKey::FileName;
     std::wstring message = L"名前（選んだ " + withCommas(ids.size()) + L" 枚を保存します";
-    if (missing) message += L"。インデックスに無い " + withCommas(missing) + L" 枚は入りません";
+    if (missing) message += L"。解析に無い " + withCommas(missing) + L" 枚は入りません";
     message += L"）";
     if (saveSmartFolderAs(q, message, L"選んだ画像") && ex.view) {
         const int i = ComboBox_GetCurSel(app.s.smart) - 1;
         const std::wstring name = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"";
-        ex.view->SetSameStatus(withCommas(ids.size()) + L" 枚をスマートフォルダ「" + name + L"」に保存しました（検索の「保存した条件」から開けます）");
+        ex.view->SetSameStatus(withCommas(ids.size()) + L" 枚をスマートフォルダ「" + name + L"」に保存しました（検索の「スマートフォルダ」から開けます）");
     }
 }
 
@@ -2894,11 +2894,11 @@ std::wstring pickQueriesFile(bool save) {
     if (FAILED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 save ? __uuidof(IFileSaveDialog) : __uuidof(IFileOpenDialog), reinterpret_cast<void**>(dlg.put()))))
         return L"";
-    const COMDLG_FILTERSPEC types[] = {{L"保存した条件（JSON）", L"*.json"}};
+    const COMDLG_FILTERSPEC types[] = {{L"スマートフォルダ（JSON）", L"*.json"}};
     dlg->SetFileTypes(1, types);
     dlg->SetDefaultExtension(L"json");
     if (save) dlg->SetFileName(L"imgdupe_saved_queries");
-    dlg->SetTitle(save ? L"保存した条件を書き出す" : L"保存した条件を読み込む");
+    dlg->SetTitle(save ? L"スマートフォルダを書き出す" : L"スマートフォルダを読み込む");
     if (FAILED(dlg->Show(app.hwnd))) return L"";
     Com<IShellItem> item;
     PWSTR p = nullptr;
@@ -3104,7 +3104,7 @@ void teachFolderUi(const std::wstring& dirIn) {
     y += px(110);
     HWND status = child(WC_STATICW, L"", SS_NOPREFIX | SS_ENDELLIPSIS, -1, m, y + px(6), w - 2 * m - px(260), px(20));
     HWND saveBtn = child(WC_BUTTONW, L"教える", WS_TABSTOP | BS_DEFPUSHBUTTON, ID_SAVE, w - m - px(250), y, px(120), px(30));
-    addTooltip(tip, saveBtn, L"この形を覚えて、同じ形のフォルダの画像にタグを付けます（バックグラウンドの解析が行います）");
+    addTooltip(tip, saveBtn, L"この形を覚えて、同じ形のフォルダの画像にタグを付けます（常駐解析が行います）");
     EnableWindow(saveBtn, slots > 0);
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP, IDOK, w - m - px(120), y, px(120), px(30));
 
@@ -3290,7 +3290,7 @@ void manageSmartFoldersUi() {
     RECT frame{0, 0, w, h};
     AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeManageQueries", L"保存した条件の管理", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeManageQueries", L"スマートフォルダの管理", WS_POPUP | WS_CAPTION | WS_SYSMENU,
                                (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                                app.inst, nullptr);
     if (!dlg) return;
@@ -3303,7 +3303,7 @@ void manageSmartFoldersUi() {
         return c;
     };
     const int m = px(12), bw = px(120), bh = px(28), bx = w - m - bw;
-    child(WC_STATICW, L"検索の「保存した条件」に出す順に並びます。", SS_NOPREFIX, -1, m, m, w - 2 * m, px(20));
+    child(WC_STATICW, L"検索の「スマートフォルダ」に出す順に並びます。", SS_NOPREFIX, -1, m, m, w - 2 * m, px(20));
     st.list = child(WC_LISTBOXW, L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, ID_LIST, m, m + px(24),
                     bx - px(8) - m, h - 2 * m - px(24), WS_EX_CLIENTEDGE);
     int by = m + px(24);
@@ -3317,7 +3317,7 @@ void manageSmartFoldersUi() {
     btn(L"下へ", ID_DOWN, L"選んだ条件を 1 つ下に動かします");
     btn(L"名前を変える…", ID_RENAME, L"選んだ条件の名前を変えます");
     btn(L"削除", ID_DELETE, L"選んだ条件を削除します（画像は消えません）", 12);
-    btn(L"書き出し…", ID_EXPORT, L"保存した条件を全部 JSON のファイルに書き出します（ほかの PC への引っ越しや控えに）");
+    btn(L"書き出し…", ID_EXPORT, L"スマートフォルダを全部 JSON のファイルに書き出します（ほかの PC への引っ越しや控えに）");
     btn(L"読み込み…", ID_IMPORT, L"書き出した JSON のファイルから条件を読み込みます（同じ名前は上書き）");
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, bx, h - m - bh, bw, bh);
 
@@ -3402,7 +3402,7 @@ void manageSmartFoldersUi() {
                     break;
                 case ID_EXPORT: {
                     if (list.empty()) {
-                        logBox(dlg, L"保存した条件がありません。", L"imgdupe", MB_ICONINFORMATION);
+                        logBox(dlg, L"スマートフォルダがありません。", L"imgdupe", MB_ICONINFORMATION);
                         break;
                     }
                     const std::wstring file = pickQueriesFile(true);
@@ -3427,7 +3427,7 @@ void manageSmartFoldersUi() {
                     }
                     std::vector<SmartFolder> got;
                     if (!importSmartFolders(text, got)) {
-                        logBox(dlg, L"保存した条件のファイルとして読めませんでした。", L"imgdupe", MB_ICONWARNING);
+                        logBox(dlg, L"スマートフォルダのファイルとして読めませんでした。", L"imgdupe", MB_ICONWARNING);
                         break;
                     }
                     int64_t last = 0;
@@ -3489,13 +3489,13 @@ void expandLinksUi() {
     }
     const int i = ComboBox_GetCurSel(app.s.smart) - 1;
     const std::wstring initial = i >= 0 && i < static_cast<int>(app.smartList.size()) ? widen(app.smartList[i].name) : L"検索結果";
-    auto input = promptText(L"フォルダを作成", L"フォルダの名前（画像のあるドライブごとに、_vfolders の下に作ります）", initial);
+    auto input = promptText(L"リンクフォルダを作成", L"フォルダの名前（画像のあるドライブごとに、_vfolders の下に作ります）", initial);
     if (!input || trimmed(*input).empty()) return;
     const std::string name = safeFolderName(narrow(trimmed(*input)));
     std::wstring msg = withCommas(app.searchTotal) + L" 枚を、ハードリンクで「" + widen(name) + L"」フォルダに並べます。\r\n\r\n" +
                        L"・容量は増えません。リンク側の画像を編集すると、元の画像も変わります。\r\n" +
-                       L"・このソフトを終了すると消えます（残す時は「展開したフォルダ」で固定にします）。\r\n" +
-                       L"・同じ名前で前に展開したフォルダは、今の結果で作り直します。";
+                       L"・このソフトを終了すると消えます（残す時は「リンクフォルダ」で固定にします）。\r\n" +
+                       L"・同じ名前で前にリンクフォルダは、今の結果で作り直します。";
     if (app.searchTotal > 10000) msg += L"\r\n\r\n枚数が多いので、少し時間がかかります。";
     if (logBox(app.hwnd, msg.c_str(), L"フォルダに展開", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return;
 
@@ -3690,7 +3690,7 @@ void showLinksWindow() {
     AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
     w = LinksWindow{};
-    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeLinks", L"展開したフォルダ", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeLinks", L"リンクフォルダ", WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                             app.inst, nullptr);
     if (!w.wnd) return;
@@ -3839,7 +3839,7 @@ void markSelected(bool correct) {
     const std::vector<int64_t> items = selectedImageIds();
     if (items.empty()) return;
     const std::string tag = tags[0];
-    const std::string desc = std::to_string(items.size()) + " 枚の " + tag + " を「" + (correct ? "正しい" : "違う") + "」に";
+    const std::string desc = std::to_string(items.size()) + " 枚の " + tag + " を「" + (correct ? "確定" : "否定") + "」に";
     editSelectedTags(items, desc, [&](Db& db, int64_t id, TagHistory& h) {
         h.touch(id, tag);
         setManualTag(db, id, tag, correct);
@@ -3881,14 +3881,14 @@ static_assert(std::size(kStatViews) == kStatTagViews + 2 && std::extent_v<declty
 std::wstring statsSummaryText(const StatsSummary& s) {
     std::wstring t = L"画像 " + withCommas(s.images) + L" 枚（" + sizeText(s.bytes) + L"）　検索用のタグあり " + withCommas(s.tagged) +
                      L" 枚　出典あり " + withCommas(s.withSource) + L" 枚" +
-                     (s.deadLinks ? L"（リンク切れ " + withCommas(s.deadLinks) + L" 枚）" : L"") +
+                     (s.deadLinks ? L"（出典切れ " + withCommas(s.deadLinks) + L" 枚）" : L"") +
                      (s.blurry || s.soft ? L"　ぼやけ " + withCommas(s.blurry) + L" 枚・細かさ不足 " + withCommas(s.soft) + L" 枚" : L"") + L"\r\n";
     t += L"完全一致 " + withCommas(s.exactGroups) + L" グループ（重なっている分 " + withCommas(s.exactExtra) + L" 枚・" +
          sizeText(s.exactExtraBytes) + L"）　見た目一致 " + withCommas(s.similarGroups) + L" グループ（" + withCommas(s.similarExtra) +
          L" 枚・" + sizeText(s.similarExtraBytes) + L"）\r\n解析: ";
     static const std::pair<const char*, const wchar_t*> names[] = {{"hash", L"ハッシュ"}, {"thumb", L"サムネイル"}, {"meta", L"メタデータ"},
                                                                    {"names", L"json・フォルダ名"}, {"tagger", L"タガー"}, {"clip", L"CLIP"},
-                                                                   {"quality", L"品質"}};
+                                                                   {"quality", L"画質"}};
     bool first = true;
     for (const auto& [k, label] : names)
         for (const auto& st : s.stages)
@@ -3924,8 +3924,8 @@ void fillStatsList() {
     SendMessageW(w.list, WM_SETREDRAW, TRUE, 0);
     std::wstring note;
     if (view < kStatTagViews)
-        note = rows.empty() ? L"まだありません（タガー・json・外部照会などでタグが付くと出ます）"
-                            : L"確度 0.5 以上（手動で「違う」と確定したものは除く）の上位 500 件。ダブルクリックでそのタグを検索します。";
+        note = rows.empty() ? L"まだありません（タガー・json・出典の照会などでタグが付くと出ます）"
+                            : L"確度 0.5 以上（手動で「否定」と確定したものは除く）の上位 500 件。ダブルクリックでそのタグを検索します。";
     else if (view == kStatTagViews)
         note = L"ファイルの作成日時と更新日時の古い方の月で数えます。";
     else
@@ -4156,7 +4156,7 @@ void relookupImages(int64_t clicked) {
     if (std::find(ids.begin(), ids.end(), clicked) == ids.end()) ids.assign(1, clicked);
     const lookup::Settings ls = lookup::load(app.dataDir);
     if (!ls.idLookup && !(ls.reverse && !ls.sauceKey.empty())) {
-        logBox(app.hwnd, L"外部照会が切ってあります。「設定」の「外部照会」で、調べ方を選んでください。", L"imgdupe",
+        logBox(app.hwnd, L"出典の照会が切ってあります。「設定」の「出典の照会」で、調べ方を選んでください。", L"imgdupe",
                     MB_ICONINFORMATION);
         return;
     }
@@ -4171,7 +4171,7 @@ void relookupImages(int64_t clicked) {
     }
     if (!indexer::isRunning()) indexer::start();
     logBox(app.hwnd,
-                (withCommas(ids.size()) + L" 枚を、バックグラウンドの解析でもう一度調べます（1 秒に 1 件ずつ。SauceNAO は 1 日の上限まで）。")
+                (withCommas(ids.size()) + L" 枚を、常駐解析でもう一度調べます（1 秒に 1 件ずつ。SauceNAO は 1 日の上限まで）。")
                     .c_str(),
                 L"imgdupe", MB_ICONINFORMATION);
 }
@@ -4181,13 +4181,13 @@ void bulkTagUi() {
     const std::vector<int64_t> items = selectedImageIds(&missing);
     if (items.empty()) {
         logBox(app.hwnd,
-                    missing ? L"選んだ画像はまだインデックスにありません（インデックスを作った画像にだけタグを付けられます）。"
+                    missing ? L"選んだ画像はまだ解析していません（解析した画像にだけタグを付けられます）。"
                             : L"タグを付ける画像を選んでください（Ctrl や Shift を押しながらクリック、空いている所からドラッグで囲むと、いくつも選べます）。",
                     L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     auto input = promptText(L"タグを付ける・外す",
-                            withCommas(items.size()) + L" 枚に付けるタグ（空白で区切る。-タグ で「違う」と確定）", L"");
+                            withCommas(items.size()) + L" 枚に付けるタグ（空白で区切る。-タグ で「否定」と確定）", L"");
     if (!input) return;
     std::vector<std::string> add, remove;
     parseTagQuery(narrow(*input), add, remove);
@@ -4374,7 +4374,7 @@ void showSettingsWindow() {
     int gy = group(L"アップデート", px(52));
     w.autoUpdate = child(WC_BUTTONW, L"終了する時に新しい版を確かめる（1 日 1 回）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOUPDATE,
                          in, gy, iw, rowH);
-    gy = group(L"バックグラウンドの解析", px(126));
+    gy = group(L"常駐解析", px(126));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
     w.quality = child(WC_BUTTONW, L"画像の品質（ぼやけ・拡大された画像）を調べる（1 枚ずつ読み直すので時間がかかります）",
                       WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_QUALITY, in, gy + rowH + px(2), iw, rowH);
@@ -4390,7 +4390,7 @@ void showSettingsWindow() {
     gy = group(L"AI 解析", px(174));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
-    w.clip = child(WC_BUTTONW, L"CLIP で画像の内容を調べる（似た画像を探す・言葉で探す）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_CLIP,
+    w.clip = child(WC_BUTTONW, L"CLIP で画像の内容を調べる（類似画像を探す・言葉で探す）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_CLIP,
                    in, gy + rowH + px(2), iw, rowH);
     child(WC_STATICW, L"差分とみなす似ている度合い（0.80〜0.99。大きいほど厳しい）", SS_NOPREFIX, -1, in + px(18),
           gy + 2 * (rowH + px(2)) + px(4), iw - px(90), rowH);
@@ -4399,8 +4399,8 @@ void showSettingsWindow() {
     w.gpu = child(WC_BUTTONW, L"GPU（DirectML）を使う（調子が悪い時は外すと CPU だけで動きます）", WS_TABSTOP | BS_AUTOCHECKBOX,
                   IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
     w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
-    child(WC_BUTTONW, L"AI 解析の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
-    gy = group(L"外部照会（インターネットで出典を調べる）", px(160));
+    child(WC_BUTTONW, L"AI の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
+    gy = group(L"出典の照会（インターネットで出典を調べる）", px(160));
     w.idLookup = child(WC_BUTTONW, L"ファイル名の pixiv・Danbooru（MD5）の ID で、投稿のタグと作者を調べる",
                        WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_LOOKUP, in, gy, iw, rowH);
     w.linkCheck = child(WC_BUTTONW, L"出典の投稿が消えていないか確かめる（pixiv・Danbooru・X。30 日ごと）", WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -4423,7 +4423,7 @@ void showSettingsWindow() {
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
-    child(WC_BUTTONW, L"展開したフォルダ…", WS_TABSTOP, IDC_ST_LINKS, in + b3 + px(8), gy, b3, bh);
+    child(WC_BUTTONW, L"リンクフォルダ…", WS_TABSTOP, IDC_ST_LINKS, in + b3 + px(8), gy, b3, bh);
     child(WC_BUTTONW, L"設定ファイルを開く", WS_TABSTOP, IDC_ST_INI, in + 2 * (b3 + px(8)), gy, b3, bh);
     child(WC_BUTTONW, L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, cw - m - px(208), ch - m - bh, px(100), bh);
     child(WC_BUTTONW, L"キャンセル", WS_TABSTOP, IDCANCEL, cw - m - px(100), ch - m - bh, px(100), bh);
@@ -4466,7 +4466,7 @@ void showSettingsWindow() {
             if (auto c = installed.find("clip"); c != installed.end())
                 status += (status.empty() ? L"" : L"、") + std::wstring(L"CLIP（版 ") + widen(c->second.version) + L"）";
         }
-        setText(w.aiStatus, status.empty() ? L"AI 解析の部品はまだ入っていません" : status + L" が入っています");
+        setText(w.aiStatus, status.empty() ? L"AI の部品はまだ入っていません" : status + L" が入っています");
     }
 
     EnableWindow(app.hwnd, FALSE);
@@ -4601,7 +4601,7 @@ void showDictionaryWindow() {
     AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
     w = DictionaryWindow{};
-    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeDictionary", L"行動・アイテムの辞書", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeDictionary", L"AI タグ辞書（行動・アイテム）", WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                             app.inst, nullptr);
     if (!w.wnd) return;
@@ -4813,7 +4813,7 @@ void showTagDictWindow() {
     RECT frame{0, 0, cw, ch};
     AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
-    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeTagDict", L"タグ辞書（別名・親子関係）", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    w.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeTagDict", L"タグの別名・親子", WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                             app.inst, nullptr);
     w.done = w.busy = false;
@@ -4825,7 +4825,7 @@ void showTagDictWindow() {
         return c;
     };
     child(WC_STATICW,
-          L"別名は検索でまとめて扱い、親子関係は子のタグが付いた画像に親のタグも付けます（出どころ「親子関係」）。"
+          L"別名は検索でまとめて扱い、親子関係は子のタグが付いた画像に親のタグも付けます（タグの由来「親子関係」）。"
           L"ここに書くのは自分の分です。Danbooru の一覧は下のボタンで取り込めます。",
           SS_NOPREFIX, -1, m, m, cw - 2 * m, px(36));
     w.edit = child(WC_EDITW, L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
@@ -5038,7 +5038,7 @@ void ExplorerApp::ExplorerFindSimilarAi(const std::wstring& path) {
     for (const auto& f : folderList()) roots.push_back(narrow(f));
     const int64_t id = findImageId(*db, narrow(path), roots);
     if (!id) {
-        logBox(app.hwnd, L"この画像はまだインデックスにありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"この画像はまだ解析していません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     if (app.tab != 1) switchTab(1);
@@ -5059,7 +5059,7 @@ void ExplorerApp::ExplorerAddTag(const std::vector<std::wstring>& paths, const s
     for (const auto& p : paths)
         if (const int64_t id = findImageId(*db, narrow(p), roots)) ids.push_back(id);
     if (ids.empty()) {
-        logBox(app.hwnd, L"インデックスに無い画像にはタグを付けられません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"解析に無い画像にはタグを付けられません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     const std::string t = narrow(tag);
@@ -5212,8 +5212,8 @@ bool ExplorerApp::ExplorerIsRoot(const std::wstring& dir) {
 void removeRoot(const std::wstring& dir) {
     const std::wstring d = stripTrailingSlash(dir);
     if (logBox(app.hwnd,
-                    (L"「" + d + L"」を調べるフォルダから外しますか？\n\nこれからは中の変化を見なくなります。"
-                               L"作ったインデックス（タグなど）は残り、ファイルも消しません。")
+                    (L"「" + d + L"」を監視をやめしますか？\n\nこれからは中の変化を見なくなります。"
+                               L"解析の結果（タグなど）は残り、ファイルも消しません。")
                         .c_str(),
                     L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
         return;
@@ -5246,11 +5246,11 @@ void replaceRoot(const std::wstring& from, const std::wstring& to) {
 void remapRootUi() {
     const auto f = folderList();
     if (f.empty()) {
-        logBox(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"監視フォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"付け替える調べるフォルダ（前の場所）:");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"場所を変更する監視フォルダ（前の場所）:");
     for (size_t i = 0; i < f.size(); ++i) AppendMenuW(menu, MF_STRING, i + 1, f[i].c_str());
     POINT pt;
     GetCursorPos(&pt);
@@ -5263,24 +5263,24 @@ void remapRootUi() {
     const std::wstring to = stripTrailingSlash(picked[0]);
     if (lstrcmpiW(from.c_str(), to.c_str()) == 0) return;
     if (logBox(app.hwnd,
-               (L"「" + from + L"」の画像を「" + to + L"」の下にあるものとして付け替えますか？\n\n作ったタグ・CLIP などはそのまま引き継ぎ、"
+               (L"「" + from + L"」の画像を「" + to + L"」の下にあるものとして場所を変更しますか？\n\n作ったタグ・CLIP などはそのまま引き継ぎ、"
                 L"解析はやり直しません。中身が違うフォルダを選ぶと、タグが別の画像に付いてしまうので気をつけてください。")
                    .c_str(),
-               L"調べるフォルダの場所を付け替える", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+               L"監視フォルダの場所を変更", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
         return;
     Db* db = uiDb();
     if (!db) return;
     try {
         SetCursor(LoadCursorW(nullptr, IDC_WAIT));
         const size_t n = moveRootPaths(*db, narrow(from), narrow(to));
-        logs::info("調べるフォルダを付け替えた（手で）: " + narrow(from) + " → " + narrow(to) + "（画像 " + std::to_string(n) + " 枚）");
+        logs::info("監視フォルダを場所を変更した（手で）: " + narrow(from) + " → " + narrow(to) + "（画像 " + std::to_string(n) + " 枚）");
         replaceRoot(from, to);
         saveSettings();
         app.infoCache.clear();
         if (ex.view) ex.view->RefreshStates();
-        logBox(app.hwnd, (withCommas(n) + L" 枚のパスを付け替えました。").c_str(), L"調べるフォルダの場所を付け替える", MB_ICONINFORMATION);
+        logBox(app.hwnd, (withCommas(n) + L" 枚のパスを場所を変更しました。").c_str(), L"監視フォルダの場所を変更", MB_ICONINFORMATION);
     } catch (const std::exception& e) {
-        logBox(app.hwnd, (L"付け替えられませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
+        logBox(app.hwnd, (L"場所を変更できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
     }
 }
 
@@ -5288,7 +5288,7 @@ void remapRootUi() {
 void removeRootMenu() {
     const auto f = folderList();
     if (f.empty()) {
-        logBox(app.hwnd, L"調べるフォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
+        logBox(app.hwnd, L"監視フォルダはありません。", L"imgdupe", MB_ICONINFORMATION);
         return;
     }
     HMENU menu = CreatePopupMenu();
@@ -5503,7 +5503,7 @@ void ExplorerApp::ExplorerRequestProgress(const std::wstring& dir) {
                 }
             }
         } catch (const std::exception& e) {
-            logs::warn("インデックスの進み具合を数えられなかった: " + std::string(e.what()));
+            logs::warn("解析の進み具合を数えられなかった: " + std::string(e.what()));
         }
         if (cancel->load() || !PostMessageW(hwnd, WM_APP_PROGRESS, 0, reinterpret_cast<LPARAM>(done))) delete done;
     }).detach();
@@ -5525,7 +5525,7 @@ void refreshView() {
     app.uiDb.reset();  // 次に使う時に開き直す
     loadTagLabels();
     if (ex.view) ex.view->Refresh();
-    if (ex.view) ex.view->SetSameStatus(L"更新しました（バックグラウンドの解析はしていません。新しいファイルのインデックスは、タスクトレイの解析が作ります）");
+    if (ex.view) ex.view->SetSameStatus(L"再読み込みしました（解析はしていません。新しいファイルは、タスクトレイの常駐解析が解析します）");
     logs::info("更新した");
 }
 
@@ -5568,7 +5568,7 @@ void archiveUi() {
     RECT frame{0, 0, w, h};
     AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeArchive", L"保管したデータ", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeArchive", L"退避した解析結果", WS_POPUP | WS_CAPTION | WS_SYSMENU,
                                (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                                app.inst, nullptr);
     if (!dlg) return;
@@ -5585,7 +5585,7 @@ void archiveUi() {
     HWND list = child(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, ID_LIST, m, m + px(44), w - 2 * m,
                       h - 3 * m - px(44) - bh, WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT);
-    addColumn(list, 0, L"保管した日時", px(130));
+    addColumn(list, 0, L"退避した日時", px(130));
     addColumn(list, 1, L"パス", px(320));
     addColumn(list, 2, L"大きさ", px(80));
     addColumn(list, 3, L"守ったタグ", px(70));
@@ -5595,8 +5595,8 @@ void archiveUi() {
     HWND del = child(WC_BUTTONW, L"選んだものを消す", WS_TABSTOP, ID_DELETE, m, h - m - bh, bw, bh);
     HWND old = child(WC_BUTTONW, L"古いものを消す…", WS_TABSTOP, ID_OLD, m + bw + px(8), h - m - bh, bw, bh);
     child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, w - m - px(100), h - m - bh, px(100), bh);
-    addTooltip(tip, del, L"一覧で選んだ画像の保管を消します（元に戻せません。画像のファイルには触れません）");
-    addTooltip(tip, old, L"指定した月数より前に保管したものを、まとめて消します（元に戻せません）");
+    addTooltip(tip, del, L"一覧で選んだ画像の退避を消します（元に戻せません。画像のファイルには触れません）");
+    addTooltip(tip, old, L"指定した月数より前に退避したものを、まとめて消します（元に戻せません）");
 
     constexpr size_t kShow = 5000;  // 一覧に出す数（古い順）
     // 保管はこの PC の分と、つながっているドライブの分（ドライブの正本のフォルダの中）
@@ -5629,13 +5629,13 @@ void archiveUi() {
                 rowFile.push_back(f);
             }
         } catch (const std::exception& e) {
-            setText(summary, L"保管の DB を読めませんでした: " + widen(e.what()));
+            setText(summary, L"退避の DB を読めませんでした: " + widen(e.what()));
         }
-        std::wstring t = L"保管: " + withCommas(static_cast<uint64_t>(sum.images)) + L" 枚・ファイル " +
+        std::wstring t = L"退避: " + withCommas(static_cast<uint64_t>(sum.images)) + L" 枚・ファイル " +
                          sizeText(static_cast<uint64_t>(sum.fileBytes)) + (places.empty() ? L"" : L"（" + places + L"）");
         if (sum.images) t += L"\r\n一番古いもの: " + dateText(sum.oldest) +
                              (sum.images > static_cast<int64_t>(kShow) ? L"。一覧には古い順に " + withCommas(kShow) + L" 件まで出します" : L"");
-        else t += L"\r\n見つからなくなった画像（消した・動かした・ゴミ箱を空にした）は、ここに保管します（自動では消しません）";
+        else t += L"\r\n見つからなくなった画像（消した・動かした・ゴミ箱を空にした）は、ここに退避します（自動では消しません）";
         setText(summary, t);
         SendMessageW(list, WM_SETREDRAW, FALSE, 0);
         ListView_DeleteAllItems(list);
@@ -5680,35 +5680,35 @@ void archiveUi() {
                         byFile[rowFile[static_cast<size_t>(i)]].push_back(rows[static_cast<size_t>(i)].aid);
                     }
                 if (aids.empty()) {
-                    logBox(dlg, L"消すものを一覧で選んでください（Ctrl・Shift を押しながらクリックでいくつも）。", L"保管したデータ", MB_ICONINFORMATION);
-                } else if (logBox(dlg, (withCommas(aids.size()) + L" 件の保管を消しますか？\n\n守ってあったタグ（タガー・手動の確定）と CLIP のベクトルも消えます。元に戻せません。")
+                    logBox(dlg, L"消すものを一覧で選んでください（Ctrl・Shift を押しながらクリックでいくつも）。", L"退避した解析結果", MB_ICONINFORMATION);
+                } else if (logBox(dlg, (withCommas(aids.size()) + L" 件の退避を消しますか？\n\n守ってあったタグ（タガー・手動の確定）と CLIP のベクトルも消えます。元に戻せません。")
                                            .c_str(),
-                                  L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                                  L"退避した解析結果", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
                     size_t n = 0;
                     for (const auto& [f, list2] : byFile) n += deleteArchived(*db, f, list2);
-                    logs::info("保管を消した: " + std::to_string(n) + " 件（選んだもの）");
+                    logs::info("退避を消した: " + std::to_string(n) + " 件（選んだもの）");
                     fill();
                 }
             } else if (cmd == ID_OLD) {
-                const auto months = promptText(L"古いものを消す", L"何ヶ月より前に保管したものを消しますか（数字）", L"6");
+                const auto months = promptText(L"古いものを消す", L"何ヶ月より前に退避したものを消しますか（数字）", L"6");
                 EnableWindow(app.hwnd, FALSE);
                 if (months && _wtoi(months->c_str()) >= 0) {
                     const int mo = _wtoi(months->c_str());
                     const int64_t before = static_cast<int64_t>(std::time(nullptr)) - static_cast<int64_t>(mo) * 30 * 24 * 3600;
                     if (logBox(dlg, (std::to_wstring(mo) + L" ヶ月（" + std::to_wstring(mo * 30) +
-                                     L" 日）より前に保管したものを全部消しますか？\n\n元に戻せません。")
+                                     L" 日）より前に退避したものを全部消しますか？\n\n元に戻せません。")
                                         .c_str(),
-                               L"保管したデータ", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                               L"退避した解析結果", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
                         size_t n = 0;
                         for (const auto& f : archiveFilesInUse(*db, file)) n += deleteArchivedBefore(*db, f, before);
-                        logs::info("保管を消した: " + std::to_string(n) + " 件（" + std::to_string(mo) + " ヶ月より前）");
-                        logBox(dlg, (withCommas(n) + L" 件を消しました。").c_str(), L"保管したデータ", MB_ICONINFORMATION);
+                        logs::info("退避を消した: " + std::to_string(n) + " 件（" + std::to_string(mo) + " ヶ月より前）");
+                        logBox(dlg, (withCommas(n) + L" 件を消しました。").c_str(), L"退避した解析結果", MB_ICONINFORMATION);
                         fill();
                     }
                 }
             }
         } catch (const std::exception& e) {
-            logBox(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"保管したデータ", MB_ICONWARNING);
+            logBox(dlg, (L"できませんでした: " + widen(e.what())).c_str(), L"退避した解析結果", MB_ICONWARNING);
         }
     }
     EnableWindow(app.hwnd, TRUE);
@@ -5740,7 +5740,7 @@ void compactDbUi() {
     const int64_t after = sp.fileBytes - sp.freeBytes;
     const int64_t need = after * 2 + after / 10;  // 詰めた後の大きさの一時ファイルと、書き込みの記録（-wal）の分と少し
     std::wstring msg = L"DB（imgdupe.db）: " + gb(sp.fileBytes) + L"\r\n使っていない所: " + gb(sp.freeBytes) + L"\r\n詰めた後: 約 " + gb(after) +
-                       L"\r\n\r\n詰めている間は、バックグラウンドの解析が止まり、検索のタグの変更などが少し待たされます（数分〜数十分）。"
+                       L"\r\n\r\n詰めている間は、常駐解析が止まり、検索のタグの変更などが少し待たされます（数分〜数十分）。"
                        L"\r\n空き容量が約 " + gb(need) + L" 要ります（今の空き: " + gb(static_cast<int64_t>(freeBytes.QuadPart)) + L"）。";
     if (static_cast<int64_t>(freeBytes.QuadPart) < need) {
         logBox(app.hwnd, (msg + L"\r\n\r\n空き容量が足りないので、詰められません。").c_str(), L"DB を詰める", MB_ICONWARNING);
@@ -5751,7 +5751,7 @@ void compactDbUi() {
     indexer::requestCompact(app.dataDir);
     if (!indexer::isRunning()) indexer::start();
     logs::info("DB を詰めるよう頼んだ（" + narrow(gb(sp.fileBytes)) + "、使っていない所 " + narrow(gb(sp.freeBytes)) + "）");
-    if (ex.view) ex.view->SetSameStatus(L"DB を詰めるよう、バックグラウンドの解析に頼みました（進み具合と結果はタスクトレイの窓に出ます）");
+    if (ex.view) ex.view->SetSameStatus(L"DB を詰めるよう、常駐解析に頼みました（進み具合と結果はタスクトレイの窓に出ます）");
 }
 
 // DB を変換した後（前の表の分が空いたまま）、一度だけ「詰める」をすすめる
@@ -5870,14 +5870,14 @@ void layoutSearch(int y, int W) {
     lbl(app.s.lClip, px(70));
     put(app.s.clip, px(200));
     x += px(10);
-    lbl(app.s.lSmart, px(84));
+    lbl(app.s.lSmart, px(112));
     put(app.s.smart, px(170), px(300));
     put(app.s.smartSave, px(56));
     put(app.s.smartDelete, px(56));
     x += px(10);
     put(app.s.review, px(96));
     x += px(10);
-    put(app.s.expand, px(100));
+    put(app.s.expand, px(140));
     cy += rowH + px(5);
     x = m;
     put(app.s.inFolder, px(140));
@@ -5963,7 +5963,7 @@ void createSearchControls() {
     SendMessageW(app.s.free, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"フリーワード（空白で区切る。\"タグ\" で名前どおり）"));
     app.s.exclude = edit(IDC_S_EXCLUDE, sp);
     SendMessageW(app.s.exclude, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"除く語"));
-    app.s.scope = combo(IDC_S_SCOPE, sp, {L"探す所: すべて", L"タグだけ", L"タグだけ（名前どおり）", L"ファイルのタグだけ", L"タイトルだけ",
+    app.s.scope = combo(IDC_S_SCOPE, sp, {L"検索対象: すべて", L"タグだけ", L"タグだけ（名前どおり）", L"埋め込みタグだけ", L"タイトルだけ",
                                           L"ファイル名・フォルダ名だけ", L"カスタム（詳細検索のチェック）"});
     app.s.go = button(L"検索", IDC_S_GO, sp, BS_DEFPUSHBUTTON);
     app.s.end = button(L"検索を終了", IDC_S_END, sp);
@@ -5974,23 +5974,23 @@ void createSearchControls() {
     app.s.advanced = button(L"詳細検索 ▼", IDC_S_ADVANCED, sp);
     app.s.clear = button(L"条件をクリア", IDC_S_CLEAR, sp);
     // 2 段目: 内容（AI）・スマートフォルダ・確認キュー・フォルダに展開
-    app.s.lClip = label(L"内容で探す", sp);
+    app.s.lClip = label(L"内容検索", sp);
     app.s.clip = edit(IDC_S_CLIP, sp);
     SendMessageW(app.s.clip, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"夕焼けの海 など"));
-    app.s.lSmart = label(L"保存した条件", sp);
+    app.s.lSmart = label(L"スマートフォルダ", sp);
     app.s.smart = combo(IDC_S_SMART, sp, {});
     app.s.smartSave = button(L"保存…", IDC_S_SMART_SAVE, sp);
     app.s.smartDelete = button(L"管理…", IDC_S_SMART_DELETE, sp);  // 削除・並べ替え・書き出し
     app.s.review = button(L"確認キュー", IDC_S_REVIEW, sp, BS_AUTOCHECKBOX);
     // 「正しい」「違う」「タグ…」はリボンに出さない（メニューの「タグ」とキーで使える）
     std::vector<HWND> unused;
-    app.s.yes = button(L"正しい", IDC_S_YES, unused);
-    app.s.no = button(L"違う", IDC_S_NO, unused);
+    app.s.yes = button(L"確定", IDC_S_YES, unused);
+    app.s.no = button(L"否定", IDC_S_NO, unused);
     app.s.bulk = button(L"タグ…", IDC_S_BULK, unused);
     for (HWND h : unused) ShowWindow(h, SW_HIDE);
-    app.s.expand = button(L"フォルダを作成", IDC_S_EXPAND, sp);
+    app.s.expand = button(L"リンクフォルダを作成", IDC_S_EXPAND, sp);
     // 3 段目: このフォルダ内で探す（検索の様子は下のステータスバーに出す）
-    app.s.inFolder = button(L"このフォルダ内で探す", IDC_S_INFOLDER, sp, BS_AUTOCHECKBOX);
+    app.s.inFolder = button(L"このフォルダ内に限る", IDC_S_INFOLDER, sp, BS_AUTOCHECKBOX);
     app.s.folder = edit(IDC_S_FOLDER, sp);
     SendMessageW(app.s.folder, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"フォルダ（エクスプローラーで今いるフォルダ）"));
     app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_S_COUNT);  // 使わない（前の版の件数の行）
@@ -6001,7 +6001,7 @@ void createSearchControls() {
     app.s.rating = combo(IDC_S_RATING, ap, {L"指定なし", L"★1 以上", L"★2 以上", L"★3 以上", L"★4 以上", L"★5", L"星なし"});
     app.s.lFormat = label(L"形式", ap);
     app.s.format = combo(IDC_S_FORMAT, ap, {L"すべて", L"JPEG", L"PNG", L"GIF", L"WebP", L"HEIF", L"BMP", L"TIFF", L"JPEG XR", L"アニメーション"});
-    app.s.lQuality = label(L"品質", ap);
+    app.s.lQuality = label(L"画質", ap);
     app.s.quality = combo(IDC_S_QUALITY, ap, {L"すべて", L"くっきり", L"ぼやけている", L"拡大・細かさ不足", L"低解像度（実質 800px 未満）"});
     app.s.lWidth = label(L"幅（px）以上", ap);
     app.s.minW = edit(IDC_S_MINW, ap, ES_NUMBER);
@@ -6032,7 +6032,7 @@ void createSearchControls() {
         ShowWindow(app.s.noTaken, SW_HIDE);
     }
     app.s.unclassified = button(L"未分類（タグなし）", IDC_S_UNCLASSIFIED, ap, BS_AUTOCHECKBOX);
-    app.s.deadLinks = button(L"リンク切れ", IDC_S_DEADLINKS, ap, BS_AUTOCHECKBOX);
+    app.s.deadLinks = button(L"出典切れ", IDC_S_DEADLINKS, ap, BS_AUTOCHECKBOX);
     app.s.lConf = label(L"確度", ap);
     app.s.conf = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, IDC_S_CONF);
     SendMessageW(app.s.conf, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
@@ -6040,7 +6040,7 @@ void createSearchControls() {
     app.s.confValue = makeControl(WC_STATICW, L"0.50", SS_LEFT, IDC_S_CONF_VALUE);
     ap.insert(ap.end(), {app.s.conf, app.s.confValue});
     app.s.confDefault = button(L"既定", IDC_S_CONF_DEFAULT, ap);
-    app.s.lSources = label(L"探す所（タグは、チェックした出どころだけで確度を計算）", ap);
+    app.s.lSources = label(L"検索対象（タグはチェックした由来だけで確度を計算）", ap);
     app.s.sources = makeControl(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, IDC_S_SOURCES,
                                 WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(app.s.sources, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
@@ -6066,7 +6066,7 @@ void createSearchControls() {
          L"プレビューのタグをここにドラッグすると、語として足します"},
         {app.s.exclude, L"この語に合う画像を除きます（空白で区切って複数。フリーワードの -語 と同じ）"},
         {app.s.scope,
-         L"フリーワードで探す所のよく使う組み合わせ。選ぶと詳細検索の「探す所」のチェックがその組み合わせになります。"
+         L"フリーワードで検索対象のよく使う組み合わせ。選ぶと詳細検索の「検索対象」のチェックがその組み合わせになります。"
          L"チェックを自分で変えると「カスタム」になります"},
         {app.s.go, L"今の条件で探して、結果をエクスプローラーに出します（検索のリボンのどこでも Enter）"},
         {app.s.end, L"条件はそのままで検索をやめて、検索の前に見ていたフォルダに戻ります"},
@@ -6075,20 +6075,20 @@ void createSearchControls() {
         {app.s.confDefault, L"確度を既定の 0.50 に戻します"},
         {app.s.sort, L"結果の並べ方"},
         {app.s.desc, L"チェックすると逆の順（大きい・新しいものから）に並べます"},
-        {app.s.advanced, L"星・形式・品質・大きさ・日付・ダウンロード元・探す所などの細かい条件を出す・隠す"},
+        {app.s.advanced, L"星・形式・品質・大きさ・日付・ダウンロード元・検索対象などの細かい条件を出す・隠す"},
         {app.s.clear, L"入力した条件を初めの状態に戻します（探しません。並び順と確度はそのまま）"},
         {app.s.clip,
          L"画像に写っているものを言葉で探します（AI の CLIP が画像と言葉の近さを比べます。タグが付いていなくても探せます）。"
          L"例: 夕焼けの海、白い猫、赤い服の女の子。英語のほうが正確です。CLIP を入れてある時だけ"},
         {app.s.lClip, L"画像に写っているものを言葉で探します（AI）"},
-        {app.s.smart, L"保存した条件を選ぶと、その条件をリボンに戻します（探すのは「検索」か Enter で）"},
+        {app.s.smart, L"スマートフォルダを選ぶと、その条件をリボンに戻します（探すのは「検索」か Enter で）"},
         {app.s.smartSave, L"今の条件に名前を付けて保存します（スマートフォルダ）"},
-        {app.s.smartDelete, L"保存した条件を削除・並べ替え・名前の変更・書き出し（JSON）・読み込みします"},
+        {app.s.smartDelete, L"スマートフォルダを削除・並べ替え・名前の変更・書き出し（JSON）・読み込みします"},
         {app.s.review, L"チェックすると、AI のタグが当たっているか迷っている画像から順に並べます（確かめる時に）"},
         {app.s.expand,
          L"検索の結果の画像を、ハードリンクで 1 つのフォルダ（ドライブごとの _vfolders の下）に並べます。"
          L"ほかのアプリ（ビューアなど）でその画像だけを見られます。容量は増えず、元のファイルも動きません。"
-         L"このソフトを終了すると消えます（残す時は「表示 → 展開したフォルダ」で固定にします）"},
+         L"このソフトを終了すると消えます（残す時は「表示 → リンクフォルダ」で固定にします）"},
         {app.s.rating, L"星（レーティング）で絞ります"},
         {app.s.format, L"ファイルの形式で絞ります"},
         {app.s.quality, L"くっきり・ぼやけ・拡大された画像などで絞ります（品質を調べてある時だけ）"},
@@ -6107,7 +6107,7 @@ void createSearchControls() {
         {app.s.download, L"ダウンロード元の URL にこの文字を含む画像だけ"},
         {app.s.conf, L"タグの確度がこれ以上のものだけをタグとして使います"},
         {app.s.sources,
-         L"フリーワードで探す所。タグは、チェックした出どころだけで確度を計算します（数はタグの数。手動で確定したタグはいつも使います）。"
+         L"フリーワードで検索対象。タグは、チェックしたタグの由来だけで確度を計算します（数はタグの数。手動で確定したタグはいつも使います）。"
          L"「タグの部分一致」を外すと、タグは名前どおりにだけ合います"},
         {app.exact, L"中身がまったく同じファイルだけを探します（見た目では比べない）"},
         {app.flat, L"真っ白・真っ黒など単色に近い画像も見た目で比べます（別の画像がまとまりやすくなります）"},
@@ -6388,9 +6388,9 @@ void layout() {
         MoveWindow(app.dupBar, m, y, barW, panelH - px(4), TRUE);
         int x = m + barW + px(8);
         int cy = y + px(2);
-        MoveWindow(app.thresholdCaption, x, cy + px(4), px(58), rowH - px(4), TRUE);
-        MoveWindow(app.threshold, x + px(60), cy, px(150), rowH + px(4), TRUE);
-        MoveWindow(app.thresholdLabel, x + px(214), cy + px(4), px(110), rowH - px(4), TRUE);
+        MoveWindow(app.thresholdCaption, x, cy + px(4), px(118), rowH - px(4), TRUE);
+        MoveWindow(app.threshold, x + px(120), cy, px(150), rowH + px(4), TRUE);
+        MoveWindow(app.thresholdLabel, x + px(274), cy + px(4), px(110), rowH - px(4), TRUE);
         cy += rowH + px(4);
         MoveWindow(app.exact, x, cy, px(110), rowH, TRUE);
         MoveWindow(app.flat, x + px(114), cy, px(180), rowH, TRUE);
@@ -6563,7 +6563,7 @@ bool writeBytes(const std::wstring& path, const void* data, size_t size) {
 void setQueryStatus(const std::wstring& text) {
     if (app.queryTags) SetWindowTextW(app.queryTags, text.c_str());
     if (text.find(L"できませんでした") != std::wstring::npos || text.find(L"読めません") != std::wstring::npos)
-        logs::warn("画像で探す: " + narrow(text));
+        logs::warn("画像から検索: " + narrow(text));
 }
 
 bool isUrlText(const std::wstring& s) { return _wcsnicmp(s.c_str(), L"http://", 7) == 0 || _wcsnicmp(s.c_str(), L"https://", 8) == 0; }
@@ -6603,7 +6603,7 @@ void onQueryFetched(QueryFetched* p) {
     if (storeQuery(r->ext, [&](const std::wstring& path) { return writeBytes(path, body.data(), body.size()); }).empty())
         setQueryStatus(L"画像を置けませんでした");
     else
-        setQueryStatus(L"URL の画像を足しました。上のボタンで、同じ画像・似た画像を探したり、タグを生成したりできます");
+        setQueryStatus(L"URL の画像を足しました。上のボタンで、同じ画像・類似画像を探したり、タグを生成したりできます");
 }
 
 // ファイル・URL（ドロップ・貼り付け・ファイルの選択）を足す
@@ -6616,7 +6616,7 @@ void addQueryInputs(const std::vector<std::wstring>& files, const std::wstring& 
             ++added;
     }
     if (!url.empty()) addQueryUrl(url);
-    else if (added) setQueryStatus(std::to_wstring(added) + L" 枚を足しました。上のボタンで、同じ画像・似た画像を探したり、タグを生成したりできます");
+    else if (added) setQueryStatus(std::to_wstring(added) + L" 枚を足しました。上のボタンで、同じ画像・類似画像を探したり、タグを生成したりできます");
     else if (!files.empty()) setQueryStatus(L"画像のファイルか、画像の URL をドロップしてください");
 }
 
@@ -6649,7 +6649,7 @@ void queryPaste() {
         if (storeQuery(L".bmp", [&](const std::wstring& path) { return writeBytes(path, bmp.data(), bmp.size()); }).empty())
             setQueryStatus(L"クリップボードの画像を置けませんでした");
         else
-            setQueryStatus(L"クリップボードの画像を足しました。上のボタンで、同じ画像・似た画像を探したり、タグを生成したりできます");
+            setQueryStatus(L"クリップボードの画像を足しました。上のボタンで、同じ画像・類似画像を探したり、タグを生成したりできます");
         return;
     }
     const size_t nl = text.find_first_of(L"\r\n");
@@ -6684,7 +6684,7 @@ void querySimilar() {
     const std::wstring p = querySelected();
     if (p.empty() || app.queryBusy) return;
     app.queryBusy = true;
-    setQueryStatus(L"似た画像を探すために、画像を AI（CLIP）で読んでいます…（最初の 1 回は数秒かかります）");
+    setQueryStatus(L"類似画像を探すために、画像を AI（CLIP）で読んでいます…（最初の 1 回は数秒かかります）");
     HWND hwnd = app.hwnd;
     const std::wstring dataDir = app.dataDir;
     std::thread([p, hwnd, dataDir] {
@@ -6701,16 +6701,16 @@ void onQueryVector(QueryVector* p) {
     std::unique_ptr<QueryVector> r(p);
     app.queryBusy = false;
     if (!r->error.empty()) {
-        setQueryStatus(L"似た画像を探せませんでした: " + r->error);
+        setQueryStatus(L"類似画像を探せませんでした: " + r->error);
         return;
     }
     // 検索の「内容で探す」をこの画像にして探す（リボンの条件はクリアしてから。結果はエクスプローラーに出す）
     clearSearchConditions();
     app.similarTo = 0;
     app.similarVec = std::move(r->v);
-    app.similarLabel = L"似た画像: " + fileNameOf(r->path);
+    app.similarLabel = L"類似画像: " + fileNameOf(r->path);
     SetWindowTextW(app.s.clip, app.similarLabel.c_str());
-    setQueryStatus(L"似た画像を探しました（結果はエクスプローラーに出します）");
+    setQueryStatus(L"類似画像を探しました（結果はエクスプローラーに出します）");
     runSearch();
 }
 
@@ -6736,7 +6736,7 @@ void queryTags() {
                 tagger::LoadResult lr = tagger::load(dataDir, 2);
                 app.guiTagger = lr.analyzer;
                 if (!lr.analyzer)
-                    r->error = !lr.error.empty() ? lr.error : L"WD14 タガーが入っていません（「その他 → AI 解析の部品…」で入れられます）";
+                    r->error = !lr.error.empty() ? lr.error : L"WD14 タガーが入っていません（「その他 → AI の部品…」で入れられます）";
             }
             tagger = app.guiTagger;
         }
@@ -6899,8 +6899,8 @@ LRESULT CALLBACK queryStripProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             app.querySel = path;
             drawQueryStripLater();
             HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, CMD_QUERY_SAME, L"同じ画像を探す(&S)");
-            AppendMenuW(menu, MF_STRING, CMD_QUERY_SIMILAR, L"似た画像を探す（AI）(&A)");
+            AppendMenuW(menu, MF_STRING, CMD_QUERY_SAME, L"同一画像を探す(&S)");
+            AppendMenuW(menu, MF_STRING, CMD_QUERY_SIMILAR, L"類似画像を探す（AI）(&A)");
             AppendMenuW(menu, MF_STRING, CMD_QUERY_TAGS, L"タグを生成（AI）(&T)");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, 1, L"開く(&O)");
@@ -6959,7 +6959,7 @@ void createQueryControls() {
                L"画像をここにドロップしても足せます（エクスプローラー・ブラウザーから）");
     addTooltip(tip, app.queryTags, L"生成したタグや、今の様子");
     refreshQueryFiles();
-    setQueryStatus(L"画像を足して（貼り付け・ドロップ・ファイル・URL）、左のボタンで、同じ画像・似た画像を探したり、タグを生成したりします");
+    setQueryStatus(L"画像を足して（貼り付け・ドロップ・ファイル・URL）、左のボタンで、同じ画像・類似画像を探したり、タグを生成したりします");
 }
 
 struct ToolButton {
@@ -6974,9 +6974,9 @@ const ToolButton kToolButtons[] = {
     {CMD_OPEN, 0xE8E5, L"開", L"開く", false},
     {CMD_EXPLORER, 0xE838, L"場", L"場所を表示", false},
     {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
-    {CMD_REFRESH, 0xE72C, L"新", L"更新", true},
+    {CMD_REFRESH, 0xE72C, L"新", L"再読み込み", true},
     {0, 0, nullptr, nullptr, false},
-    {CMD_FIND_SAME, 0xE71E, L"同", L"同じ画像を探す", true},
+    {CMD_FIND_SAME, 0xE71E, L"同", L"同一画像を探す", true},
     {0, 0, nullptr, nullptr, false},
     {CMD_STATS, 0xE9D2, L"統", L"統計", true},
     {CMD_SETTINGS, 0xE713, L"設", L"設定", true},
@@ -6991,13 +6991,13 @@ const ToolButton kQueryButtons[] = {
     {CMD_QUERY_URL, 0xE71B, L"U", L"URL", true},
     {0, 0, nullptr, nullptr, false},
     {CMD_QUERY_SAME, 0xE71E, L"同", L"同じ画像", true},
-    {CMD_QUERY_SIMILAR, 0xE8B9, L"似", L"似た画像（AI）", true},
+    {CMD_QUERY_SIMILAR, 0xE8B9, L"似", L"類似画像（AI）", true},
     {CMD_QUERY_TAGS, 0xE8EC, L"タ", L"タグを生成（AI）", true},
 };
 const ToolButton kDupButtons[] = {
-    {CMD_SEARCH, 0xE721, L"検", L"検索開始", true},
-    {CMD_QUERY, 0xE8B9, L"1", L"1 枚で検索", true},
-    {CMD_EXPORT, 0xE74E, L"保", L"結果を保存", false},
+    {CMD_SEARCH, 0xE721, L"検", L"チェック開始", true},
+    {CMD_QUERY, 0xE8B9, L"1", L"1 枚の重複チェック", true},
+    {CMD_EXPORT, 0xE74E, L"保", L"結果を書き出す", false},
 };
 
 // リボンのボタンの並び（大きな絵の下に名前。Massiguraedit と同じ記号フォントの絵）
@@ -7054,7 +7054,7 @@ void createQueryControls();
 void createControls() {
     app.tabs = makeControl(WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, IDC_TABS);
     createToolbar();
-    for (const wchar_t* t : {L"ホーム", L"重複を探す", L"検索", L"画像で探す"}) {
+    for (const wchar_t* t : {L"ホーム", L"重複チェック", L"検索", L"画像から検索"}) {
         TCITEMW it{};
         it.mask = TCIF_TEXT;
         it.pszText = const_cast<wchar_t*>(t);
@@ -7063,14 +7063,14 @@ void createControls() {
     ex.view = std::make_unique<Explorer>();
     ex.view->Create(app.hwnd, &ex, loadExplorerSettings());
     app.ribbonLine = makeControl(WC_STATICW, L"", SS_ETCHEDHORZ, IDC_RIBBON_LINE);
-    app.foldersLabel = makeControl(WC_STATICW, L"調べるフォルダ（インデックスも作ります）", SS_NOPREFIX, IDC_FOLDERS_LABEL);
+    app.foldersLabel = makeControl(WC_STATICW, L"監視フォルダ（解析も作ります）", SS_NOPREFIX, IDC_FOLDERS_LABEL);
     app.folders = makeControl(WC_LISTBOXW, L"", WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_EXTENDEDSEL | LBS_NOINTEGRALHEIGHT,
                               IDC_FOLDERS, WS_EX_CLIENTEDGE);
     app.add = makeControl(WC_BUTTONW, L"フォルダを追加…", WS_TABSTOP, CMD_ADD_FOLDER);
     app.remove = makeControl(WC_BUTTONW, L"選んだフォルダを外す", WS_TABSTOP, CMD_REMOVE_FOLDER);
     ShowWindow(app.add, SW_HIDE);  // リボンのボタンを使う
     ShowWindow(app.remove, SW_HIDE);
-    app.thresholdCaption = makeControl(WC_STATICW, L"しきい値", 0, IDC_THRESHOLD_CAPTION);
+    app.thresholdCaption = makeControl(WC_STATICW, L"見た目一致の厳しさ", 0, IDC_THRESHOLD_CAPTION);
     app.threshold = makeControl(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS, IDC_THRESHOLD);
     SendMessageW(app.threshold, TBM_SETRANGE, TRUE, MAKELPARAM(0, kMaxThreshold));
     SendMessageW(app.threshold, TBM_SETTICFREQ, 5, 0);
@@ -7080,7 +7080,7 @@ void createControls() {
     app.variants = makeControl(WC_BUTTONW, L"差分（AI）も出す", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_VARIANTS);
     app.progress = makeControl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
     SendMessageW(app.progress, PBM_SETRANGE32, 0, 1000);
-    app.status = makeControl(WC_STATICW, L"「検索開始」で、調べるフォルダの中の重複を探します。", SS_ENDELLIPSIS | SS_NOPREFIX,
+    app.status = makeControl(WC_STATICW, L"「チェック開始」で、監視フォルダの中の重複を探します。", SS_ENDELLIPSIS | SS_NOPREFIX,
                              IDC_STATUS);
 
     app.groups = makeControl(WC_LISTVIEWW, L"",
@@ -7134,12 +7134,12 @@ const wchar_t* commandHelp(int id) {
         case CMD_OPEN: return L"選んだ画像・ファイルを、関連付けられたアプリで開きます（Enter）";
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
-        case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（バックグラウンドの解析が行います）";
+        case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（常駐解析が行います）";
         case CMD_REMAP_ROOT:
-            return L"ドライブレターやフォルダの名前が変わった調べるフォルダを、新しい場所に付け替えます（作ったタグ・CLIP などはそのまま引き継ぎ、解析をやり直しません）";
-        case CMD_ARCHIVE: return L"見つからなくなった画像（消した・動かした・ゴミ箱を空にした）のタグ・CLIP などを保管してあります。一覧を見て、要らないものを消せます";
+            return L"ドライブレターやフォルダの名前が変わった監視フォルダを、新しい場所に場所を変更します（作ったタグ・CLIP などはそのまま引き継ぎ、解析をやり直しません）";
+        case CMD_ARCHIVE: return L"見つからなくなった画像（消した・動かした・ゴミ箱を空にした）のタグ・CLIP などを退避してあります。一覧を見て、要らないものを消せます";
         case CMD_REFRESH: return L"画面の控え（フォルダの中身・サムネイル・画像の情報）を捨てて、今の場所を読み直します。移動したファイルが残っている時など（Ctrl+F5）。"
-                                 L"バックグラウンドの解析はしません（要る時はタスクトレイの解析から）";
+                                 L"常駐解析はしません（要る時はタスクトレイの解析から）";
         case CMD_FIND_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、今いるフォルダに関係なく調べた全部のフォルダから探して一覧に出します（Ctrl+M）";
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
         case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
@@ -7148,8 +7148,8 @@ const wchar_t* commandHelp(int id) {
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
         case CMD_HELP: return L"使い方の説明を出します（F1）";
         case CMD_OPEN_LOGS: return L"動作履歴（ログ）のフォルダを開きます。おかしな動きをした時は、ここの .log を見せてください";
-        case CMD_SEARCH: return L"調べるフォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
-        case CMD_QUERY: return L"画像を 1 枚選んで、それと同じ・似た画像を探します（Ctrl+F）";
+        case CMD_SEARCH: return L"監視フォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
+        case CMD_QUERY: return L"画像を 1 枚選んで、それと同じ・類似画像を探します（Ctrl+F）";
         case CMD_EXPORT: return L"重複の結果を CSV と、サムネイル付きの HTML に書き出します（Ctrl+S）";
         case CMD_QUERY_PASTE:
             return L"クリップボードの画像（スクリーンショット・ブラウザーでコピーした画像）、コピーした画像のファイル、画像の URL を足します（Ctrl+Shift+V）";
@@ -7157,7 +7157,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_QUERY_URL: return L"画像の URL を入れて、ダウンロードして足します";
         case CMD_QUERY_SAME: return L"選んだ画像と同じ画像（完全一致・見た目一致）を、調べた全部のフォルダから探してエクスプローラーの一覧に出します";
         case CMD_QUERY_SIMILAR:
-            return L"選んだ画像に似た画像を AI（CLIP）で探して、エクスプローラーに似ている順に出します（検索のリボンの条件も使います）";
+            return L"選んだ画像に類似画像を AI（CLIP）で探して、エクスプローラーに似ている順に出します（検索のリボンの条件も使います）";
         case CMD_QUERY_TAGS: return L"選んだ画像に AI（WD14 タガー）でタグを付けて、右に出します（ファイルにも DB にも書きません）";
     }
     return nullptr;
@@ -7489,7 +7489,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (LOWORD(wp)) {
                 case CMD_ADD_FOLDER:
                     if (!app.running) {
-                        for (const auto& f : pickFolders(L"調べるフォルダを選ぶ")) addFolder(f);
+                        for (const auto& f : pickFolders(L"監視フォルダを選ぶ")) addFolder(f);
                         saveSettings();
                         if (ex.view) ex.view->RefreshStates();
                     }
@@ -7503,7 +7503,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_SCAN_FOLDER:
                 case CMD_SCAN_FOLDER_TOP: {
                     const bool top = LOWORD(wp) == CMD_SCAN_FOLDER_TOP;
-                    const auto dirs = pickFolders(top ? L"最優先でスキャンするフォルダを選ぶ" : L"スキャンタスクに追加するフォルダを選ぶ");
+                    const auto dirs = pickFolders(top ? L"最優先でスキャンするフォルダを選ぶ" : L"解析の予約に追加するフォルダを選ぶ");
                     if (!dirs.empty()) addScanTask(dirs, top);
                     if (ex.view) ex.view->RefreshStates();
                     break;
@@ -7647,9 +7647,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     saveSettings();  // 調べるフォルダを DB に書いてから
                     if (indexer::isRunning()) {
                         indexer::requestQuit(app.dataDir);
-                        setText(app.status, L"バックグラウンドの解析を止めました");
+                        setText(app.status, L"常駐解析を止めました");
                     } else if (indexer::start()) {
-                        setText(app.status, L"バックグラウンドの解析を始めました（タスクトレイに常駐します）");
+                        setText(app.status, L"常駐解析を始めました（タスクトレイに常駐します）");
                     }
                     break;
                 case CMD_INDEXER_AUTOSTART: {
@@ -7673,9 +7673,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             const std::string t =
                                 "見本画像のフォルダ\r\n\r\n"
                                 "ここに「キャラ名」や「作者名」のフォルダを作り、その人の画像を 10〜30 枚入れてください。\r\n"
-                                "バックグラウンドの解析が見本の CLIP のベクトルを作り、それに近い画像に、フォルダの名前のタグを付けます\r\n"
-                                "（出どころ「見本画像との類似」）。新しいキャラも、見本を足すだけで探せるようになります。\r\n"
-                                "確認キューで「正しい」と確定した画像（同じタグに 3 枚以上）も、自動で見本になります。\r\n";
+                                "常駐解析が見本の CLIP のベクトルを作り、それに近い画像に、フォルダの名前のタグを付けます\r\n"
+                                "（タグの由来「見本画像との類似」）。新しいキャラも、見本を足すだけで探せるようになります。\r\n"
+                                "確認キューで「確定」と確定した画像（同じタグに 3 枚以上）も、自動で見本になります。\r\n";
                             fwrite(t.data(), 1, t.size(), f);
                             fclose(f);
                         }
@@ -7709,7 +7709,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_INITMENUPOPUP: {
             HMENU m = reinterpret_cast<HMENU>(wp);
             const bool on = indexer::isRunning();
-            std::wstring text = on ? L"バックグラウンドの解析を止める(&B)" : L"バックグラウンドの解析を始める(&B)";
+            std::wstring text = on ? L"常駐解析を止める(&B)" : L"常駐解析を始める(&B)";
             const std::string key = keyLabel(app.keys, CMD_INDEXER_TOGGLE);
             if (!key.empty()) text += L"\t" + widen(key);
             ModifyMenuW(m, CMD_INDEXER_TOGGLE, MF_BYCOMMAND | MF_STRING, CMD_INDEXER_TOGGLE, text.c_str());
@@ -7763,7 +7763,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 msg += (msg.empty() ? L"" : L"、") + from + L" → " + to;
             }
             saveSettings();
-            if (ex.view) ex.view->SetSameStatus(L"ドライブレターが変わった調べるフォルダを付け替えました（解析はやり直しません）: " + msg);
+            if (ex.view) ex.view->SetSameStatus(L"ドライブレターが変わった監視フォルダを場所を変更しました（解析はやり直しません）: " + msg);
             return 0;
         }
         case WM_APP_OFFLINE:
@@ -7870,7 +7870,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (app.modelsDownloading) {
-                if (logBox(hwnd, L"AI 解析の部品をダウンロードしています。中止して終了しますか？\r\n（入れ終わった部品はそのまま使えます）",
+                if (logBox(hwnd, L"AI の部品をダウンロードしています。中止して終了しますか？\r\n（入れ終わった部品はそのまま使えます）",
                                 L"imgdupe", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     app.closeAfterModels = true;
                     app.modelsCancel = true;
@@ -7930,7 +7930,7 @@ private:
 };
 
 const wchar_t kCliUsage[] =
-    L"使い方: imgdupe.exe --cli <フォルダ>... [-t しきい値(0-20, 既定10)] [-o 出力名(拡張子なし)] [--exact-only]\r\n"
+    L"使い方: imgdupe.exe --cli <フォルダ>... [-t 見た目一致の厳しさ(0-20, 既定10)] [-o 出力名(拡張子なし)] [--exact-only]\r\n"
     L"                    [--include-flat] [-q 画像] [--db キャッシュ] [-j スレッド数]\r\n"
     L"  <出力名>.csv と <出力名>.html を書き出します（既定: imgdupe_result）。";
 
@@ -8176,12 +8176,12 @@ void startTagConversion() {
         Db db;
         if (!db.open(path)) return;
         tagConv.handle = db.handle();
-        logs::info("タグの置き場所の変換を、画面の側で始める（バックグラウンドの解析が動いていないので）");
+        logs::info("タグの置き場所の変換を、画面の側で始める（常駐解析が動いていないので）");
         std::string step;
         bool finished = false;
         while (!tagConv.stop) {
             if (indexer::isRunning()) {  // 解析が動いている: そちらに任せる
-                post(L"DB の変換は、バックグラウンドの解析が続けます");
+                post(L"DB の変換は、常駐解析が続けます");
                 break;
             }
             try {
@@ -8360,7 +8360,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (Db* db = uiDb()) {
         try {
             if (tagConversionState(*db).pending)
-                ex.view->SetSameStatus(L"DB を新しい形に変換しています（初回だけ。バックグラウンドの解析が行います。進み具合はタスクトレイの窓に出ます）");
+                ex.view->SetSameStatus(L"DB を新しい形に変換しています（初回だけ。常駐解析が行います。進み具合はタスクトレイの窓に出ます）");
         } catch (const std::exception&) {
         }
     }

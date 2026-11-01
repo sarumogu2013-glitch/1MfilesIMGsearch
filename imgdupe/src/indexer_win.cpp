@@ -264,7 +264,7 @@ void driveLoop() {
         try {
             syncDrives(g->dataDir, roots, true, &g->quit);
         } catch (const std::exception& e) {
-            logs::error(std::string("ドライブの正本に書き戻せなかった: ") + e.what());
+            logs::error(std::string("ドライブ記録にドライブへ記録できなかった: ") + e.what());
         }
     }
 }
@@ -415,7 +415,7 @@ void runOnce(const std::vector<std::wstring>& roots, bool full) {
                 swprintf(t, 240, L"%02d:%02d に完了（画像 %zu 枚、追加 %zu・削除 %zu、ハッシュ %zu、サムネイル %zu、メタデータ %zu）",
                          now.wHour, now.wMinute, r.files, r.added, r.removed, r.hashed, r.thumbs, r.metas);
             else
-                swprintf(t, 240, L"%02d:%02d にスキャンタスク %zu 個が完了（画像 %zu 枚）", now.wHour, now.wMinute, r.tasks, r.files);
+                swprintf(t, 240, L"%02d:%02d に解析の予約 %zu 個が完了（画像 %zu 枚）", now.wHour, now.wMinute, r.tasks, r.files);
             setStatus(&g->lastResult, t);
         }
     } catch (const std::exception& e) {
@@ -444,7 +444,7 @@ void workLoop() {
             for (const auto& c : takeCommands(db)) handleCommand(db, c);
             const std::vector<std::string> r = getRoots(db);
             if (r != rootsUtf8) {
-                logs::info("調べるフォルダ: " + std::to_string(r.size()) + " 個");
+                logs::info("監視フォルダ: " + std::to_string(r.size()) + " 個");
                 rootsUtf8 = r;
                 std::lock_guard<std::mutex> lock(g->m);
                 g->roots.clear();
@@ -475,7 +475,7 @@ void workLoop() {
         }
         const bool full = g->dirty && !rootsUtf8.empty();
         std::wstring reason = g->paused                         ? L"一時停止中"
-                              : rootsUtf8.empty() && !haveTasks ? L"調べるフォルダがありません"
+                              : rootsUtf8.empty() && !haveTasks ? L"監視フォルダがありません"
                                                                 : busyReason();
         {
             static std::wstring lastReason = L"-";
@@ -584,7 +584,7 @@ const wchar_t* phaseName(IndexPhase p) {
         case IndexPhase::Tagger: return L"タグ付け（WD14）";
         case IndexPhase::Clip: return L"CLIP";
         case IndexPhase::Variants: return L"差分のまとまり";
-        case IndexPhase::Quality: return L"品質";
+        case IndexPhase::Quality: return L"画質";
         case IndexPhase::Lookup: return L"出典の照会";
         case IndexPhase::Merge: return L"仕上げ（辞書・親子関係）";
         case IndexPhase::Convert: return L"DB の変換（タグの置き場所を新しい形に。初回だけ）";
@@ -619,7 +619,7 @@ void countOverall() {
                 rows.push_back({L"json・フォルダ名", stageCount(db, kStageNames, kNamesVersion)});
                 if (const int tv = tagger::stageVersion(g->dataDir)) rows.push_back({L"タグ付け（WD14）", stageCount(db, stage::kTagger, tv)});
                 if (const int cv = clip::stageVersion(g->dataDir)) rows.push_back({L"CLIP", stageCount(db, kStageClip, cv)});
-                if (clip::qualityEnabled(g->dataDir)) rows.push_back({L"品質", stageCount(db, kStageQuality, kQualityVersion)});
+                if (clip::qualityEnabled(g->dataDir)) rows.push_back({L"画質", stageCount(db, kStageQuality, kQualityVersion)});
             }
         } catch (const std::exception&) {
         }
@@ -754,7 +754,7 @@ void paintTasks(HDC dc, const RECT& rc, int m, int y, HFONT font, HFONT bold) {
             sub = L"▶ 処理中: " + lanes;
             SetTextColor(dc, RGB(30, 130, 60));
         } else {
-            sub = fixed ? L"タスクが無くなってから、調べるフォルダ全体の変化を見ます" : taskPathsText(g->tasks[i]);
+            sub = fixed ? L"タスクが無くなってから、監視フォルダ全体の変化を見ます" : taskPathsText(g->tasks[i]);
             SetTextColor(dc, RGB(120, 120, 120));
         }
         DrawTextW(dc, sub.c_str(), -1, &sr,
@@ -772,7 +772,7 @@ void paintTasks(HDC dc, const RECT& rc, int m, int y, HFONT font, HFONT bold) {
         RECT er = {m, g_taskTop + rowH + popupPx(6), rc.right - m, g_taskBottom};
         SetTextColor(dc, RGB(120, 120, 120));
         DrawTextW(dc,
-                  L"スキャンタスクはありません。imgdupe でフォルダやファイルを右クリックして「スキャンタスクに追加」で足せます。",
+                  L"解析の予約はありません。imgdupe でフォルダやファイルを右クリックして「解析の予約に追加」で足せます。",
                   -1, &er, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
     }
 }
@@ -791,7 +791,7 @@ void paintPopup(HDC dc, const RECT& rc) {
     int y = m;
     RECT tr = {m, y, rc.right - m, y + popupPx(20)};
     SetTextColor(dc, RGB(30, 30, 30));
-    DrawTextW(dc, L"インデックスの作成状況", -1, &tr, DT_LEFT | DT_SINGLELINE);
+    DrawTextW(dc, L"解析の作成状況", -1, &tr, DT_LEFT | DT_SINGLELINE);
     y += popupPx(26);
     // 切り替え
     SelectObject(dc, font);
@@ -845,7 +845,7 @@ void paintPopup(HDC dc, const RECT& rc) {
             const auto gpuPhase = static_cast<IndexPhase>(g->prog.gpuPhase.load());
             const int64_t task = g->prog.task;
             if (task == 0) text(L"対象: フォルダ全体の確認", RGB(90, 90, 90));
-            else if (const ScanTask* t = task > 0 ? findTask(task) : nullptr) text(L"対象: スキャンタスク「" + widen(t->label) + L"」", RGB(90, 90, 90));
+            else if (const ScanTask* t = task > 0 ? findTask(task) : nullptr) text(L"対象: 解析の予約「" + widen(t->label) + L"」", RGB(90, 90, 90));
             // CPU の側と GPU の側（同時に進める）。それぞれ段階の名前と進み具合の棒
             auto lane = [&](const wchar_t* side, IndexPhase p, const Progress& pr, int laneNo) {
                 if (p == IndexPhase::Idle || p == IndexPhase::Done) return;
@@ -1156,7 +1156,7 @@ void togglePopup(bool toggle = true, int view = -1) {
 }
 
 void updateTip() {
-    const std::wstring tip = L"imgdupe（バックグラウンドの解析）\n" + statusText();
+    const std::wstring tip = L"imgdupe（常駐解析）\n" + statusText();
     lstrcpynW(g->nid.szTip, tip.c_str(), ARRAYSIZE(g->nid.szTip));
     g->nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g->nid);
@@ -1171,7 +1171,7 @@ void addTrayIcon() {
     g->nid.uCallbackMessage = WM_TRAY;
     g->nid.hIcon = static_cast<HICON>(LoadImageW(g->inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
                                                  GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
-    lstrcpynW(g->nid.szTip, L"imgdupe（バックグラウンドの解析）", ARRAYSIZE(g->nid.szTip));
+    lstrcpynW(g->nid.szTip, L"imgdupe（常駐解析）", ARRAYSIZE(g->nid.szTip));
     Shell_NotifyIconW(NIM_ADD, &g->nid);
 }
 
@@ -1191,7 +1191,7 @@ void showMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g->paused ? MF_CHECKED : 0), ID_PAUSE, L"一時停止(&P)");
     AppendMenuW(menu, MF_STRING, ID_RESCAN, L"今すぐ調べ直す(&R)");
-    AppendMenuW(menu, MF_STRING, ID_TASKS, L"スキャンタスクの一覧(&T)");
+    AppendMenuW(menu, MF_STRING, ID_TASKS, L"解析の予約の一覧(&T)");
     {
         HMENU sub = CreatePopupMenu();
         for (int i = kLoadLight; i <= kLoadHeavy; ++i)
@@ -1201,7 +1201,7 @@ void showMenu() {
     AppendMenuW(menu, MF_STRING, ID_OPEN_GUI, L"imgdupe を開く(&O)");
     AppendMenuW(menu, MF_STRING, ID_LOGS, L"動作履歴（ログ）のフォルダを開く(&G)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_QUIT, L"バックグラウンドの解析を終了(&X)");
+    AppendMenuW(menu, MF_STRING, ID_QUIT, L"常駐解析を終了(&X)");
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g->hwnd);  // メニューの外をクリックした時に閉じるように
@@ -1389,19 +1389,19 @@ int syncDrives(const std::wstring& dataDir, const std::vector<std::wstring>& roo
                     continue;
                 }
                 if (r.kind == imgdupe::DriveSync::Imported)
-                    logs::info("ドライブ " + d.root + " の正本から読み戻した（画像 " + std::to_string(r.imported) + " 枚）");
+                    logs::info("ドライブ " + d.root + " のドライブ記録からドライブから取り込んだ（画像 " + std::to_string(r.imported) + " 枚）");
                 ok.push_back(d);
             } catch (const std::exception& e) {
-                logs::warn("ドライブ " + d.root + " の正本を開けなかった: " + e.what());
+                logs::warn("ドライブ " + d.root + " のドライブ記録を開けなかった: " + e.what());
                 imgdupe::markWritebackFailed(db, d.root, now);
             }
         }
         imgdupe::markDrivesSeen(db, seen, now);
         if (writeback && !ok.empty()) {
             for (const auto& r : imgdupe::writebackDrives(db, ok, vec, now, cancel)) {
-                if (r.failed) logs::warn("ドライブ " + r.root + " の正本に書き戻せなかった: " + r.error);
+                if (r.failed) logs::warn("ドライブ " + r.root + " のドライブ記録にドライブへ記録できなかった: " + r.error);
                 else if (r.images || r.removed || r.vectors)
-                    logs::info("ドライブ " + r.root + " の正本に書き戻した: 画像 " + std::to_string(r.images) + " 枚・消えた " +
+                    logs::info("ドライブ " + r.root + " のドライブ記録にドライブへ記録した: 画像 " + std::to_string(r.images) + " 枚・消えた " +
                                std::to_string(r.removed) + "・CLIP " + std::to_string(r.vectors));
                 if (r.conflict) ++conflicts;
             }

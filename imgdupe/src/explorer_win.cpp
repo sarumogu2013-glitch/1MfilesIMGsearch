@@ -777,7 +777,7 @@ class ExplorerImpl {
     const size_t others = items.size() - dirs - images;
     std::wstring t = L"フォルダ " + std::to_wstring(dirs) + L" 個・画像 " + std::to_wstring(images) + L" 枚";
     if (others) t += L"・ほかのファイル " + std::to_wstring(others) + L" 個";
-    t += L"　　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部、灰: 外してある（結果に出ない）";
+    t += L"　　右下の印 — 緑: 解析済み、橙: 解析待ち、白: 未解析、半分: 一部、灰: 休止中（結果に出ない）";
     SetWindowTextW(sameText, t.c_str());
   }
 
@@ -1487,8 +1487,8 @@ class ExplorerImpl {
       std::wstring what = dirCount ? L"フォルダ " + std::to_wstring(dirCount) + L" 個" : L"";
       if (images) what += (what.empty() ? L"" : L"・") + std::wstring(L"画像 ") + ni + L" 枚";
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, (L"選んだもの（" + what + L"）をスキャンタスクに追加(&I)").c_str());
-      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, (L"選んだもの（" + what + L"）をスキャンタスクの一番上に追加(&P)").c_str());
+      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, (L"選んだもの（" + what + L"）を解析の予約に追加(&I)").c_str());
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, (L"選んだもの（" + what + L"）を解析の予約の一番上に追加(&P)").c_str());
     }
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -1527,8 +1527,8 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_STRING, MENU_COPY, L"パスをコピー(&C)");
     if (it.image) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_SAME, L"同じ画像を探す(&S)");
-      AppendMenuW(menu, MF_STRING, MENU_SIMILAR_AI, L"似た画像を探す（AI）(&A)");
+      AppendMenuW(menu, MF_STRING, MENU_SAME, L"同一画像を探す(&S)");
+      AppendMenuW(menu, MF_STRING, MENU_SIMILAR_AI, L"類似画像を探す（AI）(&A)");
       AppendMenuW(menu, MF_STRING, MENU_RELOOKUP, L"出典を調べ直す(&L)");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SAVE_SMART, L"スマートフォルダに保存(&M)...");
@@ -1542,9 +1542,9 @@ class ExplorerImpl {
     }
     if (it.dir) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, L"スキャンタスクに追加(&I)");
-      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"スキャンタスクの一番上に追加（最優先）(&P)");
-      if (host->ExplorerIsRoot(it.path)) AppendMenuW(menu, MF_STRING, MENU_REMOVE_ROOT, L"調べるフォルダから外す(&X)...");
+      AppendMenuW(menu, MF_STRING, MENU_ADD_ROOT, L"解析の予約に追加(&I)");
+      AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"解析の予約の一番上に追加（最優先）(&P)");
+      if (host->ExplorerIsRoot(it.path)) AppendMenuW(menu, MF_STRING, MENU_REMOVE_ROOT, L"監視をやめる(&X)...");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_TEACH, L"このフォルダ名から作者などを読み取る形を教える(&N)...");
     }
@@ -2199,7 +2199,7 @@ class ExplorerImpl {
     int nameW = settings.detailCols.size() > 0 && settings.detailCols[0] > 0 ? ColWidth(0)
                                                                            : std::max(Px(160), w - dateW - typeW - sizeW - stateW);
     std::vector<Column> cols = {{L"名前", 0, 0, 0}, {L"更新日時", 1, 0, 0}, {listMode ? L"フォルダ" : L"種類", listMode ? kFolderSort : 2, 0, 0},
-                                {L"サイズ", 3, 0, 0}, {L"インデックス", kIndexSort, 0, 0}};
+                                {L"サイズ", 3, 0, 0}, {L"解析", kIndexSort, 0, 0}};
     int widths[] = {nameW, dateW, typeW, sizeW, stateW};
     int x = -scrollX;
     for (size_t i = 0; i < cols.size(); i++) {
@@ -2242,9 +2242,9 @@ class ExplorerImpl {
         int r = Px(5), cx = cols[4].left + pad + r, cy = (row.top + row.bottom) / 2;
         StateBadge(dc, {cx - r * 2, cy - r * 2, cx + r * 2 - Px(1), cy + r * 2 - Px(1)}, it.state);
         RECT tr = {cols[4].left + pad + r * 3, row.top, cols[4].right - pad, row.bottom};
-        static const wchar_t* names[] = {L"未作成", L"処理待ち", L"作成済み", L"一部", L"外してある（結果に出ない）"};
+        static const wchar_t* names[] = {L"未解析", L"解析待ち", L"解析済み", L"一部", L"休止中（結果に出ない）"};
         std::wstring t = !it.progressText.empty() ? it.progressText : names[it.state];
-        if (it.state == kStateOffline && !it.progressText.empty()) t = L"外してある・" + t;
+        if (it.state == kStateOffline && !it.progressText.empty()) t = L"休止中・" + t;
         DrawTextW(dc, t.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
       }
     }
@@ -2419,11 +2419,11 @@ class ExplorerImpl {
 
   static const wchar_t* StateText(int s) {
     switch (s) {
-      case kStateIndexed: return L"インデックス: 作成済み";
-      case kStatePending: return L"インデックス: 処理待ち";
-      case kStatePartial: return L"インデックス: 一部のフォルダだけ";
-      case kStateNone: return L"インデックス: 未作成";
-      case kStateOffline: return L"インデックス: 外してある（調べるフォルダの外。結果に出ない）";
+      case kStateIndexed: return L"解析: 解析済み";
+      case kStatePending: return L"解析: 解析待ち";
+      case kStatePartial: return L"解析: 一部のフォルダだけ";
+      case kStateNone: return L"解析: 未解析";
+      case kStateOffline: return L"解析: 休止中（監視フォルダの外。結果に出ない）";
     }
     return L"";
   }
@@ -2559,7 +2559,7 @@ class ExplorerImpl {
         if (!any) continue;
         RECT hr = {nr.left, y, nr.right, y + Px(18)};
         SetTextColor(dc, RGB(90, 90, 90));
-        DrawTextW(dc, pass == 0 ? L"ファイルのタグ" : L"検索用タグ", -1, &hr, DT_LEFT | DT_SINGLELINE);
+        DrawTextW(dc, pass == 0 ? L"埋め込みタグ" : L"管理タグ", -1, &hr, DT_LEFT | DT_SINGLELINE);
         y += Px(20);
         int x = nr.left;
         for (size_t i = 0; i < previewTags.size(); i++) {
@@ -2713,7 +2713,7 @@ class ExplorerImpl {
     int x = Px(8), y = (rc.bottom - Px(20)) / 2;
     RECT lr = {x, 0, x + Px(70), rc.bottom};
     SetTextColor(dc, RGB(90, 90, 90));
-    DrawTextW(dc, L"取り置き", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"タグトレイ", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     x += Px(64);
     // 右端に「組み合わせて検索」「クリア」（文字の幅に合わせる）
     auto chipW = [&](const wchar_t* t) {
@@ -2721,14 +2721,14 @@ class ExplorerImpl {
       GetTextExtentPoint32W(dc, t, int(wcslen(t)), &sz);
       return int(sz.cx) + Px(14);
     };
-    int cw = chipW(L"クリア"), sw = chipW(L"組み合わせて検索");
+    int cw = chipW(L"クリア"), sw = chipW(L"タグをまとめて検索");
     trayClearR = {rc.right - Px(8) - cw, y, rc.right - Px(8), y + Px(20)};
     traySearchR = {trayClearR.left - Px(6) - sw, y, trayClearR.left - Px(6), y + Px(20)};
     trayHits.clear();
     if (tray.empty()) {
       RECT tr = {x, 0, traySearchR.left, rc.bottom};
       SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
-      DrawTextW(dc, L"プレビューのタグをここにドラッグすると取り置けます。取り置いたタグを組み合わせて検索できます（クリックで使う・使わない、× で外す）",
+      DrawTextW(dc, L"プレビューのタグをここにドラッグすると、タグトレイに置けます。タグトレイのタグは、まとめて検索に使えます（クリックで使う・使わない、× でタグトレイから消す）",
                 -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     for (size_t i = 0; i < tray.size(); i++) {
@@ -2738,7 +2738,7 @@ class ExplorerImpl {
       trayHits.push_back({r, {r.right - Px(20), r.top, r.right, r.bottom}, i});
       x = r.right + Px(6);
     }
-    DrawChip(dc, traySearchR.left, traySearchR.top, L"組み合わせて検索", RGB(0, 120, 60), true);
+    DrawChip(dc, traySearchR.left, traySearchR.top, L"タグをまとめて検索", RGB(0, 120, 60), true);
     DrawChip(dc, trayClearR.left, trayClearR.top, L"クリア", RGB(120, 120, 120), false);
     SelectObject(dc, oldFont);
   }
@@ -2893,7 +2893,7 @@ class ExplorerImpl {
     const ExplorerTag& t = previewTags[tagHits[size_t(hit)].index];
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_TAG_SEARCH, L"このタグで検索(&S)");
-    AppendMenuW(menu, MF_STRING, MENU_TAG_TRAY, L"取り置く(&K)");
+    AppendMenuW(menu, MF_STRING, MENU_TAG_TRAY, L"タグトレイに置く(&K)");
     std::wstring shown;  // メニューでは & が下線の印になるので重ねる
     for (wchar_t c : t.tag) shown += c == L'&' ? std::wstring(L"&&") : std::wstring(1, c);
     AppendMenuW(menu, MF_STRING, MENU_TAG_COPY, (L"コピー（" + shown + L"）(&C)").c_str());
@@ -2952,7 +2952,7 @@ class ExplorerImpl {
     }
     std::wstring text = title + L"　";
     if (matches.empty()) {
-      text += L"同じ画像は見つかりませんでした（インデックスを作ったフォルダの中だけを探します）";
+      text += L"同じ画像は見つかりませんでした（解析したフォルダの中だけを探します）";
       SetWindowTextW(sameText, text.c_str());
       return;
     }
@@ -4069,7 +4069,7 @@ class ExplorerImpl {
     pathText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
                                HMENU(INT_PTR(ID_PATH)), inst, nullptr);
     SendMessageW(pathText, WM_SETFONT, WPARAM(font), TRUE);
-    SendMessageW(pathText, EM_SETCUEBANNER, TRUE, LPARAM(L"フォルダ、または画像の URL（同じ画像を探す）"));
+    SendMessageW(pathText, EM_SETCUEBANNER, TRUE, LPARAM(L"フォルダ、または画像の URL（同一画像を探す）"));
     SHAutoComplete(pathText, SHACF_FILESYS_DIRS);  // フォルダの名前を補う
     SetWindowSubclass(pathText, ChildKeyProc, 1, DWORD_PTR(this));
     crumbs = CreateWindowExW(WS_EX_CLIENTEDGE, kCrumbClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
@@ -4109,8 +4109,8 @@ class ExplorerImpl {
     for (const auto& t : settings.tray) tray.push_back({t, true});
     for (const auto& [d, n] : settings.frequent) visits[DirKey(d)] = {d, n};
     // 下のステータスバー
-    sameText = make(L"STATIC", L"画像を右クリック →「同じ画像を探す」か、画像のファイル・URL をここにドロップすると、同じ画像（インデックスを作った全部のフォルダの中）を一覧に出します。"
-                               L"　右下の印 — 緑: インデックス作成済み、橙: 処理待ち、白: 未作成、半分: 一部、灰: 外してある（結果に出ない）",
+    sameText = make(L"STATIC", L"画像を右クリック →「同一画像を探す」か、画像のファイル・URL をここにドロップすると、同じ画像（解析した全部のフォルダの中）を一覧に出します。"
+                               L"　右下の印 — 緑: 解析済み、橙: 解析待ち、白: 未解析、半分: 一部、灰: 休止中（結果に出ない）",
                     SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS, ID_SAME_TEXT);
     // マウスを乗せた時の説明
     {

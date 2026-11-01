@@ -42,7 +42,7 @@ class AttachMaster {
 public:
     AttachMaster(Db& db, const std::string& file, const std::string& alias, bool create) : db_(db), alias_(alias) {
         if (!create && fileSize(file) <= 0) return;
-        if (create && !makeDirs(dirOf(file))) throw std::runtime_error("正本のフォルダを作れません: " + dirOf(file));
+        if (create && !makeDirs(dirOf(file))) throw std::runtime_error("ドライブ記録のフォルダを作れません: " + dirOf(file));
         Stmt st(db.handle(), ("ATTACH DATABASE ? AS " + alias).c_str());
         st.bind(1, file);
         st.step();
@@ -51,7 +51,7 @@ public:
         if (!db.exec(masterSchema(alias).c_str())) {
             db.exec(("DETACH DATABASE " + alias).c_str());
             ok_ = false;
-            throw std::runtime_error("正本を開けません: " + file);
+            throw std::runtime_error("ドライブ記録を開けません: " + file);
         }
     }
     ~AttachMaster() {
@@ -235,7 +235,7 @@ DriveSyncResult syncDriveOnConnect(Db& db, const DriveRef& d, const std::string&
         dirty.bind(1, letterOf(d.root));
         dirty.step();
         r.kind = DriveSync::Created;
-        logs::info("ドライブの正本を作った: " + file);
+        logs::info("ドライブ記録を作った: " + file);
         return r;
     }
     r.driveRow = rowOfDriveId(db, driveId);
@@ -271,7 +271,7 @@ DriveSyncResult syncDriveOnConnect(Db& db, const DriveRef& d, const std::string&
         up.bind(1, seq).bind(2, r.driveRow);
         up.step();
         r.kind = DriveSync::Imported;
-        logs::info("ドライブの正本から読み戻した: " + file + "（画像 " + std::to_string(r.imported) + " 枚）");
+        logs::info("ドライブ記録からドライブから取り込んだ: " + file + "（画像 " + std::to_string(r.imported) + " 枚）");
         return r;
     }
     if (conflict || seq != mySeq) {
@@ -321,7 +321,7 @@ std::vector<WritebackResult> writebackDrives(Db& db, const std::vector<DriveRef>
         out[i].root = drives[i].root;
         try {
             const std::string file = masterFileOf(drives[i].root);
-            if (fileSize(file) <= 0) throw std::runtime_error("正本がありません: " + file);
+            if (fileSize(file) <= 0) throw std::runtime_error("ドライブ記録がありません: " + file);
             Live l{i, "w" + std::to_string(i), letterOf(drives[i].root), 0, 0, nullptr};
             l.attach = std::make_unique<AttachMaster>(db, file, l.alias, false);
             const std::string driveId = metaGet(db, l.alias, "drive_id");
@@ -634,13 +634,13 @@ void resolveConflict(Db& db, const DriveRef& d, bool useMaster, const std::strin
             st.step();
         }
         AttachMaster m(db, file, "m", false);
-        if (!m.ok()) throw std::runtime_error("正本がありません: " + file);
+        if (!m.ok()) throw std::runtime_error("ドライブ記録がありません: " + file);
         importFromMaster(db, "m", d.root, vectorFile);
         const std::string driveId = metaGet(db, "m", "drive_id");
         Stmt st(db.handle(), "UPDATE drives SET master_seq=?, conflict=0, clone_deleted=0, last_seen=?, gone_since=0 WHERE drive_id=?");
         st.bind(1, toInt(metaGet(db, "m", "seq"))).bind(2, now).bind(3, driveId);
         st.step();
-        logs::info("食い違いを解いた（ドライブの正本を使う）: " + file);
+        logs::info("食い違いを解いた（ドライブ記録を使う）: " + file);
         return;
     }
     // 正本を保管のフォルダに写して残し、クローンで作り直す
@@ -660,11 +660,11 @@ void resolveConflict(Db& db, const DriveRef& d, bool useMaster, const std::strin
         }
         if (in) std::fclose(in);
         if (outF) std::fclose(outF);
-        if (!ok) throw std::runtime_error("正本を保管のフォルダに写せません: " + dst);
-        logs::info("食い違いで選ばなかった正本を写して残した: " + dst);
+        if (!ok) throw std::runtime_error("ドライブ記録を退避のフォルダに写せません: " + dst);
+        logs::info("食い違いで選ばなかったドライブ記録を写して残した: " + dst);
     }
     AttachMaster m(db, file, "m", false);
-    if (!m.ok()) throw std::runtime_error("正本がありません: " + file);
+    if (!m.ok()) throw std::runtime_error("ドライブ記録がありません: " + file);
     db.begin();
     try {
         for (const char* t : {"images", "tags", "stages", "vectors"}) db.exec(("DELETE FROM m." + std::string(t)).c_str());
@@ -736,8 +736,8 @@ size_t deleteClone(Db& db, int64_t driveRow, const std::string& archiveFile, con
         st.bind(1, letter);
         while (st.step()) unwritten.push_back(st.i64(0));
     }
-    const size_t archived = archiveImages(db, archiveFile, unwritten, vectorFile, "書き戻し失敗分");
-    if (archived) logs::info("クローンを消す前に、書き戻していない画像 " + std::to_string(archived) + " 枚を保管へ移した");
+    const size_t archived = archiveImages(db, archiveFile, unwritten, vectorFile, "ドライブへ記録できなかった分");
+    if (archived) logs::info("PC 記録を消す前に、ドライブへ記録していない画像 " + std::to_string(archived) + " 枚を退避した");
     size_t n = 0;
     db.begin();
     try {
@@ -757,7 +757,7 @@ size_t deleteClone(Db& db, int64_t driveRow, const std::string& archiveFile, con
         db.rollback();
         throw;
     }
-    logs::info("ドライブ " + root + " のクローンを消した（画像 " + std::to_string(n) + " 枚。正本はドライブにある）");
+    logs::info("ドライブ " + root + " のPC 記録を消した（画像 " + std::to_string(n) + " 枚。ドライブ記録はドライブにある）");
     return n + archived;
 }
 

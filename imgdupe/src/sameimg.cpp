@@ -440,7 +440,7 @@ std::vector<std::pair<std::string, std::string>> imageProperties(Db& db, int64_t
             if (!st.isNull(1)) {
                 std::snprintf(b, sizeof b, "細かさ %.2f（実質 %lldpx）・くっきり %.2f", st.f64(1), static_cast<long long>(st.i64(2)),
                               st.isNull(0) ? 0.0 : st.f64(0));
-                add("品質", b);
+                add("画質", b);
             }
             if (!st.isNull(3)) {
                 std::snprintf(b, sizeof b, "%.1f", st.f64(3));

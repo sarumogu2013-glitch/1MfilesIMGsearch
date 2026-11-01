@@ -110,7 +110,7 @@ LoadResult load(const std::wstring& dataDir, int cpuThreads, std::function<void(
         if (p.size() > 4 && _wcsicmp(p.c_str() + p.size() - 4, L".csv") == 0) tagsPath = p;
     }
     if (modelPath.empty() || tagsPath.empty() || !exists(modelPath) || !exists(tagsPath)) {
-        r.error = L"WD14 タガーのファイルが足りません（「その他 → AI 解析の部品…」で入れ直してください）";
+        r.error = L"WD14 タガーのファイルが足りません（「その他 → AI の部品…」で入れ直してください）";
         return r;
     }
     std::string csv;

@@ -274,7 +274,7 @@ void prepare(const std::wstring& dataDir, imgdupe::Db& db) {
             return;
         }
         DeleteFileW((dataDir + L"\\ann_clip.hnsw").c_str());  // 索引は新しい版で作り直す
-        logs::info("CLIP を新しい版で全部作り直したので切り替えた。前の版のベクトルは保管のフォルダへ: " + narrow(old));
+        logs::info("CLIP を新しい版で全部作り直したので切り替えた。前の版のベクトルは退避のフォルダへ: " + narrow(old));
         return;
     }
     if (!idx.load(path)) return;
@@ -461,7 +461,7 @@ bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std:
     std::lock_guard<std::mutex> lock(m);
     const Files f = findFiles(dataDir);
     if (!f.ok) {
-        error = L"CLIP（内容で探す部品）が入っていません。「その他 → AI 解析の部品…」で入れられます";
+        error = L"CLIP（内容検索部品）が入っていません。「その他 → AI の部品…」で入れられます";
         return false;
     }
     if (!model || modelVersion != f.version) {
@@ -494,7 +494,7 @@ bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std:
 std::shared_ptr<imgdupe::ClipModel> loadText(const std::wstring& dataDir, std::wstring& error) {
     const Files f = findFiles(dataDir);
     if (!f.ok) {
-        error = L"CLIP（内容で探す部品）が入っていません。「その他 → AI 解析の部品…」で入れられます";
+        error = L"CLIP（内容検索部品）が入っていません。「その他 → AI の部品…」で入れられます";
         return nullptr;
     }
     auto model = std::make_shared<OnnxClip>();

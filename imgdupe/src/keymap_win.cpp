@@ -128,10 +128,10 @@ std::wstring cmdLabel(int cmd) {
 std::wstring cmdDetail(int cmd) {
     switch (cmd) {
         case CMD_SEARCH: return L"検索していない時は検索を始め、検索中なら中止する";
-        case CMD_QUERY: return L"選んだ画像に似た画像を、追加したフォルダから探す";
+        case CMD_QUERY: return L"選んだ画像に類似画像を、追加したフォルダから探す";
         case CMD_OPEN: return L"右に選んでいる画像を、既定のアプリで開く";
-        case CMD_PREV_GROUP: case CMD_NEXT_GROUP: return L"左の一覧で、前・次のグループを選ぶ";
-        case CMD_THRESHOLD_DOWN: case CMD_THRESHOLD_UP: return L"しきい値を 1 つ変える（次の検索から効く）";
+        case CMD_PREV_GROUP: case CMD_NEXT_GROUP: return L"左の一覧で、前・次のまとまりを選ぶ";
+        case CMD_THRESHOLD_DOWN: case CMD_THRESHOLD_UP: return L"見た目一致の厳しさを 1 つ変える（次の検索から効く）";
         default: return std::wstring();
     }
 }

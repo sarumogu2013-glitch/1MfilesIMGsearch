@@ -77,7 +77,7 @@ public:
         if (!db.exec(kArchiveSchema)) {
             db.exec("DETACH DATABASE arc");
             ok_ = false;
-            throw std::runtime_error("保管の DB を開けません: " + file);
+            throw std::runtime_error("退避の DB を開けません: " + file);
         }
     }
     ~Attach() {
