@@ -993,14 +993,15 @@ class ExplorerImpl {
     names.reserve(items.size());
     for (auto& it : items) names.push_back({it.name, it.dir});
     std::vector<int> st = host->ExplorerStates(dir, names);
-    if (Details()) host->ExplorerRequestProgress(dir);  // 進み具合は裏で数えて SetProgress で来る
     bool changed = false;
     for (size_t i = 0; i < items.size(); i++) {
       int s = i < st.size() ? st[i] : kStateNoBadge;
       if (!items[i].dir && !items[i].image) s = kStateNoBadge;
+      s = ProgressState(s, items[i].progress);  // 前に数えた進み具合も当てる（数え直しが来るまで）
       if (items[i].state != s) changed = true;
       items[i].state = s;
     }
+    host->ExplorerRequestProgress(dir);  // 進み具合は裏で数えて SetProgress で来る（100% でなければ解析待ちの印に）
     return changed;
   }
 
@@ -1591,6 +1592,13 @@ class ExplorerImpl {
     CloseClipboard();
   }
 
+  // 印は進み具合で決める: 100% でなければ解析待ち（橙）、100% なら解析済み（緑）。休止中・印なし・まだ数えていない時はそのまま
+  static int ProgressState(int state, double progress) {
+    if (progress < 0 || state == kStateOffline || state == kStateNoBadge) return state;
+    if (progress < 1.0) return kStatePending;
+    return state == kStatePending ? kStateIndexed : state;
+  }
+
   // 詳細表示の進み具合（裏で数えた結果）
   void SetProgress(const std::wstring& d, const std::vector<ExplorerProgress>& progress) {
     if (listMode || _wcsicmp(d.c_str(), dir.c_str()) != 0) return;
@@ -1606,9 +1614,11 @@ class ExplorerImpl {
       auto f = byName.find(k);
       it.progress = f != byName.end() ? f->second->ratio : -1;
       it.progressText = f != byName.end() ? f->second->text : L"";
+      it.state = ProgressState(it.state, it.progress);
     }
     if (SortKey() == kIndexSort) Resort();
     else InvalidateRect(grid, nullptr, FALSE);
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
   }
 
   // 詳細表示の見出しで、列の境目（右端）の上か。境目なら列の番号
