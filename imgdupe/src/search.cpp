@@ -469,6 +469,7 @@ SearchResult search(Db& db, const SearchQuery& q) {
         case QualityFilter::LowRes: where += " AND qa.effective > 0 AND qa.effective < " + std::to_string(kLowResBelow); break;
     }
     if (q.deadLinks) where += " AND EXISTS (SELECT 1 FROM sources s WHERE s.image_id=i.id AND s.link_status=0)";
+    if (q.excludeMangaBody) where += " AND NOT EXISTS (SELECT 1 FROM tags pg WHERE pg.image_id=i.id AND pg.kind='page' AND pg.tag='本文')";
 
     // 並べ替え（空欄は最後。同じなら パス順）
     std::string key;
@@ -782,6 +783,7 @@ std::string queryToJson(const SearchQuery& q) {
     putText(out, "path", q.pathContains);
     putText(out, "download", q.downloadContains);
     putBool(out, "deadLinks", q.deadLinks);
+    putBool(out, "excludeMangaBody", q.excludeMangaBody);
     if (q.quality != QualityFilter::Any) putText(out, "quality", kQualityNames[static_cast<int>(q.quality)]);
     putBool(out, "review", q.review);
     putText(out, "clipText", q.clipText);
@@ -848,6 +850,7 @@ bool queryFromJson(const std::string& json, SearchQuery& out) {
     q.format = j.getString("format");
     flag("animatedOnly", q.animatedOnly);
     flag("deadLinks", q.deadLinks);
+    flag("excludeMangaBody", q.excludeMangaBody);
     {
         const std::string qn = j.getString("quality");
         for (int i = 1; i < 5; ++i)

@@ -66,6 +66,7 @@ struct SearchQuery {
     std::string underFolder;             // このフォルダとその下の画像だけ（DB のパスと同じ書き方。区切りで終わらない）
     std::string downloadContains;        // ダウンロード元の URL の部分一致（"pixiv" など）
     bool deadLinks = false;              // 出典の投稿が消えている（リンク切れ）画像
+    bool excludeMangaBody = false;       // 漫画（本のフォルダ）の本文のページを除く（解析が付けた種類 page・タグ「本文」の画像。表紙・背表紙は残す）
     // Good: くっきりしていて画素ほどの細かさがある、Blurry: ぼやけている、Soft: 拡大された・ぼやけた（細かさが足りない）、
     // LowRes: 実質の解像度（長い辺）が kLowResBelow 未満
     QualityFilter quality = QualityFilter::Any;

@@ -172,6 +172,7 @@ enum : int {
     IDC_S_INFOLDER,
     IDC_S_FOLDER,
     IDC_S_CONF_DEFAULT,
+    IDC_S_NOBODY,
     IDC_DUPBAR,
     IDC_RIBBON_LINE,
     IDC_QUERYBAR,
@@ -244,7 +245,7 @@ struct App {
     struct SearchCtl {
         HWND tags, conf, confValue, sources, text, clip, rating, format, quality, from, to, noTaken, unclassified, deadLinks, minW, minKb, maxKb, path, download,
             sort, desc, clear, count, results, smart, smartSave, smartDelete, expand, review, yes, no, bulk;
-        HWND free, scope, go, advanced, dateField, exclude, end, inFolder, folder, confDefault;
+        HWND free, scope, go, advanced, dateField, exclude, end, inFolder, folder, confDefault, noBody;
         // 見出し（リボンと詳細検索）
         HWND lSort, lClip, lSmart, lRating, lFormat, lQuality, lWidth, lSize, lSizeTo, lPath, lDownload, lDate, lDateTo, lConf, lSources;
         std::vector<HWND> labels;
@@ -2207,6 +2208,7 @@ SearchQuery searchQueryFromUi() {
     q.freeScope = FreeScope::All;
     q.in = app.searchIn;
     q.underFolder = searchFolderFromUi();
+    q.excludeMangaBody = Button_GetCheck(app.s.noBody) == BST_CHECKED;
     q.minConfidence = SendMessageW(app.s.conf, TBM_GETPOS, 0, 0) / 100.0;
     q.excludeSources.assign(app.uncheckedSources.begin(), app.uncheckedSources.end());
     q.dateField = static_cast<DateField>(std::clamp(ComboBox_GetCurSel(app.s.dateField), 0, 2));
@@ -2813,6 +2815,7 @@ void applyQueryToUi(const SearchQuery& q) {
     ComboBox_SetCurSel(app.s.dateField, static_cast<int>(q.dateField));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(app.s.review, q.review ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.noBody, q.excludeMangaBody ? BST_CHECKED : BST_UNCHECKED);
     searchStatus(L"スマートフォルダを読み込みました。「検索」（Enter）を押すと探します");
 }
 
@@ -5881,7 +5884,8 @@ void layoutSearch(int y, int W) {
     cy += rowH + px(5);
     x = m;
     put(app.s.inFolder, px(140));
-    put(app.s.folder, std::clamp(W - x - m, px(160), px(700)));
+    put(app.s.folder, std::clamp(W - x - m - px(130), px(160), px(700)));
+    put(app.s.noBody, px(124));
 }
 
 // 詳細検索（3 段。右に出どころの一覧）
@@ -5992,6 +5996,7 @@ void createSearchControls() {
     // 3 段目: このフォルダ内で探す（検索の様子は下のステータスバーに出す）
     app.s.inFolder = button(L"このフォルダ内に限る", IDC_S_INFOLDER, sp, BS_AUTOCHECKBOX);
     app.s.folder = edit(IDC_S_FOLDER, sp);
+    app.s.noBody = button(L"漫画本文を除く", IDC_S_NOBODY, sp, BS_AUTOCHECKBOX);
     SendMessageW(app.s.folder, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"フォルダ（エクスプローラーで今いるフォルダ）"));
     app.s.count = makeControl(WC_STATICW, L"", SS_NOPREFIX, IDC_S_COUNT);  // 使わない（前の版の件数の行）
     ShowWindow(app.s.count, SW_HIDE);
@@ -6073,6 +6078,9 @@ void createSearchControls() {
         {app.s.inFolder, L"チェックすると、右の欄のフォルダとその下の階層の画像だけから探します"},
         {app.s.folder, L"エクスプローラーで今いるフォルダを映します（検索の結果を出している間は、探す前のフォルダのまま）。打って変えることもできます"},
         {app.s.confDefault, L"確度を既定の 0.50 に戻します"},
+        {app.s.noBody,
+         L"漫画（本のフォルダ）の本文のページを、検索の結果から除きます。表紙と背表紙は残します"
+         L"（フォルダ名が [サークル名] 本の名前 などの形のフォルダの画像に、解析が表紙・本文・背表紙の印を付けています）"},
         {app.s.sort, L"結果の並べ方"},
         {app.s.desc, L"チェックすると逆の順（大きい・新しいものから）に並べます"},
         {app.s.advanced, L"星・形式・品質・大きさ・日付・ダウンロード元・検索対象などの細かい条件を出す・隠す"},
@@ -6234,6 +6242,7 @@ bool onSearchCommand(WPARAM wp) {
             if (code == CBN_SELCHANGE) advancedChanged();
             return true;
         case IDC_S_DESC:
+        case IDC_S_NOBODY:  // 降順と同じく、少し待って探す（条件が空なら何もしない）
             scheduleSearch(30);
             return true;
         case IDC_S_NOTAKEN: case IDC_S_UNCLASSIFIED: case IDC_S_DEADLINKS:
@@ -6276,6 +6285,7 @@ void saveSearchSettings() {
     WritePrivateProfileStringW(L"Search", L"free", editText(app.s.free).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"exclude", editText(app.s.exclude).c_str(), iniPath().c_str());
     WritePrivateProfileStringW(L"Search", L"inFolder", Button_GetCheck(app.s.inFolder) == BST_CHECKED ? L"1" : L"0", iniPath().c_str());
+    WritePrivateProfileStringW(L"Search", L"excludeMangaBody", Button_GetCheck(app.s.noBody) == BST_CHECKED ? L"1" : L"0", iniPath().c_str());
     {
         const SearchIn& in = app.searchIn;
         std::wstring bits;
@@ -6305,6 +6315,7 @@ void loadSearchSettings() {
     GetPrivateProfileStringW(L"Search", L"exclude", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.exclude, buf);
     Button_SetCheck(app.s.inFolder, GetPrivateProfileIntW(L"Search", L"inFolder", 0, iniPath().c_str()) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.noBody, GetPrivateProfileIntW(L"Search", L"excludeMangaBody", 0, iniPath().c_str()) ? BST_CHECKED : BST_UNCHECKED);
     GetPrivateProfileStringW(L"Search", L"clip", L"", buf, 4096, iniPath().c_str());
     SetWindowTextW(app.s.clip, buf);
     const int conf = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Search", L"confidence", 50, iniPath().c_str())), 0, 100);

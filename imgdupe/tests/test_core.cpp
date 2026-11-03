@@ -3042,6 +3042,37 @@ static void testSameImage() {
     CHECK(folderHasIndexed(db, "D:\\Other") && folderHasIndexed(db, "D:\\Pics\\b\\") && !folderHasIndexed(db, "D:\\Pic"));
 }
 
+
+// 漫画本文を除く: 本のフォルダの「本文」のページ（種類 page）を除き、表紙・背表紙とほかの画像は残す
+static void testMangaBody() {
+    const fs::path dbp = fs::temp_directory_path() / "imgdupe-manga.db";
+    fs::remove(dbp);
+    Db d;
+    CHECK(d.open(dbp.string()));
+    auto ids = upsertScanned(d, {{"D:\\[サークル]本\\01.jpg", 1, 1}, {"D:\\[サークル]本\\02.jpg", 1, 1}, {"D:\\[サークル]本\\03.jpg", 1, 1},
+                                 {"D:\\イラスト\\a.jpg", 1, 1}});
+    d.begin();
+    {
+        TagWriter w(d, TagConflict::Replace);
+        w.put(ids["D:\\[サークル]本\\01.jpg"], "表紙", "page", 0.9, "folder", false);
+        w.put(ids["D:\\[サークル]本\\02.jpg"], "本文", "page", 0.9, "folder", false);
+        w.put(ids["D:\\[サークル]本\\03.jpg"], "背表紙", "page", 0.9, "folder", false);
+        for (const auto& [p, id] : ids) w.put(id, "miku", "character", 0.9, "tagger", false);
+    }
+    d.commit();
+    SearchQuery q;
+    q.tags = {"miku"};
+    CHECK(search(d, q).total == 4);
+    q.excludeMangaBody = true;
+    const auto r = search(d, q);
+    CHECK(r.total == 3 && std::find(r.ids.begin(), r.ids.end(), ids["D:\\[サークル]本\\02.jpg"]) == r.ids.end());
+    // 保存した条件にも残る
+    SearchQuery back;
+    CHECK(queryFromJson(queryToJson(q), back) && back.excludeMangaBody);
+    d.close();
+    fs::remove(dbp);
+}
+
 static void testFreeSearch() {
     const fs::path dir = fs::temp_directory_path() / "imgdupe-free-test";
     fs::remove_all(dir);
@@ -3578,6 +3609,7 @@ int main() {
     testResolveRedirect();
     testSameImage();
     testFreeSearch();
+    testMangaBody();
     testQueryStore();
     testLogs();
     testPathInfer();

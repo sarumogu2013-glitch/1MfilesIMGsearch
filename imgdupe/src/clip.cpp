@@ -244,7 +244,7 @@ int clipStageVersion(const std::string& modelVersion) {
 RankResult rankByVector(Db& db, const SearchQuery& q, const VectorIndex& index, const float* qv, size_t k, int64_t exclude) {
     RankResult r;
     std::unordered_set<int64_t> allowed;
-    const bool filter = hasConditions(q);
+    const bool filter = hasConditions(q) || q.excludeMangaBody;  // 本文を除くだけでも絞る
     if (filter) {
         SearchQuery cond = q;
         cond.limit = 0;
