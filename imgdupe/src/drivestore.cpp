@@ -271,7 +271,7 @@ DriveSyncResult syncDriveOnConnect(Db& db, const DriveRef& d, const std::string&
         up.bind(1, seq).bind(2, r.driveRow);
         up.step();
         r.kind = DriveSync::Imported;
-        logs::info("ドライブ記録からドライブから取り込んだ: " + file + "（画像 " + std::to_string(r.imported) + " 枚）");
+        logs::info("ドライブ記録から取り込んだ: " + file + "（画像 " + std::to_string(r.imported) + " 枚）");
         return r;
     }
     if (conflict || seq != mySeq) {
@@ -757,7 +757,7 @@ size_t deleteClone(Db& db, int64_t driveRow, const std::string& archiveFile, con
         db.rollback();
         throw;
     }
-    logs::info("ドライブ " + root + " のPC 記録を消した（画像 " + std::to_string(n) + " 枚。ドライブ記録はドライブにある）");
+    logs::info("ドライブ " + root + " の PC 記録を消した（画像 " + std::to_string(n) + " 枚。ドライブ記録はドライブにある）");
     return n + archived;
 }
 

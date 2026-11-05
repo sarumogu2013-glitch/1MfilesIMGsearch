@@ -264,7 +264,7 @@ void driveLoop() {
         try {
             syncDrives(g->dataDir, roots, true, &g->quit);
         } catch (const std::exception& e) {
-            logs::error(std::string("ドライブ記録にドライブへ記録できなかった: ") + e.what());
+            logs::error(std::string("ドライブへ記録できなかった: ") + e.what());
         }
     }
 }
@@ -1389,7 +1389,7 @@ int syncDrives(const std::wstring& dataDir, const std::vector<std::wstring>& roo
                     continue;
                 }
                 if (r.kind == imgdupe::DriveSync::Imported)
-                    logs::info("ドライブ " + d.root + " のドライブ記録からドライブから取り込んだ（画像 " + std::to_string(r.imported) + " 枚）");
+                    logs::info("ドライブ " + d.root + " のドライブ記録から取り込んだ（画像 " + std::to_string(r.imported) + " 枚）");
                 ok.push_back(d);
             } catch (const std::exception& e) {
                 logs::warn("ドライブ " + d.root + " のドライブ記録を開けなかった: " + e.what());
@@ -1399,9 +1399,9 @@ int syncDrives(const std::wstring& dataDir, const std::vector<std::wstring>& roo
         imgdupe::markDrivesSeen(db, seen, now);
         if (writeback && !ok.empty()) {
             for (const auto& r : imgdupe::writebackDrives(db, ok, vec, now, cancel)) {
-                if (r.failed) logs::warn("ドライブ " + r.root + " のドライブ記録にドライブへ記録できなかった: " + r.error);
+                if (r.failed) logs::warn("ドライブ " + r.root + " へ記録できなかった: " + r.error);
                 else if (r.images || r.removed || r.vectors)
-                    logs::info("ドライブ " + r.root + " のドライブ記録にドライブへ記録した: 画像 " + std::to_string(r.images) + " 枚・消えた " +
+                    logs::info("ドライブ " + r.root + " へ記録した: 画像 " + std::to_string(r.images) + " 枚・消えた " +
                                std::to_string(r.removed) + "・CLIP " + std::to_string(r.vectors));
                 if (r.conflict) ++conflicts;
             }

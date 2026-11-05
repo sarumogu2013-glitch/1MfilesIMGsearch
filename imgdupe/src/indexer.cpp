@@ -674,7 +674,7 @@ IndexReport indexOnce(const IndexOptions& opt, const IndexCallbacks& cb, IndexPr
                 for (const auto& r : opt.roots)
                     if (!cb.rootAvailable || cb.rootAvailable(r)) online.push_back(r);
                 if (const size_t n = updateOffline(db, online))
-                    logs::info("休止中画像の印を付け直した: " + std::to_string(n) + " 枚");
+                    logs::info("休止中の画像の印を付け直した: " + std::to_string(n) + " 枚");
             }
             // 前の版のスキャンタスクで、書き方の違うパスで二重に登録した画像を消す
             if (const size_t n = removeMisspelled(db, opt.roots)) {

@@ -518,9 +518,9 @@ void refreshOfflineAsync() {
             for (const auto& o : online) now.push_back(widen(o));
             indexer::syncDrives(dataDir, now, !indexer::isRunning(), nullptr);
             PostMessageW(hwnd, WM_APP_DRIVES, 0, 0);
-            if (changed) logs::info("休止中画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
+            if (changed) logs::info("休止中の画像の印を付け直した（画面の側）: " + std::to_string(changed) + " 枚");
         } catch (const std::exception& e) {
-            logs::warn(std::string("休止中画像の印を付け直せなかった: ") + e.what());
+            logs::warn(std::string("休止中の画像の印を付け直せなかった: ") + e.what());
         }
         offlineBusy = false;
         if (offlineAgain.exchange(false)) changed = static_cast<WPARAM>(-1);
@@ -599,10 +599,10 @@ void checkDrivesUi() {
                            withCommas(static_cast<uint64_t>(s.complete)) + L" 枚\n  最後に書いた日時: " + unixDateText(s.updated);
                 };
                 const std::wstring msg = L"ドライブ " + name(r) +
-                                         L" のドライブ記録（ドライブの中の DB）と、PC 記録 が食い違っています（別の PC で使った・ドライブへ記録する前に抜いた など）。\n\n"
+                                         L" のドライブ記録（ドライブの中の DB）と、PC 記録が食い違っています（別の PC で使った・ドライブへ記録する前に抜いた など）。\n\n"
                                          L"■ ドライブ記録\n" + side(m) + L"\n\n■ PC 記録\n" + side(c) +
-                                         L"\n\nはい: ドライブ記録を使う（この PC の側は退避する）\nいいえ: PC 記録 を使う（ドライブ記録は退避のフォルダに写して残す）\n"
-                                         L"キャンセル: 後で決める（その間、このドライブにはドライブへの記録ません）";
+                                         L"\n\nはい: ドライブ記録を使う（この PC の側は退避する）\nいいえ: PC 記録を使う（ドライブ記録は退避のフォルダに写して残す）\n"
+                                         L"キャンセル: 後で決める（その間、このドライブへは記録しません）";
                 const int a = logBox(app.hwnd, msg.c_str(), L"ドライブ記録が食い違っています", MB_YESNOCANCEL | MB_ICONWARNING);
                 if (a == IDYES || a == IDNO) {
                     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
@@ -615,16 +615,16 @@ void checkDrivesUi() {
                 failNotified.insert(r.id);
                 const std::wstring msg = L"ドライブ " + name(r) + L" のドライブ記録に、" + unixDateText(r.failSince) +
                                          L" から 12 時間以上ドライブへ記録できていません（ドライブがいっぱい・読み取り専用・権限が無い など）。\n\n"
-                                         L"PC 記録 には残っています。ドライブの空きや設定を確かめてください。";
+                                         L"PC 記録には残っています。ドライブの空きや設定を確かめてください。";
                 if (ex.view) ex.view->SetSameStatus(L"ドライブ " + widen(r.root) + L" のドライブ記録に 12 時間以上ドライブへ記録できていません");
-                logBox(app.hwnd, msg.c_str(), L"ドライブ記録へのドライブへの記録の失敗", MB_ICONWARNING);
+                logBox(app.hwnd, msg.c_str(), L"ドライブへの記録の失敗", MB_ICONWARNING);
                 continue;
             }
             if (r.goneSince && !r.cloneDeleted && now - r.goneSince >= 24 * 3600 && now >= r.snoozeUntil && r.cloneImages > 0 &&
                 !letterPresent(r.root)) {
                 // 外して 1 日: クローンを消すか聞く（書き戻しの様子を見せる）
                 std::wstring msg = L"ドライブ " + name(r) + L" が " + unixDateText(r.goneSince) +
-                                   L" から見つかりません。PC 記録 にある、このドライブの分（PC 記録）を消しますか？\n"
+                                   L" から見つかりません。PC 記録にある、このドライブの分（PC 記録）を消しますか？\n"
                                    L"（ドライブ記録はドライブにあるので、つなぎ直せばドライブから取り込みます）\n\n■ ドライブへの記録の様子\n  最後に見えたドライブレター: " +
                                    widen(r.root) + L"\n  見つからなくなった日時: " + unixDateText(r.goneSince) + L"\n  最後にドライブへ記録した日時: " +
                                    unixDateText(r.lastWriteback) + L"\n  PC 記録の画像: " + withCommas(static_cast<uint64_t>(r.cloneImages)) +
@@ -632,11 +632,11 @@ void checkDrivesUi() {
                                    (r.unwritten ? L"（消す前に退避します）" : L"") + L"\n  12 時間以上のドライブへの記録の失敗: " +
                                    (r.failSince && r.goneSince - r.failSince >= 12 * 3600 ? L"あり（" + unixDateText(r.failSince) + L" から）" : L"なし") +
                                    L"\n\nはい: 消す\nいいえ: 残す（1 日後にまた聞きます）";
-                const int a = logBox(app.hwnd, msg.c_str(), L"つながっていないドライブのPC 記録の片付け", MB_YESNO | MB_ICONQUESTION);
+                const int a = logBox(app.hwnd, msg.c_str(), L"つながっていないドライブの PC 記録の片付け", MB_YESNO | MB_ICONQUESTION);
                 if (a == IDYES) {
                     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
                     const size_t n = deleteClone(*db, r.id, arc, vec);
-                    logBox(app.hwnd, (L"PC 記録を消しました（" + withCommas(n) + L" 枚）。").c_str(), L"つながっていないドライブのPC 記録の片付け",
+                    logBox(app.hwnd, (L"PC 記録を消しました（" + withCommas(n) + L" 枚）。").c_str(), L"つながっていないドライブの PC 記録の片付け",
                            MB_ICONINFORMATION);
                     changed = true;
                 } else {
@@ -729,15 +729,62 @@ std::wstring stripTrailingSlash(std::wstring p) {
     return p;
 }
 
-// mustExist: 今あるフォルダだけ足す（自分で足す時）。前回の設定を読む時は、外したドライブのフォルダも残す（数ヶ月外しておいてもよい）
-void addFolder(const std::wstring& raw, bool mustExist = true) {
+// child が parent と同じか、その下のフォルダか（大文字小文字・区切りの / と \ は区別しない）
+bool sameOrUnder(const std::wstring& child, const std::wstring& parent) {
+    const std::wstring c = stripTrailingSlash(child), p = stripTrailingSlash(parent);
+    if (c.size() < p.size() || _wcsnicmp(c.c_str(), p.c_str(), p.size()) != 0) return false;
+    return c.size() == p.size() || p.back() == L'\\' || p.back() == L'/' || c[p.size()] == L'\\' || c[p.size()] == L'/';
+}
+
+// 監視フォルダを足した結果
+struct AddFolderResult {
+    bool added = false;
+    std::wstring coveredBy;            // もうこの監視フォルダの中にある（足さなかった）
+    std::vector<std::wstring> merged;  // 足したフォルダの中にあった監視フォルダ（一覧から外して、足したフォルダにまとめた）
+};
+
+// 監視フォルダを足す。足したフォルダの下にある監視フォルダは、足したフォルダにまとめる（一覧から外す。中の画像の解析の結果はそのまま）。
+// もうある監視フォルダの中なら足さない。mustExist: 今あるフォルダだけ足す（自分で足す時）。前回の設定を読む時は、
+// つながっていないドライブのフォルダも残す（数ヶ月外しておいてもよい）
+AddFolderResult addFolder(const std::wstring& raw, bool mustExist = true) {
+    AddFolderResult r;
     const std::wstring p = stripTrailingSlash(raw);
-    if (p.empty()) return;
+    if (p.empty()) return r;
     const DWORD attr = GetFileAttributesW(p.c_str());
-    if (mustExist && (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))) return;
+    if (mustExist && (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))) return r;
     for (const auto& f : folderList())
-        if (lstrcmpiW(f.c_str(), p.c_str()) == 0) return;
+        if (sameOrUnder(p, f)) {
+            r.coveredBy = f;
+            return r;
+        }
+    for (int i = ListBox_GetCount(app.folders) - 1; i >= 0; --i) {
+        std::wstring s(static_cast<size_t>(ListBox_GetTextLen(app.folders, i)), L'\0');
+        ListBox_GetText(app.folders, i, &s[0]);
+        s = s.c_str();
+        if (sameOrUnder(s, p)) {
+            r.merged.push_back(s);
+            ListBox_DeleteString(app.folders, i);
+        }
+    }
     ListBox_AddString(app.folders, p.c_str());
+    r.added = true;
+    for (const auto& m : r.merged) logs::info("監視フォルダをまとめた: " + narrow(m) + " → " + narrow(p) + "（中にあったので）");
+    return r;
+}
+
+// 足した結果を知らせる（まとめた・もう入っていた時だけ）
+void reportAddFolders(const std::vector<std::pair<std::wstring, AddFolderResult>>& results) {
+    std::wstring msg;
+    for (const auto& [path, r] : results) {
+        if (!r.coveredBy.empty())
+            msg += L"・「" + path + L"」は、監視フォルダ「" + r.coveredBy + L"」の中にあるので、足しませんでした（もう監視しています）。\n";
+        if (!r.merged.empty()) {
+            msg += L"・「" + path + L"」の中にあった監視フォルダをまとめました:\n";
+            for (const auto& m : r.merged) msg += L"    " + m + L"\n";
+        }
+    }
+    if (!msg.empty())
+        logBox(app.hwnd, (msg + L"\n（まとめても、中の画像の解析の結果はそのまま使います）").c_str(), L"監視フォルダ", MB_ICONINFORMATION);
 }
 
 std::vector<std::wstring> pickFolders(const wchar_t* title) {
@@ -5212,10 +5259,10 @@ bool ExplorerApp::ExplorerIsRoot(const std::wstring& dir) {
     return false;
 }
 
-void removeRoot(const std::wstring& dir) {
+void removeRoot(const std::wstring& dir, bool confirm = true) {
     const std::wstring d = stripTrailingSlash(dir);
-    if (logBox(app.hwnd,
-                    (L"「" + d + L"」を監視をやめしますか？\n\nこれからは中の変化を見なくなります。"
+    if (confirm && logBox(app.hwnd,
+                    (L"「" + d + L"」の監視をやめますか？\n\nこれからは中の変化を見なくなります。"
                                L"解析の結果（タグなど）は残り、ファイルも消しません。")
                         .c_str(),
                     L"imgdupe", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
@@ -5246,6 +5293,8 @@ void replaceRoot(const std::wstring& from, const std::wstring& to) {
 }
 
 // 「調べるフォルダの場所を付け替える」: 付け替える調べるフォルダと新しい場所を選んで、その下の画像のパスを書き換える（解析はやり直さない）
+void remapRoot(const std::wstring& from);
+
 void remapRootUi() {
     const auto f = folderList();
     if (f.empty()) {
@@ -5260,7 +5309,11 @@ void remapRootUi() {
     const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, app.hwnd, nullptr);
     DestroyMenu(menu);
     if (cmd < 1 || cmd > f.size()) return;
-    const std::wstring from = stripTrailingSlash(f[cmd - 1]);
+    remapRoot(stripTrailingSlash(f[cmd - 1]));
+}
+
+// 監視フォルダ from の場所を、選んだ新しい場所に変更する（その下の画像のパスも書き換える。解析はやり直さない）
+void remapRoot(const std::wstring& from) {
     const auto picked = pickFolders(L"新しい場所（中身が同じフォルダ）を選ぶ");
     if (picked.empty()) return;
     const std::wstring to = stripTrailingSlash(picked[0]);
@@ -5285,6 +5338,182 @@ void remapRootUi() {
     } catch (const std::exception& e) {
         logBox(app.hwnd, (L"場所を変更できませんでした: " + widen(e.what())).c_str(), L"imgdupe", MB_ICONWARNING);
     }
+}
+
+// 監視フォルダの管理: 一覧（状態・画像の数）と、追加・監視をやめる・場所を変更
+void rootsUi() {
+    enum { ID_LIST = 100, ID_ADD, ID_REMOVE, ID_REMAP };
+    struct State {
+        bool done = false;
+        int command = 0;
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDOK) st->done = true;
+                else st->command = LOWORD(wp);
+                return 0;
+            }
+            if (msg == WM_NOTIFY && st) {
+                auto* nm = reinterpret_cast<NMHDR*>(lp);
+                if (nm->idFrom == ID_LIST && nm->code == NM_DBLCLK) st->command = ID_REMAP;
+                return 0;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeRoots";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(920), h = px(440);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeRoots", L"監視フォルダの管理", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                               app.inst, nullptr);
+    if (!dlg) return;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    HWND tip = makeTooltip(dlg, px(320));
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cw, int ch, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cw, ch, dlg,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        return c;
+    };
+    const int m = px(12), bw = px(130), bh = px(28), bx = w - m - bw;
+    child(WC_STATICW,
+          L"常駐解析が中を見張って、解析するフォルダです。中にある監視フォルダは、外側のフォルダを足すとまとめます。",
+          SS_NOPREFIX, -1, m, m, w - 2 * m, px(20));
+    HWND list = child(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, ID_LIST, m, m + px(26), bx - px(8) - m,
+                      h - 2 * m - px(26), WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT);
+    addColumn(list, 0, L"監視フォルダ", px(500));
+    addColumn(list, 1, L"状態", px(130));
+    addColumn(list, 2, L"画像", px(80), LVCFMT_RIGHT);
+    int by = m + px(26);
+    auto btn = [&](const wchar_t* text, int id, const wchar_t* help, int gapAfter = 4) {
+        HWND b = child(WC_BUTTONW, text, WS_TABSTOP, id, bx, by, bw, bh);
+        addTooltip(tip, b, help);
+        by += bh + px(gapAfter);
+    };
+    btn(L"追加…", ID_ADD, L"監視フォルダを足します（いくつも選べます）。中にある監視フォルダはまとめます", 12);
+    btn(L"監視をやめる", ID_REMOVE, L"選んだ監視フォルダの監視をやめます（解析の結果は残り、ファイルも消しません。休止中になります）");
+    btn(L"場所を変更…", ID_REMAP,
+        L"ドライブレターやフォルダの名前が変わった監視フォルダを、新しい場所に変更します（解析はやり直しません。ダブルクリックでも）");
+    child(WC_BUTTONW, L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, bx, h - m - bh, bw, bh);
+
+    std::vector<std::wstring> roots;
+    auto fill = [&] {
+        roots = folderList();
+        std::sort(roots.begin(), roots.end(), [](const std::wstring& a, const std::wstring& b) { return lstrcmpiW(a.c_str(), b.c_str()) < 0; });
+        SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(list);
+        Db* db = uiDb();
+        for (size_t i = 0; i < roots.size(); ++i) {
+            const DWORD a = GetFileAttributesW(roots[i].c_str());
+            const bool ok = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+            int64_t n = 0;
+            if (db) {
+                try {
+                    // パスの索引で数える（\\ と / の両方）
+                    for (const wchar_t sep : {L'\\', L'/'}) {
+                        std::wstring p = roots[i];
+                        for (auto& c : p)
+                            if (c == L'\\' || c == L'/') c = sep;
+                        if (p.back() != sep) p += sep;
+                        Stmt q(db->handle(), "SELECT count(*) FROM images WHERE path >= ? AND path < ?");
+                        q.bind(1, narrow(p)).bind(2, narrow(p) + "\xff");
+                        if (q.step()) n += q.i64(0);
+                    }
+                } catch (const std::exception&) {
+                }
+            }
+            const std::wstring cells[] = {roots[i], ok ? L"つながっている" : L"見つからない（休止中）", withCommas(static_cast<uint64_t>(n))};
+            LVITEMW it{};
+            it.mask = LVIF_TEXT;
+            it.iItem = static_cast<int>(i);
+            it.pszText = const_cast<wchar_t*>(cells[0].c_str());
+            const int k = ListView_InsertItem(list, &it);
+            for (int c = 1; c < 3; ++c) ListView_SetItemText(list, k, c, const_cast<wchar_t*>(cells[c].c_str()));
+        }
+        SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(list, nullptr, TRUE);
+    };
+    fill();
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(list);
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!st.command) continue;
+        const int cmd = st.command;
+        st.command = 0;
+        std::vector<std::wstring> picked;
+        for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(list, i, LVNI_SELECTED))
+            if (i < static_cast<int>(roots.size())) picked.push_back(roots[static_cast<size_t>(i)]);
+        if (app.running) {
+            logBox(dlg, L"重複チェックの途中は、監視フォルダを変えられません。", L"監視フォルダの管理", MB_ICONINFORMATION);
+            continue;
+        }
+        if (cmd == ID_ADD) {
+            std::vector<std::pair<std::wstring, AddFolderResult>> results;
+            for (const auto& f : pickFolders(L"監視フォルダを選ぶ")) results.emplace_back(stripTrailingSlash(f), addFolder(f));
+            EnableWindow(app.hwnd, FALSE);
+            if (!results.empty()) {
+                saveSettings();
+                reportAddFolders(results);
+                EnableWindow(app.hwnd, FALSE);
+            }
+        } else if (cmd == ID_REMOVE) {
+            if (picked.empty()) {
+                logBox(dlg, L"監視をやめるフォルダを一覧で選んでください。", L"監視フォルダの管理", MB_ICONINFORMATION);
+                continue;
+            }
+            std::wstring names;
+            for (const auto& p : picked) names += L"  " + p + L"\n";
+            if (logBox(dlg, (L"次の監視フォルダの監視をやめますか？\n\n" + names +
+                             L"\nこれからは中の変化を見なくなり、中の画像は休止中になります（検索などの結果に出ません）。"
+                             L"解析の結果（タグなど）は残り、ファイルも消しません。また足せば、解析をやり直さずに戻ります。")
+                                .c_str(),
+                       L"監視フォルダの管理", MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+                for (const auto& p : picked) removeRoot(p, false);
+                logs::info("監視をやめた: " + std::to_string(picked.size()) + " 個");
+            }
+        } else if (cmd == ID_REMAP) {
+            if (picked.size() != 1) {
+                logBox(dlg, L"場所を変更する監視フォルダを、一覧で 1 つ選んでください。", L"監視フォルダの管理", MB_ICONINFORMATION);
+                continue;
+            }
+            remapRoot(picked[0]);
+            EnableWindow(app.hwnd, FALSE);
+        }
+        fill();
+    }
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    SetActiveWindow(app.hwnd);
+    if (ex.view) ex.view->RefreshStates();
 }
 
 // 「調べるフォルダを外す」: 今の調べるフォルダをメニューに並べて、選んだものを外す
@@ -7146,6 +7375,8 @@ const wchar_t* commandHelp(int id) {
         case CMD_EXPLORER: return L"選んだものを Windows のエクスプローラーで表示します（Ctrl+E）";
         case CMD_COPY_PATH: return L"選んだもののパスをクリップボードにコピーします（Ctrl+C）";
         case CMD_COMPACT_DB: return L"DB（imgdupe.db）の使っていない所を詰めて、ファイルを小さくします（常駐解析が行います）";
+        case CMD_MANAGE_ROOTS:
+            return L"監視フォルダの一覧（つながっているか・画像の数）を見て、追加・監視をやめる・場所を変更ができます";
         case CMD_REMAP_ROOT:
             return L"ドライブレターやフォルダの名前が変わった監視フォルダを、新しい場所に場所を変更します（作ったタグ・CLIP などはそのまま引き継ぎ、解析をやり直しません）";
         case CMD_ARCHIVE: return L"見つからなくなった画像（消した・動かした・ゴミ箱を空にした）のタグ・CLIP などを退避してあります。一覧を見て、要らないものを消せます";
@@ -7285,7 +7516,7 @@ void appendMainMenus(HMENU root) {
         }
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
-    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, CMD_REMAP_ROOT, 0, CMD_EXPORT, 0, CMD_EXIT});
+    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_MANAGE_ROOTS, CMD_ADD_FOLDER, CMD_REMOVE_FOLDER, CMD_REMAP_ROOT, 0, CMD_EXPORT, 0, CMD_EXIT});
     popup(L"表示(&V)", {CMD_REFRESH, 0, CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
@@ -7500,8 +7731,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (LOWORD(wp)) {
                 case CMD_ADD_FOLDER:
                     if (!app.running) {
-                        for (const auto& f : pickFolders(L"監視フォルダを選ぶ")) addFolder(f);
+                        std::vector<std::pair<std::wstring, AddFolderResult>> results;
+                        for (const auto& f : pickFolders(L"監視フォルダを選ぶ")) results.emplace_back(stripTrailingSlash(f), addFolder(f));
                         saveSettings();
+                        reportAddFolders(results);
                         if (ex.view) ex.view->RefreshStates();
                     }
                     break;
@@ -7510,6 +7743,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case CMD_REMAP_ROOT:
                     if (!app.running) remapRootUi();
+                    break;
+                case CMD_MANAGE_ROOTS:
+                    rootsUi();
                     break;
                 case CMD_SCAN_FOLDER:
                 case CMD_SCAN_FOLDER_TOP: {
