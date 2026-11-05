@@ -49,10 +49,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp imgdupe/out/imgdupe.exe imgdupe/out/imgdupe_setup.exe dist/
+          cp imgdupe/out/imgdupe.exe imgdupe/out/imgdupe_setup.exe LICENSE THIRD_PARTY_NOTICES.md dist/
           cd dist
-          gh release create "$TAG" *.exe models.json $(ls *.dll 2>/dev/null) --target "$GITHUB_SHA" \
+          gh release create "$TAG" *.exe models.json $(ls *.dll 2>/dev/null) LICENSE THIRD_PARTY_NOTICES.md --target "$GITHUB_SHA" \
             --title "imgdupe $TAG" \
             --notes "imgdupe_setup.exe: インストーラー（管理者の権限は要りません。AI 解析の部品もここから入れられます）。
           imgdupe.exe: 実行ファイル単体（アプリの自動更新が使います）。
-          models.json と *.dll: AI 解析の部品の一覧と ONNX Runtime（インストーラーとアプリがダウンロードします）。"
+          models.json と *.dll: AI 解析の部品の一覧と ONNX Runtime（インストーラーとアプリがダウンロードします）。
+          AI（Claude）で作ったソフトです。ライセンス: MIT No Attribution（LICENSE）。他のソフト・AI の部品のライセンスは THIRD_PARTY_NOTICES.md。"
