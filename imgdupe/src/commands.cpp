@@ -38,7 +38,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_ADD_FOLDER, "AddFolder", L"監視フォルダを追加(&A)...", ""},
     {CMD_REMOVE_FOLDER, "RemoveFolder", L"監視をやめる(&R)", ""},
     {CMD_MANAGE_ROOTS, "ManageFolders", L"監視フォルダの管理(&W)...", ""},
-    {CMD_REMAP_ROOT, "RemapFolder", L"監視フォルダの場所を変更(&M)...", ""},
+    {CMD_REMAP_ROOT, "RemapFolder", L"監視フォルダの移動先を指定(&M)...", ""},
     {CMD_EXPORT, "Export", L"結果を書き出す(&S)...", "Ctrl+S"},
     {CMD_EXIT, "Exit", L"終了(&X)", ""},
     {CMD_SEARCH, "Search", L"チェック開始 / 中止(&S)", "F5"},
