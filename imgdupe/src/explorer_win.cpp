@@ -46,6 +46,8 @@ constexpr wchar_t kGridClass[] = L"imgdupe_explorer_grid";
 constexpr wchar_t kPreviewClass[] = L"imgdupe_explorer_preview";
 constexpr wchar_t kTrayClass[] = L"imgdupe_explorer_tray";
 constexpr wchar_t kViewBarClass[] = L"imgdupe_explorer_viewbar";
+constexpr wchar_t kViewRibbonClass[] = L"imgdupe_view_ribbon";    // ホームのリボンの四角いボタン（ペイン・表示・並び順・表紙）
+constexpr wchar_t kStatusIconsClass[] = L"imgdupe_status_icons";  // ステータスバーの右端のアイコン
 constexpr wchar_t kCrumbClass[] = L"imgdupe_explorer_crumbs";
 const wchar_t kListMarker[] = L"\x01list";  // 戻るの履歴で「検索の結果」を表す
 constexpr UINT WM_THUMB_DONE = WM_APP + 41;  // lParam = ThumbResult*
@@ -444,6 +446,10 @@ class ExplorerImpl {
   HWND viewBar = nullptr;
   HWND crumbs = nullptr;  // アドレスバー: フォルダの階層ごとのボタン（クリックで移動、ドラッグでフォルダを外へ、空いた所のクリックで文字で入力）  // 表示・並び順・大きさ・表紙・パネルの切り替え（ホームのリボンに置く。親はホストの窓）
   HWND backBtn = nullptr, forwardBtn = nullptr, treeBtn = nullptr, previewBtn = nullptr;
+  HWND ribbonWnd = nullptr, statusIcons = nullptr, ribbonTip = nullptr, statusTip = nullptr;
+  int ribbonHot = -1, statusHot = -1, ribbonWheel = 0;
+  HFONT iconFont = nullptr, smallFont = nullptr;
+  std::wstring iconFace;
   HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
   HWND sameText = nullptr;  // 下のステータスバー（同じ画像を探した結果の数などを出す）
@@ -535,6 +541,8 @@ class ExplorerImpl {
     if (font) DeleteObject(font);
     if (nameFont) DeleteObject(nameFont);
     if (strikeFont) DeleteObject(strikeFont);
+    if (iconFont) DeleteObject(iconFont);
+    if (smallFont) DeleteObject(smallFont);
     for (HBITMAP b : dots) {
       if (b) DeleteObject(b);
     }
@@ -651,6 +659,7 @@ class ExplorerImpl {
     if (!sortBox) return;
     SendMessageW(sortBox, CB_SETCURSEL, SortKey(), 0);
     SetWindowTextW(sortDirBtn, settings.sortDesc ? L"降順" : L"昇順");
+    ViewChanged();
   }
 
   void Resort() {
@@ -1760,6 +1769,7 @@ class ExplorerImpl {
     EnsureVisible(sel);
     InvalidateRect(grid, nullptr, FALSE);
     host->ExplorerSettingsChanged(settings);
+    ViewChanged();
   }
 
   int CurrentLogicalSize() const {
@@ -3355,7 +3365,9 @@ class ExplorerImpl {
     MoveWindow(grid, gx, top, std::max(0, gr - gx), bodyH, TRUE);
     // ステータスバー
     int sy = top + bodyH;
-    MoveWindow(sameText, m, sy + Px(4), std::max(0, int(rc.right - m * 2)), resultsH - Px(6), TRUE);
+    const int iw = StatusIconsW();
+    MoveWindow(sameText, m, sy + Px(4), std::max(0, int(rc.right - m * 3 - iw)), resultsH - Px(6), TRUE);
+    if (statusIcons) MoveWindow(statusIcons, rc.right - m - iw, sy + Px(1), iw, std::max(Px(24), resultsH - Px(2)), TRUE);
     InvalidateRect(hwnd, nullptr, TRUE);
   }
 
@@ -3594,36 +3606,385 @@ class ExplorerImpl {
   }
 
   // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
-  SIZE ViewBarSize() const { return SIZE{Px(400), Px(80)}; }
+  SIZE ViewBarSize() const { return SIZE{kRibbonButtons * (RibbonW() + Px(4)), Px(80)}; }
   void LayoutViewBar() {
-    const int rowH = Px(24), gap = Px(3), labelW = Px(46);
-    int y = 0, x = 0;
-    auto label = [&](HWND h, int w) {
-      MoveWindow(h, x, y + Px(4), w, rowH - Px(4), TRUE);
-      x += w;
+    // 前のドロップダウン・スライダー・ボタンは隠して、四角いボタンだけにした（v3.12。表示の再編_仕様案.md）
+    for (HWND h : {viewLabel, viewBox, sortLabel, sortBox, sortDirBtn, sizeLabel, sizeBox, slider, folderLabel, folderBox, treeBtn, previewBtn})
+      if (h) ShowWindow(h, SW_HIDE);
+    RECT rc;
+    GetClientRect(viewBar, &rc);
+    if (ribbonWnd) MoveWindow(ribbonWnd, 0, 0, rc.right, rc.bottom, TRUE);
+  }
+
+  // ---- 表示の四角いボタンとステータスバーのアイコン
+  static constexpr int kRibbonButtons = 4;  // ペイン・表示・並び順・表紙
+  int RibbonW() const { return Px(92); }
+  RECT RibbonRect(int i) const {
+    RECT rc;
+    GetClientRect(ribbonWnd, &rc);
+    const int x = i * (RibbonW() + Px(4));
+    return RECT{x, 0, x + RibbonW(), rc.bottom};
+  }
+  // 表示（詳細・サムネイルの大きさ）を 1 つの並びに: 0 詳細・1 小・2 普通・3 大・4 可変
+  int LayoutIndex() const { return Details() ? 0 : 1 + std::max(0, std::min(3, settings.sizeMode)); }
+  void SetViewMode(int mode) {
+    if (mode == settings.viewMode) return;
+    settings.viewMode = mode;
+    SendMessageW(viewBox, CB_SETCURSEL, mode, 0);
+    host->ExplorerSettingsChanged(settings);
+    if (Details() && !listMode) host->ExplorerRequestProgress(dir);
+    scrollY = 0;
+    scrollX = 0;
+    UpdateScroll();
+    EnsureVisible(sel);
+    InvalidateRect(grid, nullptr, FALSE);
+    ViewChanged();
+  }
+  void SetLayout(int index) {
+    index = std::max(0, std::min(4, index));
+    if (index == 0) {
+      SetViewMode(1);
+      return;
+    }
+    SetViewMode(0);
+    if (index - 1 != settings.sizeMode) SetSize(index - 1, settings.customSize);
+    ViewChanged();
+  }
+  void SetFolderStyle(int style) {
+    settings.folderStyle = std::max(0, std::min(4, style));
+    SendMessageW(folderBox, CB_SETCURSEL, settings.folderStyle, 0);
+    host->ExplorerSettingsChanged(settings);
+    InvalidateRect(grid, nullptr, FALSE);
+    UpdatePreview();
+    ViewChanged();
+  }
+  void ShowPane(bool treePanel, bool show) {
+    if ((treePanel ? settings.showTree : settings.showPreview) != show) TogglePanel(treePanel);
+  }
+  void ViewChanged() {
+    if (ribbonWnd) InvalidateRect(ribbonWnd, nullptr, FALSE);
+    if (statusIcons) InvalidateRect(statusIcons, nullptr, FALSE);
+  }
+  static const wchar_t* LayoutName(int i) {
+    static const wchar_t* n[] = {L"詳細", L"サムネイル（小）", L"サムネイル（普通）", L"サムネイル（大）", L"サムネイル（可変）"};
+    return n[std::max(0, std::min(4, i))];
+  }
+  static const wchar_t* SortName(int k) {
+    static const wchar_t* n[] = {L"名前", L"更新日時", L"種類", L"サイズ", L"検索結果の順"};
+    return n[std::max(0, std::min(4, k))];
+  }
+  static const wchar_t* CoverName(int k) {
+    static const wchar_t* n[] = {L"1 枚目", L"1・2 枚目", L"最後と 1 枚目", L"最後", L"最後の一つ前と最後"};
+    return n[std::max(0, std::min(4, k))];
+  }
+  int SortKeys() const { return listMode ? 5 : 4; }  // 「検索結果の順」は検索の結果の時だけ
+  std::wstring RibbonValue(int i) const {
+    switch (i) {
+      case 0:
+        return settings.showTree && settings.showPreview ? L"一覧・プレビュー"
+               : settings.showTree                       ? L"フォルダ一覧"
+               : settings.showPreview                    ? L"プレビュー"
+                                                         : L"なし";
+      case 1: {
+        static const wchar_t* n[] = {L"詳細", L"小", L"普通", L"大", L"可変"};
+        return n[LayoutIndex()];
+      }
+      case 2: return std::wstring(SortName(SortKey())) + (settings.sortDesc ? L"・降順" : L"・昇順");
+      default: return CoverName(settings.folderStyle);
+    }
+  }
+  bool HasIconFont() const { return iconFont != nullptr; }
+  void EnsureIconFonts() {
+    if (smallFont) return;
+    LOGFONTW lf = {};
+    GetObjectW(font, sizeof(lf), &lf);
+    lf.lfHeight = lf.lfHeight * 9 / 10;
+    smallFont = CreateFontIndirectW(&lf);
+    HDC dc = GetDC(nullptr);
+    for (const wchar_t* face : {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"}) {
+      LOGFONTW q = {};
+      q.lfCharSet = DEFAULT_CHARSET;
+      lstrcpynW(q.lfFaceName, face, LF_FACESIZE);
+      bool found = false;
+      EnumFontFamiliesExW(dc, &q, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM l) -> int {
+        *reinterpret_cast<bool*>(l) = true;
+        return 0;
+      }, LPARAM(&found), 0);
+      if (found) {
+        iconFont = CreateFontW(-Px(24), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+        iconFace = face;
+        break;
+      }
+    }
+    ReleaseDC(nullptr, dc);
+  }
+  // 絵: 記号のフォントがあればその文字、無ければ代わりの文字
+  void DrawIcon(HDC dc, RECT r, wchar_t glyph, const wchar_t* fallback, int size) {
+    HFONT f = iconFont;
+    HFONT made = nullptr;
+    if (f && size != 24) f = made = CreateFontW(-Px(size), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                                                iconFace.c_str());
+    HGDIOBJ old = SelectObject(dc, f ? HGDIOBJ(f) : HGDIOBJ(font));
+    wchar_t g[2] = {glyph, 0};
+    DrawTextW(dc, f ? g : fallback, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
+    if (made) DeleteObject(made);
+  }
+  void PaintRibbon(HDC dc, const RECT& rc) {
+    EnsureIconFonts();
+    FillRect(dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+    SetBkMode(dc, TRANSPARENT);
+    const wchar_t glyphs[] = {0xE8A0, 0xE8A9, 0xE8CB, 0xE8B7};
+    const wchar_t* fallback[] = {L"窓", L"表", L"順", L"紙"};  // 記号のフォントが無い時（今のリボンと同じく漢字 1 字）
+    const wchar_t* captions[] = {L"ペイン", L"表示", L"並び順", L"表紙"};
+    for (int i = 0; i < kRibbonButtons; i++) {
+      RECT r = RibbonRect(i);
+      if (i == ribbonHot) {
+        HBRUSH br = CreateSolidBrush(RGB(229, 241, 251));
+        FillRect(dc, &r, br);
+        DeleteObject(br);
+        HBRUSH fr = CreateSolidBrush(RGB(204, 228, 247));
+        FrameRect(dc, &r, fr);
+        DeleteObject(fr);
+      }
+      SetTextColor(dc, RGB(40, 40, 40));
+      DrawIcon(dc, {r.left, r.top + Px(4), r.right, r.top + Px(34)}, glyphs[i], fallback[i], 24);
+      HGDIOBJ old = SelectObject(dc, font);
+      RECT cr = {r.left + Px(2), r.top + Px(36), r.right - Px(2), r.top + Px(54)};
+      DrawTextW(dc, captions[i], -1, &cr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+      SelectObject(dc, smallFont);
+      SetTextColor(dc, RGB(90, 90, 90));
+      const std::wstring v = RibbonValue(i) + L" ▼";
+      RECT vr = {r.left + Px(2), r.top + Px(55), r.right - Px(2), r.bottom - Px(2)};
+      DrawTextW(dc, v.c_str(), -1, &vr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+      SelectObject(dc, old);
+    }
+  }
+  // 四角いボタンを押した: 選ぶメニュー
+  void RibbonMenu(int i) {
+    enum { kPaneTree = 1, kPanePreview, kLayout0 = 10, kSort0 = 20, kAsc = 30, kDesc, kCover0 = 40 };
+    HMENU m = CreatePopupMenu();
+    auto item = [&](int id, const wchar_t* text, bool checked) {
+      AppendMenuW(m, MF_STRING | (checked ? MF_CHECKED : 0), UINT_PTR(id), text);
     };
-    auto put = [&](HWND h, int w, int dropH = 0) {
-      MoveWindow(h, x, y, w, dropH ? dropH : rowH, TRUE);
-      x += w + Px(4);
-    };
-    label(viewLabel, labelW);
-    put(viewBox, Px(100), Px(200));
-    x += Px(8);
-    label(sortLabel, Px(50));
-    put(sortBox, Px(126), Px(220));
-    put(sortDirBtn, Px(48));
-    y += rowH + gap;
-    x = 0;
-    label(sizeLabel, labelW);
-    put(sizeBox, Px(64), Px(200));
-    put(slider, Px(90));
-    x += Px(4);
-    label(folderLabel, Px(40));
-    put(folderBox, Px(140), Px(200));
-    y += rowH + gap;
-    x = labelW;
-    put(treeBtn, Px(96));
-    put(previewBtn, Px(96));
+    if (i == 0) {
+      item(kPaneTree, L"フォルダ一覧(&F)", settings.showTree);
+      item(kPanePreview, L"プレビュー(&P)", settings.showPreview);
+    } else if (i == 1) {
+      for (int k = 0; k < 5; k++) {
+        item(kLayout0 + k, LayoutName(k), LayoutIndex() == k);
+        if (k == 0) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+      }
+    } else if (i == 2) {
+      for (int k = 0; k < SortKeys(); k++) item(kSort0 + k, SortName(k), SortKey() == k);
+      AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+      item(kAsc, L"昇順(&A)", !settings.sortDesc);
+      item(kDesc, L"降順(&D)", settings.sortDesc);
+    } else {
+      for (int k = 0; k < 5; k++) item(kCover0 + k, CoverName(k), settings.folderStyle == k);
+    }
+    RECT r = RibbonRect(i);
+    POINT pt = {r.left, r.bottom};
+    ClientToScreen(ribbonWnd, &pt);
+    const int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, ribbonWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == kPaneTree || cmd == kPanePreview) TogglePanel(cmd == kPaneTree);
+    else if (cmd >= kLayout0 && cmd < kLayout0 + 5) SetLayout(cmd - kLayout0);
+    else if (cmd >= kSort0 && cmd < kSort0 + 5) SetSort(cmd - kSort0, settings.sortDesc);
+    else if (cmd == kAsc || cmd == kDesc) SetSort(SortKey(), cmd == kDesc);
+    else if (cmd >= kCover0 && cmd < kCover0 + 5) SetFolderStyle(cmd - kCover0);
+    ViewChanged();
+  }
+  // 四角いボタンの上でホイール: 値を順に替える（上へ回すと次・大きく）
+  void RibbonWheel(int i, int steps) {
+    if (i == 1) SetLayout(LayoutIndex() + steps);
+    else if (i == 2) SetSort(((SortKey() - steps) % SortKeys() + SortKeys()) % SortKeys(), settings.sortDesc);
+    else if (i == 3) SetFolderStyle(((settings.folderStyle - steps) % 5 + 5) % 5);
+    ViewChanged();
+  }
+  int RibbonAt(POINT pt) const {
+    for (int i = 0; i < kRibbonButtons; i++) {
+      RECT r = RibbonRect(i);
+      if (PtInRect(&r, pt)) return i;
+    }
+    return -1;
+  }
+  static LRESULT CALLBACK RibbonProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE)
+      SetWindowLongPtrW(h, GWLP_USERDATA, LONG_PTR(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+    auto* self = reinterpret_cast<ExplorerImpl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (!self) return DefWindowProcW(h, msg, wp, lp);
+    switch (msg) {
+      case WM_ERASEBKGND: return 1;
+      case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC buf = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
+        HGDIOBJ old = SelectObject(buf, bmp);
+        self->PaintRibbon(buf, rc);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+        SelectObject(buf, old);
+        DeleteObject(bmp);
+        DeleteDC(buf);
+        EndPaint(h, &ps);
+        return 0;
+      }
+      case WM_SIZE:
+        self->UpdateRibbonTips();
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      case WM_MOUSEMOVE: {
+        const int i = self->RibbonAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (i != self->ribbonHot) {
+          self->ribbonHot = i;
+          InvalidateRect(h, nullptr, FALSE);
+          TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+          TrackMouseEvent(&tme);
+        }
+        return 0;
+      }
+      case WM_MOUSELEAVE:
+        self->ribbonHot = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      case WM_LBUTTONDOWN: {
+        const int i = self->RibbonAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (i >= 0) self->RibbonMenu(i);
+        return 0;
+      }
+      case WM_MOUSEWHEEL: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(h, &pt);
+        const int i = self->RibbonAt(pt);
+        if (i < 0) return 0;
+        self->ribbonWheel += GET_WHEEL_DELTA_WPARAM(wp);
+        const int steps = self->ribbonWheel / WHEEL_DELTA;
+        self->ribbonWheel -= steps * WHEEL_DELTA;
+        if (steps) self->RibbonWheel(i, steps);
+        return 0;
+      }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+  }
+  void UpdateRibbonTips() {
+    if (!ribbonTip) return;
+    const wchar_t* tips[] = {L"ペイン: 左のフォルダ一覧・右のプレビューを出す・隠す（押して選ぶ）",
+                             L"表示: 詳細か、サムネイルの大きさ（押して選ぶ。ホイールで 詳細 ⇔ 小 ⇔ 普通 ⇔ 大 ⇔ 可変）",
+                             L"並び順: 並べる順（押して種類と昇順・降順を選ぶ。ホイールで種類を替える）",
+                             L"表紙: フォルダのサムネイルに、中のどの画像を出すか（押して選ぶ。ホイールで替える）"};
+    for (int i = 0; i < kRibbonButtons; i++) {
+      TOOLINFOW ti = {sizeof(ti)};
+      ti.uFlags = TTF_SUBCLASS;
+      ti.hwnd = ribbonWnd;
+      ti.uId = UINT_PTR(i + 1);
+      ti.rect = RibbonRect(i);
+      ti.lpszText = const_cast<wchar_t*>(tips[i]);
+      SendMessageW(ribbonTip, TTM_DELTOOLW, 0, LPARAM(&ti));
+      SendMessageW(ribbonTip, TTM_ADDTOOLW, 0, LPARAM(&ti));
+    }
+  }
+
+  // ステータスバーの右端: [フォルダ一覧][プレビュー]  [サムネイル][詳細]
+  int StatusIconsW() const { return Px(22) * 4 + Px(10); }
+  RECT StatusIconRect(int i) const {
+    RECT rc;
+    GetClientRect(statusIcons, &rc);
+    const int s = Px(22), x = i * s + (i >= 2 ? Px(10) : 0);
+    return RECT{x, (rc.bottom - s) / 2, x + s, (rc.bottom - s) / 2 + s};
+  }
+  bool StatusIconOn(int i) const {
+    return i == 0 ? settings.showTree : i == 1 ? settings.showPreview : i == 2 ? !Details() : Details();
+  }
+  void PaintStatusIcons(HDC dc, const RECT& rc) {
+    EnsureIconFonts();
+    FillRect(dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+    SetBkMode(dc, TRANSPARENT);
+    const wchar_t glyphs[] = {0xE8A0, 0xE8A1, 0xE8A9, 0xE8FD};
+    const wchar_t* fallback[] = {L"覧", L"プ", L"サ", L"詳"};
+    for (int i = 0; i < 4; i++) {
+      RECT r = StatusIconRect(i);
+      if (StatusIconOn(i) || i == statusHot) {
+        HBRUSH br = CreateSolidBrush(StatusIconOn(i) ? RGB(204, 228, 247) : RGB(229, 241, 251));
+        FillRect(dc, &r, br);
+        DeleteObject(br);
+      }
+      if (StatusIconOn(i)) {
+        HBRUSH fr = CreateSolidBrush(RGB(120, 170, 220));
+        FrameRect(dc, &r, fr);
+        DeleteObject(fr);
+      }
+      SetTextColor(dc, RGB(50, 50, 50));
+      DrawIcon(dc, r, glyphs[i], fallback[i], 14);
+    }
+  }
+  static LRESULT CALLBACK StatusIconsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE)
+      SetWindowLongPtrW(h, GWLP_USERDATA, LONG_PTR(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+    auto* self = reinterpret_cast<ExplorerImpl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (!self) return DefWindowProcW(h, msg, wp, lp);
+    switch (msg) {
+      case WM_ERASEBKGND: return 1;
+      case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        self->PaintStatusIcons(dc, rc);
+        EndPaint(h, &ps);
+        return 0;
+      }
+      case WM_SIZE: {
+        if (self->statusTip) {
+          const wchar_t* tips[] = {L"フォルダ一覧を出す・隠す", L"プレビューを出す・隠す", L"サムネイルで並べる", L"詳細で並べる"};
+          for (int i = 0; i < 4; i++) {
+            TOOLINFOW ti = {sizeof(ti)};
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = h;
+            ti.uId = UINT_PTR(i + 1);
+            ti.rect = self->StatusIconRect(i);
+            ti.lpszText = const_cast<wchar_t*>(tips[i]);
+            SendMessageW(self->statusTip, TTM_DELTOOLW, 0, LPARAM(&ti));
+            SendMessageW(self->statusTip, TTM_ADDTOOLW, 0, LPARAM(&ti));
+          }
+        }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      }
+      case WM_MOUSEMOVE: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int hot = -1;
+        for (int i = 0; i < 4; i++) {
+          RECT r = self->StatusIconRect(i);
+          if (PtInRect(&r, pt)) hot = i;
+        }
+        if (hot != self->statusHot) {
+          self->statusHot = hot;
+          InvalidateRect(h, nullptr, FALSE);
+          TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+          TrackMouseEvent(&tme);
+        }
+        return 0;
+      }
+      case WM_MOUSELEAVE:
+        self->statusHot = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      case WM_LBUTTONDOWN: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        for (int i = 0; i < 4; i++) {
+          RECT r = self->StatusIconRect(i);
+          if (!PtInRect(&r, pt)) continue;
+          if (i < 2) self->TogglePanel(i == 0);
+          else self->SetViewMode(i == 2 ? 0 : 1);
+        }
+        self->ViewChanged();
+        return 0;
+      }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
   }
 
   // viewBar: 部品の通知を、エクスプローラーの窓（HostProc）に回す
@@ -3654,6 +4015,7 @@ class ExplorerImpl {
     if (treePanel && settings.showTree) SyncTree(dir);
     if (!treePanel && settings.showPreview) UpdatePreview(true);
     host->ExplorerSettingsChanged(settings);
+    ViewChanged();
     SetFocus(grid);
   }
 
@@ -3749,23 +4111,13 @@ class ExplorerImpl {
             return 0;
           case ID_FOLDER:
             if (HIWORD(wp) == CBN_SELCHANGE) {
-              self->settings.folderStyle = int(SendMessageW(self->folderBox, CB_GETCURSEL, 0, 0));
-              self->host->ExplorerSettingsChanged(self->settings);
-              InvalidateRect(self->grid, nullptr, FALSE);
-              self->UpdatePreview();
+              self->SetFolderStyle(int(SendMessageW(self->folderBox, CB_GETCURSEL, 0, 0)));
               SetFocus(self->grid);
             }
             return 0;
           case ID_VIEW:
             if (HIWORD(wp) == CBN_SELCHANGE) {
-              self->settings.viewMode = int(SendMessageW(self->viewBox, CB_GETCURSEL, 0, 0));
-              self->host->ExplorerSettingsChanged(self->settings);
-              if (self->Details() && !self->listMode) self->host->ExplorerRequestProgress(self->dir);
-              self->scrollY = 0;
-              self->scrollX = 0;
-              self->UpdateScroll();
-              self->EnsureVisible(self->sel);
-              InvalidateRect(self->grid, nullptr, FALSE);
+              self->SetViewMode(int(SendMessageW(self->viewBox, CB_GETCURSEL, 0, 0)));
               SetFocus(self->grid);
             }
             return 0;
@@ -4395,6 +4747,18 @@ class ExplorerImpl {
     vc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
     vc.lpszClassName = kViewBarClass;
     RegisterClassExW(&vc);
+    WNDCLASSEXW rcl = {sizeof(rcl)};
+    rcl.lpfnWndProc = RibbonProc;
+    rcl.hInstance = inst;
+    rcl.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    rcl.lpszClassName = kViewRibbonClass;
+    RegisterClassExW(&rcl);
+    WNDCLASSEXW scl = {sizeof(scl)};
+    scl.lpfnWndProc = StatusIconsProc;
+    scl.hInstance = inst;
+    scl.hCursor = LoadCursor(nullptr, IDC_HAND);
+    scl.lpszClassName = kStatusIconsClass;
+    RegisterClassExW(&scl);
     WNDCLASSEXW tc = {sizeof(tc)};
     tc.lpfnWndProc = TrayProc;
     tc.hInstance = inst;
@@ -4475,6 +4839,10 @@ class ExplorerImpl {
     sameText = make(L"STATIC", L"画像を右クリック →「同一画像を探す」か、画像のファイル・URL をここにドロップすると、同じ画像（解析した全部のフォルダの中）を一覧に出します。"
                                L"　右下の印 — 緑: 解析済み、橙: 解析待ち、白: 未解析、半分: 一部、灰: 休止中（結果に出ない）",
                     SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS, ID_SAME_TEXT);
+    ribbonWnd = CreateWindowExW(0, kViewRibbonClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, viewBar, nullptr, inst, this);
+    statusIcons = CreateWindowExW(0, kStatusIconsClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
+    ribbonTip = winutil::makeTooltip(ribbonWnd, Px(360));
+    statusTip = winutil::makeTooltip(statusIcons, Px(300));
     // マウスを乗せた時の説明
     {
       HWND tip = winutil::makeTooltip(hwnd, Px(360));
@@ -4591,5 +4959,15 @@ void Explorer::SetGroups(const std::wstring& title, std::vector<ExplorerGroup> g
 
 void Explorer::AddTrayTag(const std::wstring& tag) { impl_->AddTray(tag); }
 bool Explorer::TagEditing() const { return impl_->tagEdit; }
+bool Explorer::ShowTree() const { return impl_->settings.showTree; }
+bool Explorer::ShowPreview() const { return impl_->settings.showPreview; }
+void Explorer::TogglePane(bool tree) { impl_->TogglePanel(tree); }
+int Explorer::LayoutIndex() const { return impl_->LayoutIndex(); }
+void Explorer::SetLayout(int index) { impl_->SetLayout(index); }
+int Explorer::SortKey() const { return impl_->SortKey(); }
+bool Explorer::SortDesc() const { return impl_->settings.sortDesc; }
+void Explorer::SetSort(int key, bool desc) { impl_->SetSort(key, desc); }
+int Explorer::FolderStyle() const { return impl_->settings.folderStyle; }
+void Explorer::SetFolderStyle(int style) { impl_->SetFolderStyle(style); }
 bool Explorer::SetTagEditing(bool on) { return impl_->SetTagEditing(on); }
 bool Explorer::ConfirmTagEdit() { return impl_->ConfirmTagEdit(); }

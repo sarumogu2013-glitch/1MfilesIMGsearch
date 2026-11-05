@@ -148,6 +148,17 @@ class Explorer {
   // 重複のまとまりを真ん中の一覧に出す（まとまりは重なった絵）
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups);
   void AddTrayTag(const std::wstring& tag);
+  // 表示（ホストのメニューから）
+  bool ShowTree() const;
+  bool ShowPreview() const;
+  void TogglePane(bool tree);
+  int LayoutIndex() const;  // 0 詳細・1 小・2 普通・3 大・4 可変
+  void SetLayout(int index);
+  int SortKey() const;      // 0 名前・1 更新日時・2 種類・3 サイズ・4 検索結果の順
+  bool SortDesc() const;
+  void SetSort(int key, bool desc);
+  int FolderStyle() const;  // フォルダのサムネイル（表紙）の出し方 0〜4
+  void SetFolderStyle(int style);
   // タグの手動編集
   bool TagEditing() const;
   bool SetTagEditing(bool on);  // 切る時に保存していない変更があれば確かめる。キャンセルなら false

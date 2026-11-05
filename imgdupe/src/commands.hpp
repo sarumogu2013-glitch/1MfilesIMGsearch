@@ -77,6 +77,25 @@ enum Cmd : int {
     CMD_SEARCH_CLEAR,     // 検索の条件をクリア
     CMD_SEARCH_ADVANCED,  // 詳細検索を開く / 閉じる
     CMD_TAG_EDIT,         // タグの手動編集（入 / 切）
+    CMD_VIEW_TREE,        // フォルダ一覧を出す・隠す
+    CMD_VIEW_PREVIEW,     // プレビューを出す・隠す
+    CMD_VIEW_DETAILS,     // 表示: 詳細（ここから 5 つは並びの順）
+    CMD_VIEW_SMALL,
+    CMD_VIEW_MEDIUM,
+    CMD_VIEW_LARGE,
+    CMD_VIEW_CUSTOM,
+    CMD_SORT_NAME,        // 並び順（ここから 5 つは並びの順）
+    CMD_SORT_DATE,
+    CMD_SORT_TYPE,
+    CMD_SORT_SIZE,
+    CMD_SORT_RESULT,
+    CMD_SORT_ASC,
+    CMD_SORT_DESC,
+    CMD_COVER_1,          // 表紙（フォルダのサムネイル）の出し方（ここから 5 つ）
+    CMD_COVER_2,
+    CMD_COVER_3,
+    CMD_COVER_4,
+    CMD_COVER_5,
 };
 
 struct CmdInfo {

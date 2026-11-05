@@ -4493,7 +4493,7 @@ void showSettingsWindow() {
     w.gpu = child(WC_BUTTONW, L"GPU（DirectML）を使う（調子が悪い時は外すと CPU だけで動きます）", WS_TABSTOP | BS_AUTOCHECKBOX,
                   IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
     w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
-    child(WC_BUTTONW, L"AI の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
+    child(WC_BUTTONW, L"最新版を調べる", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
     page(3);
     gy = group(L"出典の照会（インターネットで出典を調べる）", px(160));
     w.idLookup = child(WC_BUTTONW, L"ファイル名の pixiv・Danbooru（MD5）の ID で、投稿のタグと作者を調べる",
@@ -5757,6 +5757,7 @@ void removeRootMenu() {
 }
 
 void ExplorerApp::ExplorerSettingsChanged(const ExplorerSettings& s) {
+    syncMenuChecks();  // 表示のメニューのチェック
     const std::wstring ini = iniPath();
     auto put = [&](const wchar_t* key, int v) { WritePrivateProfileStringW(L"Explorer", key, std::to_wstring(v).c_str(), ini.c_str()); };
     put(L"sizeMode", s.sizeMode);
@@ -7555,7 +7556,6 @@ const ToolButton kToolButtons[] = {
     {0, 0, nullptr, nullptr, false},
     {CMD_FIND_SAME, 0xE71E, L"同", L"同一画像を探す", true},
     {0, 0, nullptr, nullptr, false},
-    {CMD_STATS, 0xE9D2, L"統", L"統計", true},
     {CMD_SETTINGS, 0xE713, L"設", L"設定", true},
     {CMD_KEY_SETTINGS, 0xE765, L"鍵", L"キー", true},
     {CMD_CHECK_UPDATE, 0xE895, L"更", L"アップデート", true},
@@ -7859,8 +7859,14 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(parent, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     auto popup = [&](const wchar_t* title, std::initializer_list<int> cmds) { sub(root, title, cmds); };
-    popup(L"ファイル(&F)", {CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_REFRESH, 0, CMD_STATS});
+    popup(L"ファイル(&F)", {CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE,
+                            CMD_INDEXER_AUTOSTART, 0, CMD_EXIT});
+    HMENU view = CreatePopupMenu();
+    fill(view, {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_REFRESH, 0, CMD_VIEW_TREE, CMD_VIEW_PREVIEW, 0,
+                CMD_VIEW_DETAILS, CMD_VIEW_SMALL, CMD_VIEW_MEDIUM, CMD_VIEW_LARGE, CMD_VIEW_CUSTOM, 0});
+    sub(view, L"並び順(&O)", {CMD_SORT_NAME, CMD_SORT_DATE, CMD_SORT_TYPE, CMD_SORT_SIZE, CMD_SORT_RESULT, 0, CMD_SORT_ASC, CMD_SORT_DESC});
+    sub(view, L"表紙（フォルダのサムネイル）(&C)", {CMD_COVER_1, CMD_COVER_2, CMD_COVER_3, CMD_COVER_4, CMD_COVER_5});
+    AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示(&V)");
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, CMD_SAVE_SELECTION});
     // ツール: タグと DB を補強するもの、リボン（重複チェック・検索・画像から検索）の動作、設定
     HMENU tools = CreatePopupMenu();
@@ -7870,7 +7876,7 @@ void appendMainMenus(HMENU root) {
     sub(tools, L"検索(&F)", {CMD_SEARCH_GO, CMD_SEARCH_END, CMD_SEARCH_CLEAR, CMD_SEARCH_ADVANCED, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES,
                              CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
     sub(tools, L"画像から検索(&Q)", {CMD_QUERY_PASTE, CMD_QUERY_OPEN, CMD_QUERY_URL, 0, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
-    fill(tools, {0, CMD_SETTINGS});
+    fill(tools, {0, CMD_STATS, CMD_SETTINGS});
     AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), L"ツール(&O)");
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_CHECK_UPDATE, CMD_RELEASES, 0, CMD_OPEN_LOGS, CMD_OPEN_DATA, 0, CMD_ABOUT});
 }
@@ -7886,6 +7892,16 @@ void syncMenuChecks() {
     CheckMenuItem(app.menuBar, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_EDIT, MF_BYCOMMAND | (ex.view && ex.view->TagEditing() ? MF_CHECKED : MF_UNCHECKED));
+    if (ex.view) {
+        auto mark = [](int cmd, bool on) { CheckMenuItem(app.menuBar, cmd, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED)); };
+        mark(CMD_VIEW_TREE, ex.view->ShowTree());
+        mark(CMD_VIEW_PREVIEW, ex.view->ShowPreview());
+        for (int k = 0; k < 5; ++k) mark(CMD_VIEW_DETAILS + k, ex.view->LayoutIndex() == k);
+        for (int k = 0; k < 5; ++k) mark(CMD_SORT_NAME + k, ex.view->SortKey() == k);
+        mark(CMD_SORT_ASC, !ex.view->SortDesc());
+        mark(CMD_SORT_DESC, ex.view->SortDesc());
+        for (int k = 0; k < 5; ++k) mark(CMD_COVER_1 + k, ex.view->FolderStyle() == k);
+    }
 }
 
 void rebuildMenu() {
@@ -8263,6 +8279,28 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_COMPACT_DB: compactDbUi(); break;
                 case CMD_ARCHIVE: archiveUi(); break;
                 case CMD_INFER_RULES: teachFolderUi(L""); break;
+                case CMD_VIEW_TREE:
+                case CMD_VIEW_PREVIEW:
+                    if (ex.view) ex.view->TogglePane(LOWORD(wp) == CMD_VIEW_TREE);
+                    syncMenuChecks();
+                    break;
+                case CMD_VIEW_DETAILS: case CMD_VIEW_SMALL: case CMD_VIEW_MEDIUM: case CMD_VIEW_LARGE: case CMD_VIEW_CUSTOM:
+                    if (ex.view) ex.view->SetLayout(LOWORD(wp) - CMD_VIEW_DETAILS);
+                    syncMenuChecks();
+                    break;
+                case CMD_SORT_NAME: case CMD_SORT_DATE: case CMD_SORT_TYPE: case CMD_SORT_SIZE: case CMD_SORT_RESULT:
+                    if (ex.view) ex.view->SetSort(LOWORD(wp) - CMD_SORT_NAME, ex.view->SortDesc());
+                    syncMenuChecks();
+                    break;
+                case CMD_SORT_ASC:
+                case CMD_SORT_DESC:
+                    if (ex.view) ex.view->SetSort(ex.view->SortKey(), LOWORD(wp) == CMD_SORT_DESC);
+                    syncMenuChecks();
+                    break;
+                case CMD_COVER_1: case CMD_COVER_2: case CMD_COVER_3: case CMD_COVER_4: case CMD_COVER_5:
+                    if (ex.view) ex.view->SetFolderStyle(LOWORD(wp) - CMD_COVER_1);
+                    syncMenuChecks();
+                    break;
                 case CMD_TAG_EDIT:
                     if (ex.view) ex.view->SetTagEditing(!ex.view->TagEditing());
                     break;
@@ -8996,6 +9034,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             POINT pt{GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam)};
             if (wheelOnTabs(pt, GET_WHEEL_DELTA_WPARAM(msg.wParam))) continue;
             HWND under = WindowFromPoint(pt);
+            {  // ホームのリボンの四角いボタン（表示・並び順・表紙）は、カーソルの下のボタンで替える
+                wchar_t cls[64] = L"";
+                if (under) GetClassNameW(under, cls, 64);
+                if (lstrcmpW(cls, L"imgdupe_view_ribbon") == 0) {
+                    SendMessageW(under, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
+                    continue;
+                }
+            }
             if (under == app.s.sources && !(GET_KEYSTATE_WPARAM(msg.wParam) & (MK_CONTROL | MK_SHIFT))) {
                 // 探す所の一覧は、普段の 1/2 の速さで（行が少ないので行き過ぎないように）
                 static int acc = 0;
