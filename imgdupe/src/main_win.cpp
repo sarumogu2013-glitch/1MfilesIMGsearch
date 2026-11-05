@@ -28,6 +28,7 @@
 #include <optional>
 #include <mutex>
 #include <set>
+#include <functional>
 #include <thread>
 #include <unordered_map>
 
@@ -4288,11 +4289,21 @@ void undoTagEdit() {
 struct SettingsWindow {
     HWND wnd = nullptr, autoUpdate = nullptr, autostart = nullptr, quality = nullptr, tagger = nullptr, clip = nullptr, gpu = nullptr, aiStatus = nullptr,
          variantSim = nullptr, tagJapanese = nullptr, load = nullptr, idLookup = nullptr, linkCheck = nullptr, sauce = nullptr, sauceKey = nullptr, sauceLimit = nullptr, sauceStatus = nullptr;
+    HWND tabs = nullptr, dbSize = nullptr;
+    std::vector<HWND> pages[6];  // ページごとの部品（全般・常駐解析・AI 解析・出典の照会・データ・そのほか）
     bool done = false;
     int after = 0;  // 閉じた後に実行する機能（CMD_*。0 = なし）
 } settingsWin;
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA, IDC_ST_LOAD };
+// 設定の画面のページを出す（ほかのページの部品は隠す）
+void settingsShowPage(int page) {
+    SettingsWindow& w = settingsWin;
+    for (int k = 0; k < 6; ++k)
+        for (HWND h : w.pages[k]) ShowWindow(h, k == page ? SW_SHOW : SW_HIDE);
+    iniSet(L"settingsPage", std::to_wstring(page));
+}
+
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA, IDC_ST_LOAD, IDC_ST_TABS, IDC_ST_ARCHIVE, IDC_ST_COMPACT, IDC_ST_DATADIR };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -4365,6 +4376,9 @@ void settingsCommand(int id, int code) {
         case IDC_ST_MODELS: applySettings(); w.after = CMD_MODELS; w.done = true; break;
         case IDC_ST_LINKS: applySettings(); w.after = CMD_LINKS; w.done = true; break;
         case IDC_ST_KEYS: applySettings(); w.after = CMD_KEY_SETTINGS; w.done = true; break;
+        case IDC_ST_ARCHIVE: applySettings(); w.after = CMD_ARCHIVE; w.done = true; break;
+        case IDC_ST_COMPACT: applySettings(); w.after = CMD_COMPACT_DB; w.done = true; break;
+        case IDC_ST_DATADIR: ShellExecuteW(w.wnd, L"open", app.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
         case IDC_ST_INI:
             applySettings();
             ShellExecuteW(w.wnd, L"open", L"notepad.exe", (L"\"" + iniPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
@@ -4387,6 +4401,11 @@ void showSettingsWindow() {
                 settingsWin.done = true;
                 return 0;
             }
+            if (msg == WM_NOTIFY) {
+                auto* nm = reinterpret_cast<NMHDR*>(lp);
+                if (nm->idFrom == IDC_ST_TABS && nm->code == TCN_SELCHANGE) settingsShowPage(TabCtrl_GetCurSel(nm->hwndFrom));
+                return 0;
+            }
             return DefWindowProcW(h, msg, wp, lp);
         };
         wc.hInstance = app.inst;
@@ -4396,7 +4415,7 @@ void showSettingsWindow() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    const int cw = px(560), ch = px(744), m = px(12);
+    const int cw = px(560), ch = px(300), m = px(12);
     RECT owner;
     GetWindowRect(app.hwnd, &owner);
     RECT frame{0, 0, cw, ch};
@@ -4407,14 +4426,33 @@ void showSettingsWindow() {
                             (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
                             app.inst, nullptr);
     if (!w.wnd) return;
+    int curPage = -1;  // いま作っている部品のページ（-1 = どのページでもない）
     auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int cx, int cy) {
         HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy, w.wnd,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+        if (curPage >= 0) w.pages[curPage].push_back(c);
         return c;
     };
     const int gw = cw - 2 * m, in = m + px(12), iw = gw - px(24), rowH = px(22), bh = px(28);
-    int y = m;
+    // 上にページのタブ（大きくなって画面に入らなくなったので分けた）
+    w.tabs = child(WC_TABCONTROLW, L"", WS_TABSTOP, IDC_ST_TABS, m, m, gw, px(28));
+    {
+        const wchar_t* names[] = {L"全般", L"常駐解析", L"AI 解析", L"出典の照会", L"データ", L"そのほか"};
+        for (int k = 0; k < 6; ++k) {
+            TCITEMW ti{};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = const_cast<wchar_t*>(names[k]);
+            TabCtrl_InsertItem(w.tabs, k, &ti);
+        }
+    }
+    const int contentTop = m + px(28) + px(10);
+    int y = contentTop;
+    auto page = [&](int k) {
+        curPage = k;
+        y = contentTop;
+    };
+    page(0);
     auto group = [&](const wchar_t* title, int h) {
         child(WC_BUTTONW, title, BS_GROUPBOX, -1, m, y, gw, h);
         const int top = y + px(22);
@@ -4424,6 +4462,10 @@ void showSettingsWindow() {
     int gy = group(L"アップデート", px(52));
     w.autoUpdate = child(WC_BUTTONW, L"終了する時に新しい版を確かめる（1 日 1 回）", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOUPDATE,
                          in, gy, iw, rowH);
+    gy = group(L"表示", px(52));
+    w.tagJapanese = child(WC_BUTTONW, L"タグを日本語で表示する（タグそのものは英語のまま。日本語でも英語でも検索できます）",
+                          WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGJA, in, gy, iw, rowH);
+    page(1);
     gy = group(L"常駐解析", px(126));
     w.autostart = child(WC_BUTTONW, L"Windows と一緒に起動する", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_AUTOSTART, in, gy, iw, rowH);
     w.quality = child(WC_BUTTONW, L"画像の品質（ぼやけ・拡大された画像）を調べる（1 枚ずつ読み直すので時間がかかります）",
@@ -4437,6 +4479,7 @@ void showSettingsWindow() {
               L"上げるほど速く進みますが、そのぶんほかのアプリが重くなります。",
               SS_NOPREFIX, -1, in, ly + rowH + px(6), iw, rowH);
     }
+    page(2);
     gy = group(L"AI 解析", px(174));
     w.tagger = child(WC_BUTTONW, L"WD14 タガーで画像にタグを付ける（検索用のタグ。ファイルには書き込みません）",
                      WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGGER, in, gy, iw, rowH);
@@ -4450,6 +4493,7 @@ void showSettingsWindow() {
                   IDC_ST_GPU, in, gy + 3 * (rowH + px(2)), iw, rowH);
     w.aiStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy + 4 * (rowH + px(2)) + px(6), iw - px(150), px(36));
     child(WC_BUTTONW, L"AI の部品…", WS_TABSTOP, IDC_ST_MODELS, in + iw - px(140), gy + 4 * (rowH + px(2)) + px(4), px(140), bh);
+    page(3);
     gy = group(L"出典の照会（インターネットで出典を調べる）", px(160));
     w.idLookup = child(WC_BUTTONW, L"ファイル名の pixiv・Danbooru（MD5）の ID で、投稿のタグと作者を調べる",
                        WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_LOOKUP, in, gy, iw, rowH);
@@ -4467,14 +4511,22 @@ void showSettingsWindow() {
         child(WC_STATICW, L"回", SS_NOPREFIX, -1, in + iw - px(24), ry + px(3), px(24), rowH);
         w.sauceStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in + px(18), ry + rowH + px(6), iw - px(18), px(34));
     }
-    gy = group(L"表示", px(52));
-    w.tagJapanese = child(WC_BUTTONW, L"タグを日本語で表示する（タグそのものは英語のまま。日本語でも英語でも検索できます）",
-                          WS_TABSTOP | BS_AUTOCHECKBOX, IDC_ST_TAGJA, in, gy, iw, rowH);
+    page(4);
+    gy = group(L"データ", px(150));
+    w.dbSize = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy, iw, rowH);
+    child(WC_BUTTONW, L"退避した解析結果…", WS_TABSTOP, IDC_ST_ARCHIVE, in, gy + rowH + px(8), px(180), bh);
+    child(WC_STATICW, L"見つからなくなった画像の、退避したタグ・CLIP などを見る・消す", SS_NOPREFIX, -1, in + px(190),
+          gy + rowH + px(14), iw - px(190), rowH);
+    child(WC_BUTTONW, L"DB を詰めて小さくする…", WS_TABSTOP, IDC_ST_COMPACT, in, gy + rowH + bh + px(16), px(180), bh);
+    child(WC_STATICW, L"DB の使っていない所を詰めて、ファイルを小さくする", SS_NOPREFIX, -1, in + px(190),
+          gy + rowH + bh + px(22), iw - px(190), rowH);
+    page(5);
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
     child(WC_BUTTONW, L"ショートカットキー…", WS_TABSTOP, IDC_ST_KEYS, in, gy, b3, bh);
-    child(WC_BUTTONW, L"リンクフォルダ…", WS_TABSTOP, IDC_ST_LINKS, in + b3 + px(8), gy, b3, bh);
-    child(WC_BUTTONW, L"設定ファイルを開く", WS_TABSTOP, IDC_ST_INI, in + 2 * (b3 + px(8)), gy, b3, bh);
+    child(WC_BUTTONW, L"設定ファイルを開く", WS_TABSTOP, IDC_ST_INI, in + b3 + px(8), gy, b3, bh);
+    child(WC_BUTTONW, L"設定のフォルダを開く", WS_TABSTOP, IDC_ST_DATADIR, in + 2 * (b3 + px(8)), gy, b3, bh);
+    curPage = -1;
     child(WC_BUTTONW, L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, cw - m - px(208), ch - m - bh, px(100), bh);
     child(WC_BUTTONW, L"キャンセル", WS_TABSTOP, IDCANCEL, cw - m - px(100), ch - m - bh, px(100), bh);
 
@@ -4519,9 +4571,19 @@ void showSettingsWindow() {
         setText(w.aiStatus, status.empty() ? L"AI の部品はまだ入っていません" : status + L" が入っています");
     }
 
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        const std::wstring db = dbPath();
+        if (GetFileAttributesExW(db.c_str(), GetFileExInfoStandard, &fa))
+            setText(w.dbSize, L"DB（imgdupe.db）: " + sizeText((static_cast<uint64_t>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow));
+    }
+    const int startPage = std::clamp(iniInt(L"settingsPage", 0), 0, 5);
+    TabCtrl_SetCurSel(w.tabs, startPage);
+    settingsShowPage(startPage);
+
     EnableWindow(app.hwnd, FALSE);
     ShowWindow(w.wnd, SW_SHOW);
-    SetFocus(w.autoUpdate);
+    SetFocus(w.tabs);
     MSG msg;
     while (!w.done && GetMessageW(&msg, nullptr, 0, 0)) {
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
@@ -6231,6 +6293,7 @@ void toggleAdvanced() {
     SetWindowTextW(app.s.advanced, app.advancedShown ? L"詳細検索 ▲" : L"詳細検索 ▼");
     iniSet(L"advancedSearch", app.advancedShown ? L"1" : L"0");
     switchTab(app.tab);
+    syncMenuChecks();
 }
 
 // 検索のリボン（3 段）
@@ -7663,29 +7726,41 @@ LRESULT onNotify(NMHDR* nm) {
 std::wstring menuText(int cmd) {
     const CmdInfo* ci = findCommand(cmd);
     std::wstring text = ci ? ci->label : L"";
-    const std::string key = keyLabel(app.keys, cmd);
+    std::string key = keyLabel(app.keys, cmd);
+    if (const size_t at = key.find("Comma"); at != std::string::npos) key.replace(at, 5, ",");
     if (!key.empty()) text += L"\t" + widen(key);
     return text;
 }
 
 // 本体のメニュー（ショートカットキーの設定画面で機能を選ぶメニューにも使う）
 void appendMainMenus(HMENU root) {
-    auto popup = [&](const wchar_t* title, std::initializer_list<int> cmds) {
-        HMENU m = CreatePopupMenu();
+    auto fill = [](HMENU m, std::initializer_list<int> cmds) {
         for (int c : cmds) {  // 0 は区切り線
             if (c) AppendMenuW(m, MF_STRING, static_cast<UINT_PTR>(c), menuText(c).c_str());
             else AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         }
-        AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
-    popup(L"ファイル(&F)", {CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_MANAGE_ROOTS, 0, CMD_EXPORT, 0, CMD_EXIT});
-    popup(L"表示(&V)", {CMD_REFRESH, 0, CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES, CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
-    popup(L"検索(&S)", {CMD_SEARCH, CMD_QUERY, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, 0, CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP});
-    popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, 0, CMD_SAVE_SELECTION, 0, CMD_QUERY_PASTE, CMD_QUERY_OPEN,
-                        CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
-    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
-    popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, CMD_COMPACT_DB, CMD_ARCHIVE, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
-    popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, CMD_OPEN_DATA, 0, CMD_ABOUT});
+    auto sub = [&](HMENU parent, const wchar_t* title, std::initializer_list<int> cmds) {
+        HMENU m = CreatePopupMenu();
+        fill(m, cmds);
+        AppendMenuW(parent, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
+    };
+    auto popup = [&](const wchar_t* title, std::initializer_list<int> cmds) { sub(root, title, cmds); };
+    popup(L"ファイル(&F)", {CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE, 0, CMD_EXIT});
+    popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_REFRESH, 0, CMD_STATS});
+    popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, CMD_SAVE_SELECTION});
+    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG});
+    // ツール: タグと DB を補強するもの、リボン（重複チェック・検索・画像から検索）の動作、設定
+    HMENU tools = CreatePopupMenu();
+    fill(tools, {CMD_UNDO, 0, CMD_TAGDICT, CMD_DICTIONARY, CMD_INFER_RULES, CMD_REFS, 0});
+    sub(tools, L"重複チェック(&C)", {CMD_SEARCH, CMD_QUERY, CMD_EXPORT, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, CMD_TOGGLE_VARIANTS, 0,
+                                     CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP, 0, CMD_PREV_GROUP, CMD_NEXT_GROUP});
+    sub(tools, L"検索(&F)", {CMD_SEARCH_GO, CMD_SEARCH_END, CMD_SEARCH_CLEAR, CMD_SEARCH_ADVANCED, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES,
+                             CMD_DELETE_SMART, 0, CMD_EXPAND_LINKS, CMD_LINKS});
+    sub(tools, L"画像から検索(&Q)", {CMD_QUERY_PASTE, CMD_QUERY_OPEN, CMD_QUERY_URL, 0, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
+    fill(tools, {0, CMD_SETTINGS});
+    AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), L"ツール(&O)");
+    popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_CHECK_UPDATE, CMD_RELEASES, 0, CMD_OPEN_LOGS, CMD_OPEN_DATA, 0, CMD_ABOUT});
 }
 
 void syncMenuChecks() {
@@ -7694,6 +7769,9 @@ void syncMenuChecks() {
                   MF_BYCOMMAND | (Button_GetCheck(app.exact) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TOGGLE_FLAT,
                   MF_BYCOMMAND | (Button_GetCheck(app.flat) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(app.menuBar, CMD_TOGGLE_VARIANTS,
+                  MF_BYCOMMAND | (Button_GetCheck(app.variants) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(app.menuBar, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
 }
 
@@ -7747,7 +7825,27 @@ void saveKeys() {
 class KeyHost : public KeyMapHost {
 public:
     KeyMap& keys() override { return app.keys; }
-    void buildCommandMenu(HMENU root) override { appendMainMenus(root); }
+    void buildCommandMenu(HMENU root) override {
+        appendMainMenus(root);
+        // メニューバーに無い機能（監視フォルダの管理の画面のボタン・設定の画面のボタンなど）にも割り当てられるように
+        std::set<int> shown;
+        std::function<void(HMENU)> walk = [&](HMENU m) {
+            for (int i = 0, n = GetMenuItemCount(m); i < n; ++i) {
+                if (HMENU s = GetSubMenu(m, i)) walk(s);
+                else shown.insert(static_cast<int>(GetMenuItemID(m, i)));
+            }
+        };
+        walk(root);
+        HMENU rest = CreatePopupMenu();
+        for (const auto& c : allCommands())
+            if (!shown.count(c.id)) AppendMenuW(rest, MF_STRING, static_cast<UINT_PTR>(c.id), menuText(c.id).c_str());
+        if (GetMenuItemCount(rest) > 0) {
+            AppendMenuW(root, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(rest), L"メニューに無い機能");
+        } else {
+            DestroyMenu(rest);
+        }
+    }
     void onKeysChanged() override {
         saveKeys();
         rebuildMenu();  // メニューのキーの表示を更新
@@ -7965,7 +8063,23 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_FLAT:
                     syncMenuChecks();
                     break;
+                case CMD_TOGGLE_VARIANTS:
+                    if (app.running) break;
+                    Button_SetCheck(app.variants, Button_GetCheck(app.variants) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
+                    SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_VARIANTS, BN_CLICKED), reinterpret_cast<LPARAM>(app.variants));
+                    break;
+                case CMD_SEARCH_GO:
+                case CMD_SEARCH_END:
+                case CMD_SEARCH_CLEAR:
+                case CMD_SEARCH_ADVANCED: {
+                    if (app.tab != 1) switchTab(1);
+                    const int id = LOWORD(wp) == CMD_SEARCH_GO ? IDC_S_GO : LOWORD(wp) == CMD_SEARCH_END ? IDC_S_END
+                                   : LOWORD(wp) == CMD_SEARCH_CLEAR ? IDC_S_CLEAR : IDC_S_ADVANCED;
+                    SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), 0);
+                    break;
+                }
                 case IDC_VARIANTS:
+                    syncMenuChecks();
                     // 出している結果に、差分のグループを足す・外す
                     if (!app.running && app.haveFiles && !app.resultIsQuery) {
                         Result r = std::move(app.result);

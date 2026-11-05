@@ -14,7 +14,7 @@ enum : unsigned {
     K_PRIOR = 0x21, K_NEXT = 0x22, K_END = 0x23, K_HOME = 0x24, K_LEFT = 0x25, K_UP = 0x26, K_RIGHT = 0x27,
     K_DOWN = 0x28, K_INSERT = 0x2D, K_DELETE = 0x2E, K_APPS = 0x5D, K_NUMPAD0 = 0x60, K_MULTIPLY = 0x6A,
     K_ADD = 0x6B, K_SUBTRACT = 0x6D, K_DECIMAL = 0x6E, K_DIVIDE = 0x6F, K_F1 = 0x70, K_F24 = 0x87,
-    K_BROWSER_BACK = 0xA6, K_BROWSER_FORWARD = 0xA7,
+    K_BROWSER_BACK = 0xA6, K_BROWSER_FORWARD = 0xA7, K_OEM_COMMA = 0xBC,
 };
 
 struct KeyNameDef {
@@ -28,18 +28,18 @@ const KeyNameDef kKeyNames[] = {
     {K_RIGHT, "Right"},    {K_DOWN, "Down"},     {K_INSERT, "Insert"},  {K_DELETE, "Delete"},
     {K_APPS, "Apps"},      {K_MULTIPLY, "Num*"}, {K_ADD, "Num+"},       {K_SUBTRACT, "Num-"},
     {K_DECIMAL, "Num."},   {K_DIVIDE, "Num/"},   {K_BROWSER_BACK, "BrowserBack"},
-    {K_BROWSER_FORWARD, "BrowserForward"},
+    {K_BROWSER_FORWARD, "BrowserForward"}, {K_OEM_COMMA, "Comma"},
 };
 
 const std::vector<CmdInfo> kCommands = {
     {CMD_SCAN_FOLDER, "ScanFolder", L"フォルダを解析の予約に追加(&S)...", "Ctrl+O"},
-    {CMD_SCAN_FOLDER_TOP, "ScanFolderTop", L"フォルダを最優先でスキャン(&T)...", "Ctrl+Shift+O"},
+    {CMD_SCAN_FOLDER_TOP, "ScanFolderTop", L"フォルダを最優先で解析(&T)...", "Ctrl+Shift+O"},
     {CMD_SCAN_TASKS, "ScanTasks", L"解析の予約の一覧(&K)", ""},
     {CMD_ADD_FOLDER, "AddFolder", L"監視フォルダを追加(&A)...", ""},
     {CMD_REMOVE_FOLDER, "RemoveFolder", L"監視をやめる(&R)", ""},
     {CMD_MANAGE_ROOTS, "ManageFolders", L"監視フォルダの管理(&W)...", ""},
     {CMD_REMAP_ROOT, "RemapFolder", L"監視フォルダの移動先を指定(&M)...", ""},
-    {CMD_EXPORT, "Export", L"結果を書き出す(&S)...", "Ctrl+S"},
+    {CMD_EXPORT, "Export", L"結果を書き出す(&W)...", "Ctrl+S"},
     {CMD_EXIT, "Exit", L"終了(&X)", ""},
     {CMD_SEARCH, "Search", L"チェック開始 / 中止(&S)", "F5"},
     {CMD_QUERY, "Query", L"1 枚の重複チェック(&Q)...", "Ctrl+F"},
@@ -75,7 +75,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_REVIEW, "ReviewQueue", L"確認キュー（迷っている順に並べる）(&R)", "Ctrl+R"},
     {CMD_UNDO, "Undo", L"タグの操作を元に戻す(&U)", "Ctrl+Z"},
     {CMD_TAG_JAPANESE, "TagJapanese", L"タグを日本語で表示(&J)", "Ctrl+J"},
-    {CMD_SETTINGS, "Settings", L"設定(&S)...", ""},
+    {CMD_SETTINGS, "Settings", L"設定(&S)...", "Ctrl+Comma"},
     {CMD_DICTIONARY, "Dictionary", L"AI タグ辞書（行動・アイテム）(&D)...", ""},
     {CMD_TAGDICT, "TagDictionary", L"タグの別名・親子(&T)...", ""},
     {CMD_REFS, "References", L"見本画像のフォルダを開く(&R)", ""},
@@ -94,6 +94,11 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_OPEN_DATA, "OpenDataFolder", L"設定のフォルダを開く(&D)", ""},
     {CMD_OPEN_LOGS, "OpenLogs", L"動作履歴（ログ）のフォルダを開く(&L)", ""},
     {CMD_ABOUT, "About", L"バージョン情報(&A)", ""},
+    {CMD_TOGGLE_VARIANTS, "IncludeVariants", L"差分（AI）も出す(&V)", ""},
+    {CMD_SEARCH_GO, "SearchRun", L"検索する(&S)", ""},
+    {CMD_SEARCH_END, "SearchEnd", L"検索を終了(&E)", ""},
+    {CMD_SEARCH_CLEAR, "SearchClear", L"条件をクリア(&C)", ""},
+    {CMD_SEARCH_ADVANCED, "SearchAdvanced", L"詳細検索を開く / 閉じる(&A)", ""},
 };
 
 std::string trim(const std::string& s) {

@@ -71,6 +71,11 @@ enum Cmd : int {
     CMD_REMAP_ROOT,       // 監視フォルダの移動先を指定（ドライブレター・フォルダ名が変わった）
     CMD_MANAGE_ROOTS,     // 監視フォルダの管理（一覧・追加・監視をやめる・移動先を指定）
     CMD_OPEN_DATA,        // 設定のフォルダを開く
+    CMD_TOGGLE_VARIANTS,  // 差分（AI）も出す
+    CMD_SEARCH_GO,        // 検索する
+    CMD_SEARCH_END,       // 検索を終了
+    CMD_SEARCH_CLEAR,     // 検索の条件をクリア
+    CMD_SEARCH_ADVANCED,  // 詳細検索を開く / 閉じる
 };
 
 struct CmdInfo {
