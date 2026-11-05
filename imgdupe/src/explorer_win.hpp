@@ -45,11 +45,17 @@ struct ExplorerProgress {
 };
 
 // 画像のタグ（プレビューに出す）
+// いくつも選んでいる時は、選んだ画像のタグをまとめたもの
 struct ExplorerTag {
   std::wstring tag, kind;
   std::wstring label;  // 画面に出す名前（日本語の表示名など。空ならタグそのもの）
-  double confidence = 0;
+  double confidence = 0;  // 並べる確度（普段は付いている画像の中で一番高いもの、手動編集では一番低いもの）
   bool file = false;  // ファイルに書き込まれているタグ（実体のタグ）
+  int count = 1, total = 1;  // 付いている画像の数・まとめた画像の数（count < total なら「3/5」と出す）
+  int state = 1;             // 手動編集の状態: 0 否定・1 そのまま・2 確定（いくつもなら低いほう）
+  bool mixed = false;        // 画像ごとに状態が違う
+  bool editable = false;     // 手動編集でさわれる（AI か手で付いた画像がある）
+  bool added = false;        // 手動編集で足した（まだ保存していない。エクスプローラーの中で使う）
 };
 
 // 重複のまとまり（下の一覧に出す）
@@ -86,18 +92,21 @@ class ExplorerHost {
   virtual std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) = 0;
   // 詳細表示で、フォルダ dir の直下の進み具合を求める（裏で数えて Explorer::SetProgress で返す）
   virtual void ExplorerRequestProgress(const std::wstring& dir) { (void)dir; }
-  virtual std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) = 0;      // 画像のタグ（確度の高い順）
+  // 画像のタグ（確度の高い順）。いくつもならまとめる。edit なら手動編集の形（否定したタグも出し、確度は低いほう）
+  virtual std::vector<ExplorerTag> ExplorerTagSet(const std::vector<std::wstring>& paths, bool edit) = 0;
+  // 手動編集を保存する（edits: タグと状態 0 否定・1 そのまま・2 確定）。保存できたら true
+  virtual bool ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, const std::vector<std::pair<std::wstring, int>>& edits) = 0;
+  virtual std::wstring ExplorerResolveTag(const std::wstring& text) = 0;  // 手で打ったタグ（表示名でも）を、タグの名前に
+  virtual void ExplorerTagEditChanged(bool on) { (void)on; }              // 手動編集を入れた・切った
   virtual void ExplorerSearchTags(const std::vector<std::wstring>& tags) = 0;       // タグ（すべてを持つ画像）で検索する
   virtual void ExplorerFindSimilarAi(const std::wstring& path) = 0;                 // 似た画像（CLIP）を探す
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
   virtual std::wstring ExplorerTagLabel(const std::wstring& tag) = 0;               // タグの表示名（取り置きに出す）
   virtual void ExplorerRenameTag(const std::wstring& tag) = 0;                      // タグの表示名を変える
-  virtual void ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) = 0;  // この画像からタグを外す（手動で「違う」）
   virtual void ExplorerAddTag(const std::vector<std::wstring>& paths, const std::wstring& tag) = 0;  // 画像にタグを付ける（手動で「正しい」）
   virtual void ExplorerDropTag(const std::wstring& tag, POINT screen) = 0;  // 取り置いたタグをエクスプローラーの外に落とした
   virtual std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) = 0;  // 画像のプロパティ（名前と値）
   virtual void ExplorerSaveSelection() = 0;                                         // 選んだ画像をスマートフォルダに保存する
-  virtual void ExplorerTagSelection() = 0;                                          // 選んだ画像にタグを付ける・外す
   virtual void ExplorerTeachFolder(const std::wstring& dir) = 0;                   // フォルダ名から作者などを読み取る形を教える
 };
 
@@ -139,6 +148,10 @@ class Explorer {
   // 重複のまとまりを真ん中の一覧に出す（まとまりは重なった絵）
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups);
   void AddTrayTag(const std::wstring& tag);
+  // タグの手動編集
+  bool TagEditing() const;
+  bool SetTagEditing(bool on);  // 切る時に保存していない変更があれば確かめる。キャンセルなら false
+  bool ConfirmTagEdit();        // 保存していない変更があれば「保存しますか？」。キャンセルなら false（しようとしたことをやめる）
 
  private:
   std::unique_ptr<ExplorerImpl> impl_;

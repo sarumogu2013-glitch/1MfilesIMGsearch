@@ -69,10 +69,6 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_DELETE_SMART, "DeleteSmartFolder", L"スマートフォルダを削除(&L)", ""},
     {CMD_EXPAND_LINKS, "ExpandLinks", L"検索結果からリンクフォルダを作成(&X)...", "Ctrl+Shift+E"},
     {CMD_LINKS, "Links", L"リンクフォルダ(&F)...", ""},
-    {CMD_TAG_YES, "TagCorrect", L"確定（1 つ目のタグ）(&Y)", "Ctrl+Y"},
-    {CMD_TAG_NO, "TagWrong", L"否定（1 つ目のタグ）(&N)", "Ctrl+N"},
-    {CMD_BULK_TAG, "BulkTag", L"選んだ画像にタグを付ける・否定する(&T)...", "Ctrl+T"},
-    {CMD_REVIEW, "ReviewQueue", L"確認キュー（迷っている順に並べる）(&R)", "Ctrl+R"},
     {CMD_UNDO, "Undo", L"タグの操作を元に戻す(&U)", "Ctrl+Z"},
     {CMD_TAG_JAPANESE, "TagJapanese", L"タグを日本語で表示(&J)", "Ctrl+J"},
     {CMD_SETTINGS, "Settings", L"設定(&S)...", "Ctrl+Comma"},
@@ -99,6 +95,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_SEARCH_END, "SearchEnd", L"検索を終了(&E)", ""},
     {CMD_SEARCH_CLEAR, "SearchClear", L"条件をクリア(&C)", ""},
     {CMD_SEARCH_ADVANCED, "SearchAdvanced", L"詳細検索を開く / 閉じる(&A)", ""},
+    {CMD_TAG_EDIT, "TagEdit", L"タグの手動編集(&E)", ""},
 };
 
 std::string trim(const std::string& s) {

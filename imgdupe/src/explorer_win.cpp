@@ -57,7 +57,7 @@ enum {
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
-       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_REMOVE, MENU_TEACH, MENU_TAG_PAGE };
+       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_EDIT, MENU_TEACH, MENU_TAG_PAGE };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 constexpr int kFolderSort = 5;  // 詳細表示の「フォルダ」の列（検索の結果）
 constexpr int kIndexSort = 6;   // 詳細表示の「インデックス」の列（進み具合）
@@ -534,6 +534,7 @@ class ExplorerImpl {
     }
     if (font) DeleteObject(font);
     if (nameFont) DeleteObject(nameFont);
+    if (strikeFont) DeleteObject(strikeFont);
     for (HBITMAP b : dots) {
       if (b) DeleteObject(b);
     }
@@ -744,6 +745,7 @@ class ExplorerImpl {
   }
 
   void ShowList(const std::wstring& title, std::vector<std::vector<std::wstring>> entries, int select = -1) {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     if (!listMode && !dir.empty()) {
       backStack.push_back({dir, SelectedPath()});
       forwardStack.clear();
@@ -759,6 +761,7 @@ class ExplorerImpl {
 
   // まとまりを開く (中の画像を一覧に出す。「戻る」で結果の一覧へ)
   void OpenStack(int i) {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     const Item& it = items[size_t(i)];
     backStack.push_back({Here(), SelectedPath()});
     forwardStack.clear();
@@ -1131,7 +1134,48 @@ class ExplorerImpl {
   bool showingExternal = false;
   const Item* PreviewItem() const {
     if (showingExternal) return &external;
+    if (multi) {  // いくつも選んでいる: 一覧で一番前の選んだ画像（無ければ選んだものの先頭）
+      int first = -1;
+      for (int i = 0; i < int(items.size()); i++)
+        if (items[size_t(i)].picked) {
+          if (first < 0) first = i;
+          if (items[size_t(i)].image) return &items[size_t(i)];
+        }
+      if (first >= 0) return &items[size_t(first)];
+    }
     return sel >= 0 && sel < int(items.size()) ? &items[size_t(sel)] : nullptr;
+  }
+  // いくつも選んでいる（プレビューは重ねた絵と「N 枚」）
+  bool ManyPicked() const {
+    if (!multi || showingExternal) return false;
+    int n = 0;
+    for (const auto& it : items)
+      if (it.picked && ++n > 1) return true;
+    return false;
+  }
+  // タグを出す・手で直す画像（いくつも選んでいれば全部。まとまりは中の画像）
+  std::vector<std::wstring> TargetPaths() const {
+    std::vector<std::wstring> out;
+    if (showingExternal) return out;
+    auto add = [&](const Item& it) {
+      if (it.Stack()) out.insert(out.end(), it.members.begin(), it.members.end());
+      else if (it.image) out.push_back(it.path);
+    };
+    if (ManyPicked()) {
+      for (const auto& it : items)
+        if (it.picked) add(it);
+    } else if (sel >= 0 && sel < int(items.size())) {
+      add(items[size_t(sel)]);
+    }
+    return out;
+  }
+  static std::wstring PathsKey(const std::vector<std::wstring>& paths) {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& p : paths) {
+      for (wchar_t c : p) h = (h ^ uint64_t(c)) * 1099511628211ull;
+      h = (h ^ 0xFFFF) * 1099511628211ull;
+    }
+    return std::to_wstring(paths.size()) + L":" + std::to_wstring(h);
   }
   void PreviewFile(const std::wstring& path) {
     external = Item{};
@@ -1164,6 +1208,7 @@ class ExplorerImpl {
   }
 
   void Navigate(const std::wstring& d, const std::wstring& select) {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     if (listMode) {
       backStack.push_back({Here(), SelectedPath()});
       if (backStack.size() > 100) backStack.erase(backStack.begin());
@@ -1186,6 +1231,7 @@ class ExplorerImpl {
   }
 
   void Back() {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     if (backStack.empty()) {
       MessageBeep(MB_OK);
       return;
@@ -1197,6 +1243,7 @@ class ExplorerImpl {
   }
 
   void Forward() {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     if (forwardStack.empty()) {
       MessageBeep(MB_OK);
       return;
@@ -1427,6 +1474,9 @@ class ExplorerImpl {
     if (nm->code == TVN_ITEMEXPANDINGW) {
       auto* tv = reinterpret_cast<NMTREEVIEWW*>(nm);
       if (tv->action == TVE_EXPAND) TreeFill(tv->itemNew.hItem);
+    } else if (nm->code == TVN_SELCHANGINGW) {
+      auto* tv = reinterpret_cast<NMTREEVIEWW*>(nm);
+      if (!treeSyncing && (tv->action == TVC_BYMOUSE || tv->action == TVC_BYKEYBOARD) && !ConfirmTagEdit()) return TRUE;  // 移らない
     } else if (nm->code == TVN_SELCHANGEDW) {
       auto* tv = reinterpret_cast<NMTREEVIEWW*>(nm);
       if (!treeSyncing && (tv->action == TVC_BYMOUSE || tv->action == TVC_BYKEYBOARD)) {
@@ -1446,6 +1496,7 @@ class ExplorerImpl {
   }
 
   void Up() {
+    if (!ConfirmTagEdit()) return;  // 手動編集で保存していない変更
     if (listMode) {  // 検索の結果からは、前のフォルダへ
       Back();
       return;
@@ -1483,7 +1534,7 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     UINT on = images ? MF_STRING : MF_STRING | MF_GRAYED;
     AppendMenuW(menu, on, MENU_SAVE_SMART, (L"選んだ画像（" + ni + L" 枚）をスマートフォルダに保存(&M)...").c_str());
-    AppendMenuW(menu, on, MENU_BULK_TAG, (L"選んだ画像（" + ni + L" 枚）にタグを付ける・外す(&T)...").c_str());
+    AppendMenuW(menu, on | (tagEdit ? MF_CHECKED : 0), MENU_TAG_EDIT, L"タグの手動編集(&T)");
     if (!scan.empty()) {
       std::wstring what = dirCount ? L"フォルダ " + std::to_wstring(dirCount) + L" 個" : L"";
       if (images) what += (what.empty() ? L"" : L"・") + std::wstring(L"画像 ") + ni + L" 枚";
@@ -1502,7 +1553,7 @@ class ExplorerImpl {
       }
       case MENU_SHOW: ShowInShell(SelectedPath()); break;
       case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
-      case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
+      case MENU_TAG_EDIT: SetTagEditing(!tagEdit); break;
       case MENU_ADD_ROOT:
       case MENU_SCAN_TOP:
         host->ExplorerAddScanTask(scan, cmd == MENU_SCAN_TOP);
@@ -1533,7 +1584,7 @@ class ExplorerImpl {
       AppendMenuW(menu, MF_STRING, MENU_RELOOKUP, L"出典を調べ直す(&L)");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SAVE_SMART, L"スマートフォルダに保存(&M)...");
-      AppendMenuW(menu, MF_STRING, MENU_BULK_TAG, L"タグを付ける・外す(&T)...");
+      AppendMenuW(menu, MF_STRING | (tagEdit ? MF_CHECKED : 0), MENU_TAG_EDIT, L"タグの手動編集(&T)");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SCAN_TOP, L"この画像を解析する（最優先）(&I)");
       AppendMenuW(menu, MF_STRING, MENU_TEACH, L"この画像のフォルダ名から作者などを読み取る形を教える(&N)...");
@@ -1560,7 +1611,7 @@ class ExplorerImpl {
       case MENU_SIMILAR_AI: host->ExplorerFindSimilarAi(path); break;
       case MENU_RELOOKUP: host->ExplorerRelookup(path); break;
       case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
-      case MENU_BULK_TAG: host->ExplorerTagSelection(); break;
+      case MENU_TAG_EDIT: SetTagEditing(!tagEdit); break;
       case MENU_ADD_ROOT:
       case MENU_SCAN_TOP:
         host->ExplorerAddScanTask(it.Stack() ? it.members : std::vector<std::wstring>{path}, cmd == MENU_SCAN_TOP);
@@ -2129,12 +2180,13 @@ class ExplorerImpl {
 
   // 1 つ分のサムネイルを box に描く (一覧とプレビューで同じ見た目)。t は無ければ読み込み中
   // まとまりの枚数 (左上の丸)
-  void StackBadge(HDC dc, RECT r, int n) {
-    std::wstring text = std::to_wstring(n);
+  void StackBadge(HDC dc, RECT r, int n, const std::wstring& suffix = L"", bool right = false) {
+    std::wstring text = std::to_wstring(n) + suffix;
     SIZE sz = {};
     GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &sz);
     int h = Px(18), w = std::max(h, int(sz.cx) + Px(10));
-    RECT b = {r.left + Px(4), r.top + Px(4), r.left + Px(4) + w, r.top + Px(4) + h};
+    RECT b = right ? RECT{r.right - Px(4) - w, r.top + Px(4), r.right - Px(4), r.top + Px(4) + h}
+                   : RECT{r.left + Px(4), r.top + Px(4), r.left + Px(4) + w, r.top + Px(4) + h};
     HBRUSH br = CreateSolidBrush(RGB(0, 120, 215));
     HGDIOBJ oldBr = SelectObject(dc, br), oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
     RoundRect(dc, b.left, b.top, b.right, b.bottom, h, h);
@@ -2151,7 +2203,8 @@ class ExplorerImpl {
     return it.Stack() ? it.name + L" ほか " + std::to_wstring(it.members.size() - 1) + L" 枚" : it.name;
   }
 
-  void DrawThumb(HDC dc, HDC mem, const Item& it, const Thumb* t, RECT box) {
+  // stackCount: 2 以上なら、いくつも選んでいる時のプレビュー（重ねた絵と「N 枚」）。badge: 解析の状態の印を出す
+  void DrawThumb(HDC dc, HDC mem, const Item& it, const Thumb* t, RECT box, int stackCount = 0, bool badge = true) {
     int ts = std::min(box.right - box.left, box.bottom - box.top);
     if (it.dir) {
       // フォルダは本として描き、隅にフォルダの札を添える
@@ -2165,9 +2218,10 @@ class ExplorerImpl {
         // 一枚の紙のように: 白地と影、細い縁
         const ThumbPic& p = t->pics[0];
         // まとまりは、後ろに紙を 2 枚重ねて見せる
-        int lift = it.Stack() ? Px(8) : 0;
+        const bool stack = it.Stack() || stackCount > 1;
+        int lift = stack ? Px(8) : 0;
         RECT r = FitRect(p.w, p.h, {box.left, box.top + lift, box.right - Px(4) - lift, box.bottom - Px(4)}, true);
-        for (int k = 2; k >= 1 && it.Stack(); k--) {
+        for (int k = 2; k >= 1 && stack; k--) {
           RECT back = {r.left + k * Px(4), r.top - k * Px(4), r.right + k * Px(4), r.bottom - k * Px(4)};
           Fill(dc, back, RGB(250, 250, 250));
           Frame(dc, back, RGB(180, 180, 180));
@@ -2176,7 +2230,8 @@ class ExplorerImpl {
         Fill(dc, r, RGB(255, 255, 255));
         Blit(dc, mem, p, r);
         Frame(dc, r, RGB(200, 200, 200));
-        if (it.Stack()) StackBadge(dc, r, int(it.members.size()));
+        if (stackCount > 1) StackBadge(dc, r, stackCount, L" 枚", true);
+        else if (it.Stack()) StackBadge(dc, r, int(it.members.size()));
       } else if (t && t->none) {
         DrawIconIn(dc, it, box);  // 読めなかった
       } else {
@@ -2187,7 +2242,7 @@ class ExplorerImpl {
     } else {
       DrawIconIn(dc, it, box);
     }
-    StateBadge(dc, box, it.state);
+    if (badge) StateBadge(dc, box, it.state);
   }
 
   // 詳細表示の列: 名前・更新日時・種類 (検索の結果ではフォルダ)・サイズ・インデックス。右端の x を返す
@@ -2349,7 +2404,7 @@ class ExplorerImpl {
     GetClientRect(preview, &rc);
     int w = rc.right - Px(24);
     int h = int(rc.bottom) - PreviewTabsH();
-    if (settings.previewMode == 0) return std::max(Px(48), std::min({w, h - Px(64), 1024}));  // 画像だけ: 名前の分を残して全部
+    if (settings.previewMode == 0) return std::max(Px(48), std::min({w, h - Px(16), 1024}));  // 画像だけ: 全部（名前は出さない）
     if (settings.previewMode == 2) return std::max(Px(48), std::min({w, h / 3, 1024}));       // プロパティ: 下に表を出すので 3 分の 1
     return std::max(Px(48), std::min({w, h * 2 / 5, 1024}));  // タグ: 下にタグと情報を出すので 4 割まで
   }
@@ -2384,8 +2439,9 @@ class ExplorerImpl {
     int bucket = std::min(1024, (box + 63) / 64 * 64);
     bool same = path == previewPath && previewReady && previewThumb.bucket >= bucket &&
                 (!it || !it->dir || previewThumb.style == settings.folderStyle);
+    LoadPreviewTags();  // いくつも選んでいる時は、プレビューの画像が同じでもタグは変わる
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
     if (same && !force) return;
-    LoadPreviewTags(it);
     if (path != previewPath) {
       ClearPreviewThumb();
       previewPath = path;
@@ -2445,6 +2501,8 @@ class ExplorerImpl {
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = SelectObject(dc, nameFont);
     const Item* it = PreviewItem();
+    tagHits.clear();
+    editSaveR = editCancelR = plusR = RECT{};
     if (!it) {
       RECT tr = rc;
       SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
@@ -2464,6 +2522,8 @@ class ExplorerImpl {
         x = r.right + Px(4);
       }
     }
+    const std::vector<int> picked = multi ? PickedIndices() : std::vector<int>();
+    const bool many = ManyPicked();
     HDC mem = CreateCompatibleDC(dc);
     int boxSize = PreviewBox();
     int m = Px(12);
@@ -2474,7 +2534,9 @@ class ExplorerImpl {
       // 大きいのを読むまでは一覧の縮小版で
       t = CachedThumb(*it);
     }
-    DrawThumb(dc, mem, *it, t, box);
+    // 画像だけ・いくつも選んでいる時は、名前・情報・解析の印を出さない（いくつもなら重ねた絵と「N 枚」）
+    const bool showName = settings.previewMode != 0 && !many;
+    DrawThumb(dc, mem, *it, t, box, many ? int(picked.size()) : 0, showName);
     DeleteDC(mem);
 
     // 名前と情報
@@ -2484,10 +2546,6 @@ class ExplorerImpl {
       if (!info.empty()) info += L"\n";
       info += s;
     };
-    if (multi) {
-      const size_t n = PickedIndices().size();
-      if (n > 1) line(std::to_wstring(n) + L" 個を選んでいます");
-    }
     if (it->dir) {
       line(L"フォルダ");
     } else {
@@ -2503,46 +2561,66 @@ class ExplorerImpl {
     }
     line(StateText(it->state));
     RECT nr = {rc.left + m, box.bottom + Px(10), rc.right - m, rc.bottom - m};
-    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-    RECT measure = nr;
-    DrawTextW(dc, it->name.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_CALCRECT);
-    measure.right = nr.right;
-    measure.left = nr.left;
-    DrawTextW(dc, it->name.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-    // タグ (クリックで検索、ドラッグで取り置き)。ファイルのタグ、続いて検索用のタグ。名前のすぐ下に
-    tagHits.clear();
-    int y = measure.bottom + Px(8);
-    if (settings.previewMode == 0) {
-      // 画像だけ: いくつも選んでいる時の数だけ
-      if (multi && PickedIndices().size() > 1) {
-        RECT ir = {nr.left, y, nr.right, nr.bottom};
-        SetTextColor(dc, RGB(96, 96, 96));
-        DrawTextW(dc, (std::to_wstring(PickedIndices().size()) + L" 個を選んでいます").c_str(), -1, &ir, DT_CENTER | DT_SINGLELINE);
-      }
+    int y = nr.top;
+    if (showName) {
+      SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+      RECT measure = nr;
+      DrawTextW(dc, it->name.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_CALCRECT);
+      measure.right = nr.right;
+      measure.left = nr.left;
+      DrawTextW(dc, it->name.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+      y = measure.bottom + Px(8);
+    }
+    if (settings.previewMode == 0) {  // 画像だけ
       SelectObject(dc, oldFont);
       return;
     }
     if (settings.previewMode == 2) {
-      // プロパティ: 名前と値の表。画像は DB の情報、ほかはファイルの情報
-      if (it->image) {
-        if (previewPropsPath != it->path) {
-          previewPropsPath = it->path;
-          previewProps = host->ExplorerProperties(it->path);
+      // プロパティ: 名前と値の表。画像は DB の情報、ほかはファイルの情報。いくつもなら、全部にある項目だけ（違う値は「複数のプロパティ」）
+      std::vector<std::pair<std::wstring, std::wstring>> rows;
+      if (many) {
+        const std::vector<std::wstring> paths = TargetPaths();
+        const std::wstring key = L"many|" + PathsKey(paths);
+        if (previewPropsPath != key) {
+          previewPropsPath = key;
+          previewProps.clear();
+          const size_t n = std::min<size_t>(paths.size(), 500);  // 多すぎる時は先頭の分で比べる
+          for (size_t k = 0; k < n; k++) {
+            auto props = host->ExplorerProperties(paths[k]);
+            if (k == 0) {
+              previewProps = props;
+              continue;
+            }
+            std::vector<std::pair<std::wstring, std::wstring>> keep;
+            for (auto& [name, value] : previewProps) {
+              auto f = std::find_if(props.begin(), props.end(), [&](const auto& p) { return p.first == name; });
+              if (f == props.end()) continue;  // この画像には無い項目
+              keep.push_back({name, f->second == value ? value : std::wstring(L"複数のプロパティ")});
+            }
+            previewProps.swap(keep);
+          }
+          previewProps.insert(previewProps.begin(), {L"選択", std::to_wstring(picked.size()) + L" 個"});
         }
+        rows = previewProps;
       } else {
-        previewProps.clear();
-        previewPropsPath.clear();
-      }
-      std::vector<std::pair<std::wstring, std::wstring>> rows = previewProps;
-      if (rows.empty()) {
-        // DB に無い: 分かることだけ
-        for (size_t a = 0, b; a < info.size(); a = b + 1) {
-          b = info.find(L'\n', a);
-          if (b == std::wstring::npos) b = info.size();
-          rows.push_back({L"", info.substr(a, b - a)});
+        if (it->image) {
+          if (previewPropsPath != it->path) {
+            previewPropsPath = it->path;
+            previewProps = host->ExplorerProperties(it->path);
+          }
+        } else {
+          previewProps.clear();
+          previewPropsPath.clear();
         }
-      } else if (multi && PickedIndices().size() > 1) {
-        rows.insert(rows.begin(), {L"選択", std::to_wstring(PickedIndices().size()) + L" 個"});
+        rows = previewProps;
+        if (rows.empty()) {
+          // DB に無い: 分かることだけ
+          for (size_t a = 0, b; a < info.size(); a = b + 1) {
+            b = info.find(L'\n', a);
+            if (b == std::wstring::npos) b = info.size();
+            rows.push_back({L"", info.substr(a, b - a)});
+          }
+        }
       }
       const int labelW = Px(100);
       for (const auto& [k, v] : rows) {
@@ -2562,51 +2640,289 @@ class ExplorerImpl {
       SelectObject(dc, oldFont);
       return;
     }
-    if (it->image && it->path == previewTagsPath) {
-      for (int pass = 0; pass < 2; pass++) {
-        bool any = false;
-        for (const auto& t : previewTags) any = any || t.file == (pass == 0);
-        if (!any) continue;
-        RECT hr = {nr.left, y, nr.right, y + Px(18)};
-        SetTextColor(dc, RGB(90, 90, 90));
-        DrawTextW(dc, pass == 0 ? L"埋め込みタグ" : L"管理タグ", -1, &hr, DT_LEFT | DT_SINGLELINE);
-        y += Px(20);
-        int x = nr.left;
-        for (size_t i = 0; i < previewTags.size(); i++) {
-          const ExplorerTag& t = previewTags[i];
-          if (t.file != (pass == 0)) continue;
-          SIZE sz = {};
-          const std::wstring& label = t.label.empty() ? t.tag : t.label;
-          GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &sz);
-          int w = sz.cx + Px(14);
-          if (x > nr.left && x + w > nr.right) {
-            x = nr.left;
-            y += Px(24);
-          }
-          if (y + Px(20) > rc.bottom) break;
-          RECT r = DrawChip(dc, x, y, label, KindColor(t.kind), false);
-          tagHits.push_back({r, i});
-          x = r.right + Px(5);
-        }
-        y += Px(28);
-      }
-      if (previewTags.empty()) {
-        RECT tr = {nr.left, y, nr.right, y + Px(20)};
-        SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
-        DrawTextW(dc, L"タグはまだありません", -1, &tr, DT_CENTER | DT_SINGLELINE);
-        y += Px(26);
-      }
+    // タグ
+    if (it->image || many) y = PaintTags(dc, nr, y, rc);
+    if (showName) {
+      RECT ir = {nr.left, y, nr.right, nr.bottom};
+      SetTextColor(dc, RGB(96, 96, 96));
+      DrawTextW(dc, info.c_str(), -1, &ir, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
     }
-    RECT ir = {nr.left, y, nr.right, nr.bottom};
-    SetTextColor(dc, RGB(96, 96, 96));
-    DrawTextW(dc, info.c_str(), -1, &ir, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
     SelectObject(dc, oldFont);
+  }
+
+  // プレビューのタグ（埋め込みタグ・管理タグ）。手動編集の時は、状態の色・＋・保存のボタンも。続きの y を返す
+  int PaintTags(HDC dc, const RECT& nr, int y, const RECT& rc) {
+    shownTags = previewTags;
+    if (tagEdit) {
+      // 足した（まだ保存していない）タグ
+      for (const auto& [key, p] : pending) {
+        bool found = false;
+        for (const auto& e : previewTags) found = found || (!e.file && LowerTag(e.tag) == key);
+        if (found) continue;
+        ExplorerTag a;
+        a.tag = p.tag;
+        a.kind = L"general";
+        a.label = host->ExplorerTagLabel(p.tag);
+        a.confidence = 1;
+        a.state = 1;
+        a.editable = a.added = true;
+        a.count = a.total = 1;
+        shownTags.push_back(a);
+      }
+      // 手動編集中（変更 N 件） [保存] [取り消す]
+      RECT hr = {nr.left, y, nr.right, y + Px(20)};
+      SetTextColor(dc, RGB(0, 90, 190));
+      const std::wstring head = pending.empty() ? L"タグの手動編集中" : L"タグの手動編集中（変更 " + std::to_wstring(pending.size()) + L" 件）";
+      DrawTextW(dc, head.c_str(), -1, &hr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+      if (!pending.empty()) {
+        SIZE a = {}, b = {};
+        GetTextExtentPoint32W(dc, L"取り消す", 4, &a);
+        GetTextExtentPoint32W(dc, L"保存", 2, &b);
+        const int wc = a.cx + Px(14), ws = b.cx + Px(14);
+        editCancelR = DrawChip(dc, nr.right - wc, y, L"取り消す", RGB(110, 110, 110), false);
+        editSaveR = DrawChip(dc, nr.right - wc - Px(6) - ws, y, L"保存", RGB(0, 100, 220), true);
+      }
+      y += Px(26);
+    }
+    if (!strikeFont) {
+      LOGFONTW lf = {};
+      GetObjectW(nameFont, sizeof(lf), &lf);
+      lf.lfStrikeOut = TRUE;
+      strikeFont = CreateFontIndirectW(&lf);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+      bool any = tagEdit && pass == 1;  // 手動編集では、管理タグが無くても「＋」を出す
+      for (const auto& t : shownTags) any = any || t.file == (pass == 0);
+      if (!any) continue;
+      RECT hr = {nr.left, y, nr.right, y + Px(18)};
+      SetTextColor(dc, RGB(90, 90, 90));
+      DrawTextW(dc, pass == 0 ? L"埋め込みタグ" : L"管理タグ", -1, &hr, DT_LEFT | DT_SINGLELINE);
+      y += Px(20);
+      int x = nr.left;
+      auto place = [&](int w) {
+        if (x > nr.left && x + w > nr.right) {
+          x = nr.left;
+          y += Px(24);
+        }
+      };
+      bool full = false;
+      for (size_t i = 0; i < shownTags.size(); i++) {
+        const ExplorerTag& t = shownTags[i];
+        if (t.file != (pass == 0)) continue;
+        std::wstring label = t.label.empty() ? t.tag : t.label;
+        if (t.count < t.total) label += L" " + std::to_wstring(t.count) + L"/" + std::to_wstring(t.total);
+        COLORREF color = KindColor(t.kind);
+        bool filled = false, strike = false, changed = false;
+        if (tagEdit) {
+          const int st = ShownState(t);
+          changed = Changed(t);
+          if (t.file || !t.editable) {
+            color = RGB(165, 165, 165);  // さわれない（AI 以外の由来）
+          } else if (st == 2) {
+            color = RGB(30, 140, 60);
+            filled = true;
+            label = L"✓ " + label;
+          } else if (st == 0) {
+            color = RGB(200, 50, 50);
+            filled = true;
+            strike = true;
+            label = L"× " + label;
+          }
+        }
+        HGDIOBJ prev = strike ? SelectObject(dc, strikeFont) : nullptr;
+        SIZE sz = {};
+        GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &sz);
+        place(sz.cx + Px(14));
+        if (y + Px(20) > rc.bottom) {
+          if (prev) SelectObject(dc, prev);
+          full = true;
+          break;
+        }
+        RECT r = DrawChip(dc, x, y, label, color, filled);
+        if (prev) SelectObject(dc, prev);
+        if (changed) {
+          // まだ保存していない変更: 太い点線の枠
+          LOGBRUSH lb = {BS_SOLID, RGB(40, 40, 40), 0};
+          HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_DOT, std::max(2, Px(2)), &lb, 0, nullptr);
+          HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+          RoundRect(dc, r.left - Px(2), r.top - Px(2), r.right + Px(2), r.bottom + Px(2), Px(10), Px(10));
+          SelectObject(dc, op);
+          SelectObject(dc, ob);
+          DeleteObject(pen);
+        }
+        tagHits.push_back({r, i});
+        x = r.right + Px(5);
+      }
+      if (tagEdit && pass == 1 && !full) {
+        place(Px(28));
+        if (y + Px(20) <= rc.bottom) plusR = DrawChip(dc, x, y, L"＋", RGB(0, 100, 220), false);
+      }
+      y += Px(28);
+    }
+    if (shownTags.empty() && !tagEdit) {
+      RECT tr = {nr.left, y, nr.right, y + Px(20)};
+      SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+      DrawTextW(dc, L"タグはまだありません", -1, &tr, DT_CENTER | DT_SINGLELINE);
+      y += Px(26);
+    }
+    return y;
   }
 
   // ---------------------------------------------------------------- タグ (プレビュー) と取り置き
 
   std::vector<ExplorerTag> previewTags;
-  std::wstring previewTagsPath;
+  std::wstring previewTagsKey;          // 読んだ時の選んでいる画像（PathsKey）と手動編集かどうか
+  std::vector<ExplorerTag> shownTags;   // 描いたタグ（previewTags と、手動編集で足したもの）。tagHits の番号はこれの番号
+  static constexpr size_t kMaxTagImages = 2000;  // プレビューにまとめて出すのは先頭のこれだけ（直すのは全部）
+
+  // ---- タグの手動編集（タグの手動編集_仕様案.md）
+  bool tagEdit = false;
+  struct PendingTag {
+    std::wstring tag;
+    int state = 1;  // 0 否定・1 そのまま・2 確定
+  };
+  std::map<std::wstring, PendingTag> pending;  // 小文字のタグ → 変えた後の状態（保存するまで DB には書かない）
+  std::vector<std::wstring> editPaths;          // 変えている画像（最初に変えた時に選んでいたもの）
+  RECT editSaveR = {}, editCancelR = {}, plusR = {};
+  HWND plusEdit = nullptr;
+  bool asking = false;
+  HFONT strikeFont = nullptr;
+
+  static std::wstring LowerTag(const std::wstring& t) {
+    std::wstring k = t;
+    if (!k.empty()) CharLowerBuffW(&k[0], DWORD(k.size()));
+    return k;
+  }
+
+  // 保存する。保存できたら true
+  bool CommitEdits() {
+    if (pending.empty()) return true;
+    std::vector<std::pair<std::wstring, int>> edits;
+    for (const auto& [k, p] : pending) edits.push_back({p.tag, p.state});
+    const std::vector<std::wstring> paths = editPaths;
+    if (!host->ExplorerApplyTagEdits(paths, edits)) return false;
+    pending.clear();
+    editPaths.clear();
+    RefreshTags();
+    return true;
+  }
+  void DiscardEdits() {
+    pending.clear();
+    editPaths.clear();
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
+  }
+  // 保存していない変更があれば確かめる。キャンセルなら false
+  bool ConfirmTagEdit() {
+    CancelPlusEdit();
+    if (pending.empty() || asking) return true;
+    asking = true;
+    const std::wstring msg = L"編集したタグを保存しますか？（" + std::to_wstring(pending.size()) + L" 件）";
+    const int r = MessageBoxW(GetAncestor(hwnd, GA_ROOT), msg.c_str(), L"タグの手動編集", MB_YESNOCANCEL | MB_ICONQUESTION);
+    asking = false;
+    if (r == IDCANCEL) return false;
+    if (r == IDYES) return CommitEdits();
+    DiscardEdits();
+    return true;
+  }
+  bool SetTagEditing(bool on) {
+    if (on == tagEdit) return true;
+    if (!on && !ConfirmTagEdit()) return false;
+    CancelPlusEdit();
+    tagEdit = on;
+    pending.clear();
+    editPaths.clear();
+    if (on && settings.previewMode != 1) SetPreviewMode(1);  // タグを出す
+    previewTagsKey.clear();
+    LoadPreviewTags();
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
+    host->ExplorerTagEditChanged(on);
+    return true;
+  }
+  // 変えた後の状態（変えていなければ元の状態）
+  int ShownState(const ExplorerTag& t) const {
+    auto p = pending.find(LowerTag(t.tag));
+    return p != pending.end() ? p->second.state : t.state;
+  }
+  bool Changed(const ExplorerTag& t) const { return !t.file && pending.count(LowerTag(t.tag)); }
+  void BeginChange() {
+    if (pending.empty()) editPaths = TargetPaths();
+  }
+  // タグをクリック: 確定 → 否定 → そのまま → 確定 …
+  void CycleTag(size_t index) {
+    if (index >= shownTags.size()) return;
+    const ExplorerTag& t = shownTags[index];
+    if (t.file || !t.editable) {
+      MessageBeep(MB_OK);  // さわれないタグ（AI 以外の由来）
+      return;
+    }
+    BeginChange();
+    if (editPaths.empty()) return;
+    const std::wstring key = LowerTag(t.tag);
+    const int next = ShownState(t) == 2 ? 0 : ShownState(t) == 0 ? 1 : 2;
+    if (t.added && next == 1) pending.erase(key);                 // 足すのをやめる
+    else if (!t.added && next == t.state && !t.mixed) pending.erase(key);  // 元に戻った
+    else pending[key] = {t.tag, next};
+    InvalidateRect(preview, nullptr, FALSE);
+  }
+  // タグを足す（＋・タグトレイから落とした）: 確定にする
+  void AddPending(const std::wstring& tag) {
+    std::wstring t = tag;
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    while (!t.empty() && iswspace(t.front())) t.erase(0, 1);
+    if (t.empty()) return;
+    BeginChange();
+    if (editPaths.empty()) return;
+    const std::wstring key = LowerTag(t);
+    for (const auto& e : previewTags)
+      if (!e.file && LowerTag(e.tag) == key) {
+        if (e.state == 2 && !e.mixed) pending.erase(key);  // もう全部で確定している
+        else pending[key] = {e.tag, 2};
+        InvalidateRect(preview, nullptr, FALSE);
+        return;
+      }
+    pending[key] = {t, 2};
+    InvalidateRect(preview, nullptr, FALSE);
+  }
+  // 「＋」の入力欄
+  void StartPlusEdit() {
+    CancelPlusEdit();
+    if (plusR.right <= plusR.left) return;
+    plusEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, plusR.left, plusR.top,
+                               Px(180), plusR.bottom - plusR.top, preview, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(plusEdit, WM_SETFONT, WPARAM(font), TRUE);
+    SendMessageW(plusEdit, EM_SETCUEBANNER, TRUE, LPARAM(L"タグ（表示名でも）"));
+    SetWindowSubclass(plusEdit, PlusEditProc, 3, DWORD_PTR(this));
+    SetFocus(plusEdit);
+  }
+  void CancelPlusEdit() {
+    if (!plusEdit) return;
+    HWND e = plusEdit;
+    plusEdit = nullptr;
+    DestroyWindow(e);
+  }
+  static LRESULT CALLBACK PlusEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    auto* self = reinterpret_cast<ExplorerImpl*>(ref);
+    if (msg == WM_GETDLGCODE) return DefSubclassProc(h, msg, wp, lp) | DLGC_WANTALLKEYS;
+    if (msg == WM_CHAR && (wp == L'\r' || wp == 27)) return 0;  // ビープを鳴らさない
+    if (msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+      if (wp == VK_RETURN) {
+        wchar_t buf[512] = L"";
+        GetWindowTextW(h, buf, 512);
+        const std::wstring tag = self->host->ExplorerResolveTag(buf);
+        self->AddPending(tag);
+      }
+      self->CancelPlusEdit();
+      SetFocus(self->grid);
+      return 0;
+    }
+    if (msg == WM_KILLFOCUS) {
+      LRESULT r = DefSubclassProc(h, msg, wp, lp);
+      if (self->plusEdit == h) PostMessageW(self->preview, WM_APP + 7, 0, 0);  // 入力欄の外を押した: やめる（後で消す）
+      return r;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, PlusEditProc, 3);
+    return DefSubclassProc(h, msg, wp, lp);
+  }
   struct TagHit {
     RECT r;
     size_t index;
@@ -2669,19 +2985,20 @@ class ExplorerImpl {
     return r;
   }
 
-  void LoadPreviewTags(const Item* it) {
-    std::wstring path = it && it->image ? it->path : std::wstring();
-    if (path == previewTagsPath) return;
-    previewTagsPath = path;
-    previewTags = path.empty() ? std::vector<ExplorerTag>() : host->ExplorerTags(path);
+  void LoadPreviewTags() {
+    std::vector<std::wstring> paths = TargetPaths();
+    const std::wstring key = PathsKey(paths) + (tagEdit ? L"|edit" : L"");
+    if (key == previewTagsKey) return;
+    previewTagsKey = key;
+    if (paths.size() > kMaxTagImages) paths.resize(kMaxTagImages);
+    previewTags = paths.empty() ? std::vector<ExplorerTag>() : host->ExplorerTagSet(paths, tagEdit);
   }
 
   // タグの表示名が変わった: プレビューのタグを読み直して描き直す
   void RefreshTags() {
-    previewTagsPath.clear();
+    previewTagsKey.clear();
     previewPropsPath.clear();
-    const Item* it = PreviewItem();
-    LoadPreviewTags(it);
+    LoadPreviewTags();
     if (preview) InvalidateRect(preview, nullptr, FALSE);
     InvalidateRect(trayWnd, nullptr, FALSE);
   }
@@ -2875,6 +3192,14 @@ class ExplorerImpl {
   // プレビューの上ならプレビューの画像に、ほかはホストに任せる（検索の欄なら語として使う）
   void DropTrayTag(const std::wstring& tag, POINT screen) {
     HWND under = WindowFromPoint(screen);
+    if (tagEdit) {
+      // 手動編集: プレビューか、選んでいる画像の上なら、確定として足す（保存するまで書かない）
+      const int i = under == grid ? TagDropItemAt(screen) : -1;
+      if (under == preview || (i >= 0 && IsPicked(i))) {
+        AddPending(tag);
+        return;
+      }
+    }
     std::vector<std::wstring> paths;
     if (under == grid) {
       const int i = TagDropItemAt(screen);
@@ -2900,7 +3225,7 @@ class ExplorerImpl {
   }
 
   void TagMenu(int hit, POINT screen) {
-    const ExplorerTag& t = previewTags[tagHits[size_t(hit)].index];
+    const ExplorerTag& t = shownTags[tagHits[size_t(hit)].index];
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_TAG_SEARCH, L"このタグで検索(&S)");
     AppendMenuW(menu, MF_STRING, MENU_TAG_TRAY, L"タグトレイに置く(&K)");
@@ -2911,19 +3236,13 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_STRING, MENU_TAG_RENAME, L"表示名を変える(&R)...");
     const std::string page = t.kind == L"account" ? imgdupe::accountUrl(winutil::narrow(t.tag)) : std::string();
     if (!page.empty()) AppendMenuW(menu, MF_STRING, MENU_TAG_PAGE, L"アカウントのページを開く(&W)");
-    if (!previewTagsPath.empty()) {  // タグを出している画像
-      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-      AppendMenuW(menu, MF_STRING, MENU_TAG_REMOVE, L"この画像からこのタグを外す(&X)");
-    }
     const std::wstring tag = t.tag;  // 下で previewTags が読み直されることがある
-    const std::wstring path = previewTagsPath;
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
     if (cmd == MENU_TAG_SEARCH) host->ExplorerSearchTags({tag});
     if (cmd == MENU_TAG_TRAY) AddTray(tag);
     if (cmd == MENU_TAG_COPY) CopyText(tag);
     if (cmd == MENU_TAG_RENAME) host->ExplorerRenameTag(tag);
-    if (cmd == MENU_TAG_REMOVE) host->ExplorerRemoveTag(path, tag);
     if (cmd == MENU_TAG_PAGE) ShellExecuteW(nullptr, L"open", winutil::widen(page).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   }
 
@@ -3552,14 +3871,23 @@ class ExplorerImpl {
         InvalidateRect(hwnd, nullptr, FALSE);
         if (!self->dragSplit) self->UpdatePreview();
         return 0;
-      case WM_LBUTTONDBLCLK:
-        if (self->TagAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}) < 0) self->Open(self->sel);
+      case WM_LBUTTONDBLCLK: {
+        const POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int hit = self->TagAt(pt);
+        if (self->tagEdit && hit >= 0) self->CycleTag(self->tagHits[size_t(hit)].index);  // 続けて押した 2 回目
+        else if (self->tagEdit && (PtInRect(&self->plusR, pt) || PtInRect(&self->editSaveR, pt) || PtInRect(&self->editCancelR, pt))) {
+        } else if (hit < 0) self->Open(self->sel);
+        return 0;
+      }
+      case WM_APP + 7:  // 「＋」の入力欄の外を押した
+        self->CancelPlusEdit();
         return 0;
       case WM_SETCURSOR: {
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hwnd, &pt);
-        if (self->tagDragging || self->TagAt(pt) >= 0) {
+        const bool button = self->tagEdit && (PtInRect(&self->plusR, pt) || PtInRect(&self->editSaveR, pt) || PtInRect(&self->editCancelR, pt));
+        if (self->tagDragging || self->TagAt(pt) >= 0 || button) {
           SetCursor(LoadCursor(nullptr, self->tagDragging ? IDC_SIZEALL : IDC_HAND));
           return TRUE;
         }
@@ -3572,6 +3900,20 @@ class ExplorerImpl {
             self->SetPreviewMode(mode);
             return 0;
           }
+        if (self->tagEdit) {
+          if (PtInRect(&self->editSaveR, pt)) {
+            self->CommitEdits();
+            return 0;
+          }
+          if (PtInRect(&self->editCancelR, pt)) {
+            self->DiscardEdits();
+            return 0;
+          }
+          if (PtInRect(&self->plusR, pt)) {
+            self->StartPlusEdit();
+            return 0;
+          }
+        }
         self->tagDown = self->TagAt(pt);
         self->tagDragging = false;
         self->tagDownPt = pt;
@@ -3602,12 +3944,15 @@ class ExplorerImpl {
           int hit = self->tagDown;
           self->tagDown = -1;
           if (hit < int(self->tagHits.size())) {
-            const std::wstring tag = self->previewTags[self->tagHits[size_t(hit)].index].tag;
+            const size_t index = self->tagHits[size_t(hit)].index;
+            const std::wstring tag = self->shownTags[index].tag;
             if (self->tagDragging) {
               POINT sp = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
               ClientToScreen(hwnd, &sp);
               if (WindowFromPoint(sp) == self->trayWnd) self->AddTray(tag);
               else self->host->ExplorerDropTag(tag, sp);  // 検索のフリーワードの欄なら、語として足す
+            } else if (self->tagEdit) {
+              self->CycleTag(index);  // 手動編集: 確定 → 否定 → そのまま
             } else {
               self->host->ExplorerSearchTags({tag});
             }
@@ -3793,6 +4138,12 @@ class ExplorerImpl {
         }
         int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
         bool ctrl = (wp & MK_CONTROL) != 0, shift = (wp & MK_SHIFT) != 0;
+        // 選ぶ画像が変わる時は、手動編集の保存していない変更を確かめる（キャンセルなら選ばない）
+        const bool keeps = h >= 0 && ((msg == WM_RBUTTONDOWN && IsPicked(h)) ||
+                                      (msg == WM_LBUTTONDOWN && !ctrl && !shift && ((multi && IsPicked(h)) || (!multi && h == sel))));
+        const bool prompted = !keeps && (h >= 0 || msg == WM_LBUTTONDOWN) && !pending.empty();
+        if (prompted && !ConfirmTagEdit()) return 0;
+        if (prompted && h < 0) return 0;  // 確かめる窓を出した後は、枠で囲むのを始めない（ボタンはもう離している）
         if (h >= 0) {
           // 右クリックは、選んでいるものの上なら選び方を変えない (選んだものに対するメニュー)
           if (msg == WM_RBUTTONDOWN && IsPicked(h)) {
@@ -3808,7 +4159,7 @@ class ExplorerImpl {
           } else {
             SelectWith(h, msg == WM_LBUTTONDOWN && ctrl, msg == WM_LBUTTONDOWN && shift);
           }
-          if (msg == WM_LBUTTONDOWN && !shift) {
+          if (msg == WM_LBUTTONDOWN && !shift && !prompted) {
             dragArmed = true;
             dragFrom = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             SetCapture(grid);
@@ -3835,7 +4186,7 @@ class ExplorerImpl {
         if (dragArmed) {
           dragArmed = false;
           ReleaseCapture();
-          if (collapseOnUp >= 0) Select(collapseOnUp);
+          if (collapseOnUp >= 0 && ConfirmTagEdit()) Select(collapseOnUp);
           collapseOnUp = -1;
         }
         if (banding) {
@@ -3919,7 +4270,9 @@ class ExplorerImpl {
         GetClientRect(grid, &rc);
         int page = std::max(1, int(rc.bottom / CellH())) * cols;
         bool shift = GetKeyState(VK_SHIFT) < 0;
-        auto go = [&](int i) { SelectWith(i, false, shift); };  // Shift を押していれば範囲を選ぶ
+        auto go = [&](int i) {  // Shift を押していれば範囲を選ぶ
+          if (ConfirmTagEdit()) SelectWith(i, false, shift);
+        };
         switch (wp) {
           case VK_LEFT: go(sel - 1); return 0;
           case VK_RIGHT: go(sel + 1); return 0;
@@ -3934,13 +4287,13 @@ class ExplorerImpl {
           case VK_END: go(int(items.size()) - 1); return 0;
           case 'A':
             if (ctrl) {
-              SelectAll();
+              if (ConfirmTagEdit()) SelectAll();
               return 0;
             }
             break;
           case VK_ESCAPE:
             if (multi) {
-              Select(sel);
+              if (ConfirmTagEdit()) Select(sel);
               return 0;
             }
             break;
@@ -4237,3 +4590,6 @@ void Explorer::ShowList(const std::wstring& title, std::vector<std::vector<std::
 void Explorer::SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups) { impl_->SetGroups(title, std::move(groups)); }
 
 void Explorer::AddTrayTag(const std::wstring& tag) { impl_->AddTray(tag); }
+bool Explorer::TagEditing() const { return impl_->tagEdit; }
+bool Explorer::SetTagEditing(bool on) { return impl_->SetTagEditing(on); }
+bool Explorer::ConfirmTagEdit() { return impl_->ConfirmTagEdit(); }

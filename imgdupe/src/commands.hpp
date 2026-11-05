@@ -37,7 +37,7 @@ enum Cmd : int {
     CMD_DELETE_SMART,
     CMD_EXPAND_LINKS,
     CMD_LINKS,
-    CMD_TAG_YES,
+    CMD_TAG_YES,  // ここから 4 つは v3.11 でやめた（設定ファイルの名前が残っていても無視する）
     CMD_TAG_NO,
     CMD_BULK_TAG,
     CMD_REVIEW,
@@ -76,6 +76,7 @@ enum Cmd : int {
     CMD_SEARCH_END,       // 検索を終了
     CMD_SEARCH_CLEAR,     // 検索の条件をクリア
     CMD_SEARCH_ADVANCED,  // 詳細検索を開く / 閉じる
+    CMD_TAG_EDIT,         // タグの手動編集（入 / 切）
 };
 
 struct CmdInfo {

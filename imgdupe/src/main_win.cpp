@@ -348,18 +348,19 @@ struct ExplorerApp : ExplorerHost {
     void ExplorerSettingsChanged(const ExplorerSettings& s) override;
     std::vector<int> ExplorerStates(const std::wstring& dir, const std::vector<std::pair<std::wstring, bool>>& items) override;
     void ExplorerRequestProgress(const std::wstring& dir) override;
-    std::vector<ExplorerTag> ExplorerTags(const std::wstring& path) override;
+    std::vector<ExplorerTag> ExplorerTagSet(const std::vector<std::wstring>& paths, bool edit) override;
+    bool ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, const std::vector<std::pair<std::wstring, int>>& edits) override;
+    std::wstring ExplorerResolveTag(const std::wstring& text) override;
+    void ExplorerTagEditChanged(bool on) override;
     void ExplorerSearchTags(const std::vector<std::wstring>& tags) override;
     void ExplorerFindSimilarAi(const std::wstring& path) override;
     void ExplorerRelookup(const std::wstring& path) override;
     std::wstring ExplorerTagLabel(const std::wstring& tag) override;
     void ExplorerRenameTag(const std::wstring& tag) override;
-    void ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) override;
     void ExplorerAddTag(const std::vector<std::wstring>& paths, const std::wstring& tag) override;
     void ExplorerDropTag(const std::wstring& tag, POINT screen) override;
     std::vector<std::pair<std::wstring, std::wstring>> ExplorerProperties(const std::wstring& path) override;
     void ExplorerSaveSelection() override;
-    void ExplorerTagSelection() override;
     void ExplorerTeachFolder(const std::wstring& dir) override;
 } ex;
 
@@ -2285,7 +2286,7 @@ SearchQuery searchQueryFromUi() {
     const int sort = std::max(0, ComboBox_GetCurSel(app.s.sort));
     q.sort = kSortChoices[std::min<int>(sort, static_cast<int>(std::size(kSortChoices)) - 1)];
     q.descending = Button_GetCheck(app.s.desc) == BST_CHECKED;
-    q.review = Button_GetCheck(app.s.review) == BST_CHECKED;
+    q.review = false;  // 確認キューはやめた（v3.11。タグの手動編集に置き換え）
     return q;
 }
 
@@ -5081,43 +5082,169 @@ void ExplorerApp::ExplorerSelected(const std::wstring& path, bool image) {
 }
 
 // 画像のタグ（ファイルのタグと、確度を合成した検索用のタグ。確度の高い順）
-std::vector<ExplorerTag> ExplorerApp::ExplorerTags(const std::wstring& path) {
+// 手動編集でさわれるタグの由来（AI が付けるもの）
+bool aiTagSource(const std::string& source) {
+    return source == kSourceTagger || source == kSourceDict || source == kSourceClip || source == "reference";
+}
+
+// 画像のタグ（プレビューに出す）。いくつもならまとめる（タグの手動編集_仕様案.md）
+std::vector<ExplorerTag> ExplorerApp::ExplorerTagSet(const std::vector<std::wstring>& paths, bool edit) {
     std::vector<ExplorerTag> out;
     Db* db = uiDb();
-    if (!db) return out;
+    if (!db || paths.empty()) return out;
     try {
         std::vector<std::string> roots;
         for (const auto& f : folderList()) roots.push_back(narrow(f));
-        const int64_t id = findImageId(*db, narrow(path), roots);
-        if (!id) return out;
-        struct Agg {
-            std::string kind;
-            std::vector<double> ps;
-            int manual = -1;
-            bool file = false, dbOnly = false;
+        struct Row {
+            std::string tag, kind;
+            double p = 0;
+            int state = 1;
+            bool file = false, editable = false;
         };
-        std::vector<std::pair<std::string, Agg>> agg;
-        for (const auto& t : tagsOf(*db, id)) {
-            if (t.kind == "rating") continue;  // general / sensitive などの年齢区分は出さない
-            auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return lstrcmpiA(a.first.c_str(), t.tag.c_str()) == 0; });
-            if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{t.kind}});
-            if (t.source == kSourceEmbedded) it->second.file = true;
-            else it->second.dbOnly = true;
-            if (t.manual) it->second.manual = t.confidence > 0.5 ? 1 : 0;
-            else it->second.ps.push_back(t.confidence);
+        struct Sum {
+            std::string tag, kind;
+            bool file = false;
+            int count = 0;
+            double lo = 2, hi = -1;
+            int stLo = 3, stHi = -1;
+            bool editable = false;
+        };
+        std::vector<Sum> sums;
+        std::unordered_map<std::string, size_t> at;  // 小文字のタグ + 埋め込みか → sums の番号
+        int total = 0;
+        for (const auto& path : paths) {
+            const int64_t id = findImageId(*db, narrow(path), roots);
+            if (!id) continue;
+            ++total;
+            struct Agg {
+                std::string kind;
+                std::vector<double> ps;
+                int manual = -1;
+                bool file = false, dbOnly = false, ai = false;
+            };
+            std::vector<std::pair<std::string, Agg>> agg;
+            for (const auto& t : tagsOf(*db, id)) {
+                if (t.kind == "rating") continue;  // general / sensitive などの年齢区分は出さない
+                auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return lstrcmpiA(a.first.c_str(), t.tag.c_str()) == 0; });
+                if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{t.kind}});
+                if (t.source == kSourceEmbedded) it->second.file = true;
+                else it->second.dbOnly = true;
+                if (t.manual) it->second.manual = t.confidence > 0.5 ? 1 : 0;
+                else it->second.ps.push_back(t.confidence);
+                if (aiTagSource(t.source)) it->second.ai = true;
+            }
+            std::vector<Row> rows;
+            for (const auto& [tag, a] : agg) {
+                const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
+                const int state = a.manual == 1 ? 2 : a.manual == 0 ? 0 : 1;
+                // 手動で外した（「違う」と確定した）タグは、ファイルに書き込まれていても出さない（ファイルは書き換えない）
+                if (a.file && a.manual != 0) rows.push_back({tag, a.kind, 1.0, state, true, false});
+                // 手動編集では、否定したタグも出す（クリックで戻せるように）
+                if (a.dbOnly && (p >= 0.35 || (edit && a.manual >= 0)))
+                    rows.push_back({tag, a.kind, p, state, false, a.ai || a.manual >= 0});
+            }
+            for (const auto& r : rows) {
+                std::string key = r.tag;
+                for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (r.file) key += '\x01';
+                auto f = at.find(key);
+                if (f == at.end()) {
+                    f = at.emplace(key, sums.size()).first;
+                    sums.push_back(Sum{r.tag, r.kind, r.file});
+                }
+                Sum& u = sums[f->second];
+                ++u.count;
+                u.lo = std::min(u.lo, r.p);
+                u.hi = std::max(u.hi, r.p);
+                u.stLo = std::min(u.stLo, r.state);
+                u.stHi = std::max(u.stHi, r.state);
+                u.editable = u.editable || r.editable;
+            }
         }
         std::vector<std::pair<double, ExplorerTag>> rows;
-        for (const auto& [tag, a] : agg) {
-            const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
-            // 手動で外した（「違う」と確定した）タグは、ファイルに書き込まれていても出さない（ファイルは書き換えない）
-            if (a.file && a.manual != 0) rows.push_back({2.0, ExplorerTag{widen(tag), widen(a.kind), tagLabel(tag), 1.0, true}});
-            if (a.dbOnly && p >= 0.35) rows.push_back({p, ExplorerTag{widen(tag), widen(a.kind), tagLabel(tag), p, false}});
+        for (const auto& u : sums) {
+            ExplorerTag t{widen(u.tag), widen(u.kind), tagLabel(u.tag), edit ? u.lo : u.hi, u.file};
+            t.count = u.count;
+            t.total = total;
+            t.state = u.stLo;
+            t.mixed = u.stLo != u.stHi;
+            t.editable = u.editable;
+            rows.push_back({u.file ? 2.0 : t.confidence, std::move(t)});
         }
         std::stable_sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
         for (auto& r : rows) out.push_back(std::move(r.second));
     } catch (const std::exception&) {
     }
     return out;
+}
+
+// タグの手動編集を保存する: 選んだ画像それぞれに、確定（手動で 1.0）・否定（手動で 0）・そのまま（手動の決定を外す）。
+// AI 以外の由来（フォルダ名など）だけで付いている画像は変えない。全部で 1 回の操作として元に戻せる
+bool ExplorerApp::ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, const std::vector<std::pair<std::wstring, int>>& edits) {
+    Db* db = uiDb();
+    if (!db || edits.empty()) return false;
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    std::vector<int64_t> ids;
+    try {
+        for (const auto& p : paths)
+            if (const int64_t id = findImageId(*db, narrow(p), roots)) ids.push_back(id);
+    } catch (const std::exception&) {
+    }
+    if (ids.empty()) {
+        logBox(app.hwnd, L"解析に無い画像のタグは直せません。", L"タグの手動編集", MB_ICONINFORMATION);
+        return false;
+    }
+    std::string what;
+    for (const auto& [tag, state] : edits) {
+        if (what.size() > 120) {
+            what += " ほか";
+            break;
+        }
+        what += (what.empty() ? "" : "、") + narrow(tag) + (state == 2 ? " を確定" : state == 0 ? " を否定" : " をそのまま");
+    }
+    const std::string desc = "タグの手動編集（" + std::to_string(ids.size()) + " 枚）: " + what;
+    bool ok = true;
+    editSelectedTags(ids, desc, [&](Db& d, int64_t id, TagHistory& history) {
+        const std::vector<TagRow> rows = tagsOf(d, id);
+        for (const auto& [wtag, state] : edits) {
+            const std::string tag = narrow(wtag);
+            bool present = false, touchable = false;
+            for (const auto& r : rows)
+                if (lstrcmpiA(r.tag.c_str(), tag.c_str()) == 0) {
+                    present = true;
+                    touchable = touchable || r.manual || aiTagSource(r.source);
+                }
+            if (present && !touchable) continue;  // フォルダ名などの由来だけ: 変えない
+            history.touch(id, tag);
+            if (state == 2) setManualTag(d, id, tag, true);
+            else if (state == 0) setManualTag(d, id, tag, false);
+            else clearManualTag(d, id, tag);
+        }
+    });
+    logs::info(desc);
+    return ok;
+}
+
+// 手で打ったタグ: 表示名（日本語など）なら元のタグに。決まらなければ打ったまま
+std::wstring ExplorerApp::ExplorerResolveTag(const std::wstring& text) {
+    std::wstring t = text;
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    while (!t.empty() && iswspace(t.front())) t.erase(0, 1);
+    Db* db = uiDb();
+    if (!db || t.empty()) return t;
+    try {
+        const auto named = tagsNamed(*db, narrow(t));
+        if (named.size() == 1) return widen(named[0]);
+    } catch (const std::exception&) {
+    }
+    return t;
+}
+
+void ExplorerApp::ExplorerTagEditChanged(bool on) {
+    syncMenuChecks();
+    if (ex.view) ex.view->SetSameStatus(on ? L"タグの手動編集: プレビューのタグをクリックで 確定 → 否定 → そのまま。＋ で足す。タグトレイから落としても足せます"
+                                           : L"タグの手動編集を終えました");
 }
 
 // タグで検索する（タグをクリック・取り置いたタグを組み合わせて）: 検索のリボンに出して、すぐ探す
@@ -5194,21 +5321,6 @@ void ExplorerApp::ExplorerDropTag(const std::wstring& tag, POINT screen) {
     SendMessageW(app.s.free, EM_SETSEL, text.size(), text.size());
 }
 
-// この画像からタグを外す: 手動で「違う」と確定する（Ctrl+Z で戻せる。ファイルは書き換えない）
-void ExplorerApp::ExplorerRemoveTag(const std::wstring& path, const std::wstring& tag) {
-    Db* db = uiDb();
-    if (!db) return;
-    std::vector<std::string> roots;
-    for (const auto& f : folderList()) roots.push_back(narrow(f));
-    const int64_t id = findImageId(*db, narrow(path), roots);
-    if (!id) return;
-    const std::string t = narrow(tag);
-    editSelectedTags({id}, "タグを外す: " + t, [&](Db& d, int64_t imageId, TagHistory& history) {
-        history.touch(imageId, t);
-        setManualTag(d, imageId, t, false);
-    });
-}
-
 // タグの表示名を自分で付ける（空にすると同梱の訳に戻す）
 void ExplorerApp::ExplorerRenameTag(const std::wstring& tag) {
     Db* db = uiDb();
@@ -5256,7 +5368,6 @@ std::vector<std::pair<std::wstring, std::wstring>> ExplorerApp::ExplorerProperti
     return out;
 }
 
-void ExplorerApp::ExplorerTagSelection() { bulkTagUi(); }
 void ExplorerApp::ExplorerTeachFolder(const std::wstring& dir) { teachFolderUi(dir); }
 
 void ExplorerApp::ExplorerRelookup(const std::wstring& path) {
@@ -6264,6 +6375,10 @@ int tabPos(int id) {
 
 // リボンの切り替え（app.tab: 2 = ホーム、0 = 重複を探す、1 = 検索）。画面はいつもエクスプローラー
 void switchTab(int t) {
+    if (t != app.tab && ex.view && !ex.view->ConfirmTagEdit()) {  // 手動編集で保存していないタグ: キャンセルなら替えない
+        TabCtrl_SetCurSel(app.tabs, tabPos(app.tab));
+        return;
+    }
     app.tab = t;
     TabCtrl_SetCurSel(app.tabs, tabPos(t));
     // 並べ替え・出し入れの間は描かない（部品ごとに描き直すと、エクスプローラーのサムネイルまで何度も描いて遅かった）
@@ -6330,8 +6445,6 @@ void layoutSearch(int y, int W) {
     put(app.s.smart, px(170), px(300));
     put(app.s.smartSave, px(56));
     put(app.s.smartDelete, px(56));
-    x += px(10);
-    put(app.s.review, px(96));
     x += px(10);
     put(app.s.expand, px(140));
     cy += rowH + px(5);
@@ -6438,9 +6551,9 @@ void createSearchControls() {
     app.s.smart = combo(IDC_S_SMART, sp, {});
     app.s.smartSave = button(L"保存…", IDC_S_SMART_SAVE, sp);
     app.s.smartDelete = button(L"管理…", IDC_S_SMART_DELETE, sp);  // 削除・並べ替え・書き出し
-    app.s.review = button(L"確認キュー", IDC_S_REVIEW, sp, BS_AUTOCHECKBOX);
     // 「正しい」「違う」「タグ…」はリボンに出さない（メニューの「タグ」とキーで使える）
     std::vector<HWND> unused;
+    app.s.review = button(L"確認キュー", IDC_S_REVIEW, unused, BS_AUTOCHECKBOX);  // 使わない（v3.11 でやめた。タグの手動編集に）
     app.s.yes = button(L"確定", IDC_S_YES, unused);
     app.s.no = button(L"否定", IDC_S_NO, unused);
     app.s.bulk = button(L"タグ…", IDC_S_BULK, unused);
@@ -7749,10 +7862,9 @@ void appendMainMenus(HMENU root) {
     popup(L"ファイル(&F)", {CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE, 0, CMD_EXIT});
     popup(L"表示(&V)", {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_REFRESH, 0, CMD_STATS});
     popup(L"画像(&I)", {CMD_OPEN, CMD_EXPLORER, CMD_COPY_PATH, 0, CMD_FIND_SAME, CMD_SAVE_SELECTION});
-    popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG});
     // ツール: タグと DB を補強するもの、リボン（重複チェック・検索・画像から検索）の動作、設定
     HMENU tools = CreatePopupMenu();
-    fill(tools, {CMD_UNDO, 0, CMD_TAGDICT, CMD_DICTIONARY, CMD_INFER_RULES, CMD_REFS, 0});
+    fill(tools, {CMD_TAG_EDIT, CMD_UNDO, 0, CMD_TAGDICT, CMD_DICTIONARY, CMD_INFER_RULES, CMD_REFS, 0});
     sub(tools, L"重複チェック(&C)", {CMD_SEARCH, CMD_QUERY, CMD_EXPORT, 0, CMD_TOGGLE_EXACT, CMD_TOGGLE_FLAT, CMD_TOGGLE_VARIANTS, 0,
                                      CMD_THRESHOLD_DOWN, CMD_THRESHOLD_UP, 0, CMD_PREV_GROUP, CMD_NEXT_GROUP});
     sub(tools, L"検索(&F)", {CMD_SEARCH_GO, CMD_SEARCH_END, CMD_SEARCH_CLEAR, CMD_SEARCH_ADVANCED, 0, CMD_SAVE_SMART, CMD_MANAGE_QUERIES,
@@ -7773,6 +7885,7 @@ void syncMenuChecks() {
                   MF_BYCOMMAND | (Button_GetCheck(app.variants) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(app.menuBar, CMD_TAG_EDIT, MF_BYCOMMAND | (ex.view && ex.view->TagEditing() ? MF_CHECKED : MF_UNCHECKED));
 }
 
 void rebuildMenu() {
@@ -8150,21 +8263,12 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_COMPACT_DB: compactDbUi(); break;
                 case CMD_ARCHIVE: archiveUi(); break;
                 case CMD_INFER_RULES: teachFolderUi(L""); break;
-                case CMD_TAG_YES:
-                case CMD_TAG_NO:
-                    markSelected(LOWORD(wp) == CMD_TAG_YES);
-                    break;
-                case CMD_BULK_TAG:
-                    bulkTagUi();
+                case CMD_TAG_EDIT:
+                    if (ex.view) ex.view->SetTagEditing(!ex.view->TagEditing());
                     break;
                 case CMD_UNDO:
                     if (app.tab != 1) switchTab(1);
                     undoTagEdit();
-                    break;
-                case CMD_REVIEW:
-                    if (app.tab != 1) switchTab(1);
-                    Button_SetCheck(app.s.review, Button_GetCheck(app.s.review) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
-                    scheduleSearch(10);
                     break;
                 case CMD_INDEXER_TOGGLE:
                     saveSettings();  // 調べるフォルダを DB に書いてから
@@ -8382,6 +8486,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_CLOSE:
             if (app.closing) return 0;
+            if (ex.view && !ex.view->ConfirmTagEdit()) return 0;  // 手動編集で保存していないタグ（キャンセルなら閉じない）
             if (app.updating) {
                 logBox(hwnd, L"アップデートの処理中です。少し待ってから閉じてください。", L"imgdupe", MB_ICONINFORMATION);
                 return 0;
