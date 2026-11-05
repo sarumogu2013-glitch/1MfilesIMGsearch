@@ -91,6 +91,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_ARCHIVE, "Archive", L"退避した解析結果(&H)...", ""},
     {CMD_REFRESH, "Refresh", L"更新(&F)", "Ctrl+F5"},
     {CMD_INFER_RULES, "InferRules", L"フォルダ名のルール(&N)...", ""},
+    {CMD_OPEN_DATA, "OpenDataFolder", L"設定のフォルダを開く(&D)", ""},
     {CMD_OPEN_LOGS, "OpenLogs", L"動作履歴（ログ）のフォルダを開く(&L)", ""},
     {CMD_ABOUT, "About", L"バージョン情報(&A)", ""},
 };

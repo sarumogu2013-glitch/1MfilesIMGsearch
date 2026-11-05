@@ -6034,6 +6034,119 @@ void compactDbUi() {
     if (ex.view) ex.view->SetSameStatus(L"DB を詰めるよう、常駐解析に頼みました（進み具合と結果はタスクトレイの窓に出ます）");
 }
 
+// バージョン情報: 真ん中に並べる。リポジトリの名前はクリックで開く
+void aboutUi() {
+    enum { ID_LINK = 100 };
+    struct State {
+        bool done = false;
+        bool openLink = false;
+        HFONT big = nullptr, link = nullptr;
+        HWND linkWnd = nullptr;
+    } st;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            auto* st = reinterpret_cast<State*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            if (msg == WM_COMMAND && st) {
+                if (LOWORD(wp) == ID_LINK && HIWORD(wp) == STN_CLICKED) st->openLink = true;
+                else if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) st->done = true;
+                return 0;
+            }
+            if (msg == WM_CTLCOLORSTATIC && st) {
+                HDC dc = reinterpret_cast<HDC>(wp);
+                SetBkMode(dc, TRANSPARENT);
+                if (reinterpret_cast<HWND>(lp) == st->linkWnd) SetTextColor(dc, RGB(0, 102, 204));
+                return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+            }
+            if (msg == WM_SETCURSOR && st && reinterpret_cast<HWND>(wp) == st->linkWnd) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            if (msg == WM_CLOSE && st) {
+                st->done = true;
+                return 0;
+            }
+            return DefWindowProcW(h, msg, wp, lp);
+        };
+        wc.hInstance = app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ImgdupeAbout";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const int w = px(420), h = px(210);
+    RECT owner;
+    GetWindowRect(app.hwnd, &owner);
+    RECT frame{0, 0, w, h};
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ImgdupeAbout", L"バージョン情報", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               (owner.left + owner.right - fw) / 2, (owner.top + owner.bottom - fh) / 2, fw, fh, app.hwnd, nullptr,
+                               app.inst, nullptr);
+    if (!dlg) return;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
+    LOGFONTW lf{};
+    GetObjectW(app.font, sizeof(lf), &lf);
+    LOGFONTW bigLf = lf;
+    bigLf.lfHeight = lf.lfHeight * 3 / 2;
+    bigLf.lfWeight = FW_BOLD;
+    st.big = CreateFontIndirectW(&bigLf);
+    LOGFONTW linkLf = lf;
+    linkLf.lfUnderline = TRUE;
+    st.link = CreateFontIndirectW(&linkLf);
+    auto label = [&](const std::wstring& text, int y, int ch, HFONT f, DWORD style = 0, int id = -1) {
+        HWND c = CreateWindowExW(0, WC_STATICW, text.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX | style, px(12), y,
+                                 w - px(24), ch, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.inst, nullptr);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(f), TRUE);
+        return c;
+    };
+    label(L"imgdupe " + widen(IMGDUPE_VERSION), px(20), px(30), st.big);
+    label(L"重複画像検索", px(56), px(20), app.font);
+    // リンクは文字の幅だけにする（横の空いた所をクリックしても開かないように）
+    const std::wstring repo = L"github.com/" APP_REPOSITORY;
+    HDC dc = GetDC(dlg);
+    HGDIOBJ old = SelectObject(dc, st.link);
+    SIZE ts{};
+    GetTextExtentPoint32W(dc, repo.c_str(), static_cast<int>(repo.size()), &ts);
+    SelectObject(dc, old);
+    ReleaseDC(dlg, dc);
+    const int lw = std::min<int>(ts.cx + px(4), w - px(24));
+    st.linkWnd = CreateWindowExW(0, WC_STATICW, repo.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX | SS_NOTIFY, (w - lw) / 2,
+                                 px(96), lw, px(20), dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LINK)), app.inst, nullptr);
+    SendMessageW(st.linkWnd, WM_SETFONT, reinterpret_cast<WPARAM>(st.link), TRUE);
+    HWND tip = makeTooltip(dlg, px(320));
+    addTooltip(tip, st.linkWnd, L"クリックで GitHub のページを開きます");
+    const int bw = px(100), bh = px(28);
+    HWND ok = CreateWindowExW(0, WC_BUTTONW, L"閉じる", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, (w - bw) / 2,
+                              h - px(14) - bh, bw, bh, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), app.inst, nullptr);
+    SendMessageW(ok, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
+    EnableWindow(app.hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(ok);
+    MSG msg{};
+    while (!st.done && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            st.done = true;
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (st.openLink) {
+            st.openLink = false;
+            ShellExecuteW(dlg, L"open", L"https://github.com/" APP_REPOSITORY, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+    EnableWindow(app.hwnd, TRUE);
+    DestroyWindow(dlg);
+    DeleteObject(st.big);
+    DeleteObject(st.link);
+    SetForegroundWindow(app.hwnd);
+}
+
 // DB を変換した後（前の表の分が空いたまま）、一度だけ「詰める」をすすめる
 void suggestCompact() {
     Db* db = uiDb();
@@ -7437,6 +7550,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
         case CMD_HELP: return L"使い方の説明を出します（F1）";
+        case CMD_OPEN_DATA: return L"設定・DB・キャッシュの入ったフォルダを開きます";
         case CMD_OPEN_LOGS: return L"動作履歴（ログ）のフォルダを開きます。おかしな動きをした時は、ここの .log を見せてください";
         case CMD_SEARCH: return L"監視フォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
         case CMD_QUERY: return L"画像を 1 枚選んで、それと同じ・類似画像を探します（Ctrl+F）";
@@ -7571,7 +7685,7 @@ void appendMainMenus(HMENU root) {
                         CMD_QUERY_URL, CMD_QUERY_SAME, CMD_QUERY_SIMILAR, CMD_QUERY_TAGS});
     popup(L"タグ(&T)", {CMD_REVIEW, 0, CMD_TAG_YES, CMD_TAG_NO, 0, CMD_BULK_TAG, 0, CMD_UNDO, 0, CMD_TAG_JAPANESE});
     popup(L"その他(&O)", {CMD_SETTINGS, CMD_KEY_SETTINGS, CMD_DICTIONARY, CMD_TAGDICT, CMD_REFS, CMD_INFER_RULES, 0, CMD_STATS, CMD_COMPACT_DB, CMD_ARCHIVE, 0, CMD_INDEXER_TOGGLE, CMD_INDEXER_AUTOSTART, 0, CMD_CHECK_UPDATE, CMD_MODELS, CMD_RELEASES});
-    popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, 0, CMD_ABOUT});
+    popup(L"ヘルプ(&H)", {CMD_HELP, CMD_OPEN_LOGS, CMD_OPEN_DATA, 0, CMD_ABOUT});
 }
 
 void syncMenuChecks() {
@@ -7988,14 +8102,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case CMD_RELEASES: ShellExecuteW(hwnd, L"open", APP_RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL); break;
-                case CMD_ABOUT:
-                    logBox(hwnd,
-                                (L"imgdupe " + widen(IMGDUPE_VERSION) + L"\r\n重複画像検索\r\n\r\n"
-                                 L"github.com/" APP_REPOSITORY L"\r\n\r\n"
-                                 L"設定・キャッシュ: " + app.dataDir)
-                                    .c_str(),
-                                L"バージョン情報", MB_ICONINFORMATION);
-                    break;
+                case CMD_ABOUT: aboutUi(); break;
+                case CMD_OPEN_DATA: ShellExecuteW(hwnd, L"open", app.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
                 case CMD_EXIT: SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
             }
             return 0;
