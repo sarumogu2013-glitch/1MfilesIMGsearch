@@ -3606,7 +3606,7 @@ class ExplorerImpl {
   }
 
   // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
-  SIZE ViewBarSize() const { return SIZE{kRibbonButtons * (RibbonW() + Px(4)), Px(80)}; }
+  SIZE ViewBarSize() const { return SIZE{kRibbonButtons * (RibbonW() + Px(4)), Px(58)}; }  // 今のボタン（main の TB_SETBUTTONSIZE）と同じ高さ
   void LayoutViewBar() {
     // 前のドロップダウン・スライダー・ボタンは隠して、四角いボタンだけにした（v3.12。表示の再編_仕様案.md）
     for (HWND h : {viewLabel, viewBox, sortLabel, sortBox, sortDirBtn, sizeLabel, sizeBox, slider, folderLabel, folderBox, treeBtn, previewBtn})
@@ -3750,14 +3750,11 @@ class ExplorerImpl {
       SetTextColor(dc, RGB(40, 40, 40));
       // 絵と名前の高さは、ホームのリボンの今のボタン（絵 28、その下に名前）にそろえる
       DrawIcon(dc, {r.left, r.top + Px(3), r.right, r.top + Px(31)}, glyphs[i], fallback[i], 28);
+      // 下の文字は 1 行（今のボタンと同じ高さ）。何のボタンかはマウスを載せた時の説明に出す
       HGDIOBJ old = SelectObject(dc, font);
+      const std::wstring v = (i == 0 ? std::wstring(captions[0]) : RibbonValue(i)) + L" ▼";
       RECT cr = {r.left + Px(2), r.top + Px(30), r.right - Px(2), r.top + Px(46)};
-      DrawTextW(dc, captions[i], -1, &cr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
-      SelectObject(dc, smallFont);
-      SetTextColor(dc, RGB(90, 90, 90));
-      const std::wstring v = RibbonValue(i) + L" ▼";
-      RECT vr = {r.left + Px(2), r.top + Px(46), r.right - Px(2), r.top + Px(62)};
-      DrawTextW(dc, v.c_str(), -1, &vr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+      DrawTextW(dc, v.c_str(), -1, &cr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
       SelectObject(dc, old);
     }
   }

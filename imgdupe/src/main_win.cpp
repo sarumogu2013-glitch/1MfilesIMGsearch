@@ -6943,10 +6943,12 @@ void layout() {
         SIZE bar{};
         SendMessageW(app.toolbar, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar));
         const int barW = std::max<int>(bar.cx, px(200));
-        MoveWindow(app.toolbar, m, y, barW, panelH - px(4), TRUE);
+        // ボタン（高さ 58）はリボンの真ん中に（上に寄って下が空いていた）
+        const int btnH = px(58), by = y + std::max(0, (panelH - px(4) - btnH) / 2);
+        MoveWindow(app.toolbar, m, by, barW, btnH, TRUE);
         if (HWND vb = ex.view->ViewBar()) {
             const SIZE vs = ex.view->ViewBarSize();
-            MoveWindow(vb, m + barW + px(16), y, vs.cx, std::min<int>(vs.cy, panelH - px(4)), TRUE);  // 今のボタンと同じ高さに
+            MoveWindow(vb, m + barW + px(16), by, vs.cx, btnH, TRUE);
         }
     } else if (app.tab == 3) {
         // 画像で探す: 左にボタン、真ん中に足した画像、右に生成したタグ・様子
