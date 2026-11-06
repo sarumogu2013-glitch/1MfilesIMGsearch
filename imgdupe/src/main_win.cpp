@@ -6946,7 +6946,7 @@ void layout() {
         MoveWindow(app.toolbar, m, y, barW, panelH - px(4), TRUE);
         if (HWND vb = ex.view->ViewBar()) {
             const SIZE vs = ex.view->ViewBarSize();
-            MoveWindow(vb, m + barW + px(16), y + px(2), vs.cx, std::min<int>(vs.cy, panelH - px(4)), TRUE);
+            MoveWindow(vb, m + barW + px(16), y, vs.cx, std::min<int>(vs.cy, panelH - px(4)), TRUE);  // 今のボタンと同じ高さに
         }
     } else if (app.tab == 3) {
         // 画像で探す: 左にボタン、真ん中に足した画像、右に生成したタグ・様子

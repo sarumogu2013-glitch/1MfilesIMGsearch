@@ -3720,15 +3720,15 @@ class ExplorerImpl {
   }
   // 絵: 記号のフォントがあればその文字、無ければ代わりの文字
   void DrawIcon(HDC dc, RECT r, wchar_t glyph, const wchar_t* fallback, int size) {
-    HFONT f = iconFont;
-    HFONT made = nullptr;
-    if (f && size != 24) f = made = CreateFontW(-Px(size), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
-                                                iconFace.c_str());
-    HGDIOBJ old = SelectObject(dc, f ? HGDIOBJ(f) : HGDIOBJ(font));
+    // ホームのリボンの今のボタン（main_win の createRibbonBar）と同じ大きさ: 記号は 0.8 倍、代わりの漢字は MS UI Gothic の 0.75 倍
+    const bool sym = iconFont != nullptr;
+    HFONT made = CreateFontW(-Px(sym ? size * 8 / 10 : size * 3 / 4), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                             CLEARTYPE_QUALITY, 0, sym ? iconFace.c_str() : L"MS UI Gothic");
+    HGDIOBJ old = SelectObject(dc, made);
     wchar_t g[2] = {glyph, 0};
-    DrawTextW(dc, f ? g : fallback, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, sym ? g : fallback, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old);
-    if (made) DeleteObject(made);
+    DeleteObject(made);
   }
   void PaintRibbon(HDC dc, const RECT& rc) {
     EnsureIconFonts();
@@ -3748,14 +3748,15 @@ class ExplorerImpl {
         DeleteObject(fr);
       }
       SetTextColor(dc, RGB(40, 40, 40));
-      DrawIcon(dc, {r.left, r.top + Px(4), r.right, r.top + Px(34)}, glyphs[i], fallback[i], 24);
+      // 絵と名前の高さは、ホームのリボンの今のボタン（絵 28、その下に名前）にそろえる
+      DrawIcon(dc, {r.left, r.top + Px(3), r.right, r.top + Px(31)}, glyphs[i], fallback[i], 28);
       HGDIOBJ old = SelectObject(dc, font);
-      RECT cr = {r.left + Px(2), r.top + Px(36), r.right - Px(2), r.top + Px(54)};
+      RECT cr = {r.left + Px(2), r.top + Px(30), r.right - Px(2), r.top + Px(46)};
       DrawTextW(dc, captions[i], -1, &cr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
       SelectObject(dc, smallFont);
       SetTextColor(dc, RGB(90, 90, 90));
       const std::wstring v = RibbonValue(i) + L" ▼";
-      RECT vr = {r.left + Px(2), r.top + Px(55), r.right - Px(2), r.bottom - Px(2)};
+      RECT vr = {r.left + Px(2), r.top + Px(46), r.right - Px(2), r.top + Px(62)};
       DrawTextW(dc, v.c_str(), -1, &vr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
       SelectObject(dc, old);
     }
@@ -3917,7 +3918,7 @@ class ExplorerImpl {
         DeleteObject(fr);
       }
       SetTextColor(dc, RGB(50, 50, 50));
-      DrawIcon(dc, r, glyphs[i], fallback[i], 14);
+      DrawIcon(dc, r, glyphs[i], fallback[i], 18);
     }
   }
   static LRESULT CALLBACK StatusIconsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
