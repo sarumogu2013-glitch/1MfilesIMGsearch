@@ -3606,7 +3606,11 @@ class ExplorerImpl {
   }
 
   // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
-  SIZE ViewBarSize() const { return SIZE{kRibbonButtons * (RibbonW() + Px(4)), Px(58)}; }  // 今のボタン（main の TB_SETBUTTONSIZE）と同じ高さ
+  SIZE ViewBarSize() const {
+    int w = 0;
+    for (int k = 0; k < kRibbonButtons; k++) w += RibbonW(k);
+    return SIZE{w, Px(58)};  // 高さは今のボタン（main の TB_SETBUTTONSIZE）と同じ
+  }  // 今のボタン（main の TB_SETBUTTONSIZE）と同じ高さ
   void LayoutViewBar() {
     // 前のドロップダウン・スライダー・ボタンは隠して、四角いボタンだけにした（v3.12。表示の再編_仕様案.md）
     for (HWND h : {viewLabel, viewBox, sortLabel, sortBox, sortDirBtn, sizeLabel, sizeBox, slider, folderLabel, folderBox, treeBtn, previewBtn})
@@ -3618,12 +3622,36 @@ class ExplorerImpl {
 
   // ---- 表示の四角いボタンとステータスバーのアイコン
   static constexpr int kRibbonButtons = 4;  // ペイン・表示・並び順・表紙
-  int RibbonW() const { return Px(92); }
+  // 並べる順: 表示・ペイン・表紙・並び順（中の番号は 0 ペイン・1 表示・2 並び順・3 表紙のまま）
+  static constexpr int kRibbonOrder[kRibbonButtons] = {1, 0, 3, 2};
+  // 幅: ホームのリボンの今のボタンと同じく、下の文字に合わせる（一番長い値の幅。最低 64）
+  int RibbonW(int i) const {
+    std::vector<std::wstring> labels;
+    if (i == 0) labels = {L"ペイン ▼"};
+    else if (i == 1) labels = {L"詳細 ▼", L"普通 ▼", L"可変 ▼"};
+    else if (i == 2) labels = {L"更新日時↓ ▼", L"検索結果↓ ▼"};
+    else labels = {L"表紙 ▼"};
+    HDC dc = GetDC(nullptr);
+    HGDIOBJ old = SelectObject(dc, font);
+    int w = 0;
+    for (const auto& l : labels) {
+      SIZE sz = {};
+      GetTextExtentPoint32W(dc, l.c_str(), int(l.size()), &sz);
+      w = std::max(w, int(sz.cx));
+    }
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    return std::max(Px(64), w + Px(14));
+  }
   RECT RibbonRect(int i) const {
     RECT rc;
     GetClientRect(ribbonWnd, &rc);
-    const int x = i * (RibbonW() + Px(4));
-    return RECT{x, 0, x + RibbonW(), rc.bottom};
+    int x = 0;
+    for (int k : kRibbonOrder) {
+      if (k == i) return RECT{x, 0, x + RibbonW(i), rc.bottom};
+      x += RibbonW(k);
+    }
+    return RECT{};
   }
   // 表示（詳細・サムネイルの大きさ）を 1 つの並びに: 0 詳細・1 小・2 普通・3 大・4 可変
   int LayoutIndex() const { return Details() ? 0 : 1 + std::max(0, std::min(3, settings.sizeMode)); }
@@ -3752,7 +3780,12 @@ class ExplorerImpl {
       DrawIcon(dc, {r.left, r.top + Px(3), r.right, r.top + Px(31)}, glyphs[i], fallback[i], 28);
       // 下の文字は 1 行（今のボタンと同じ高さ）。何のボタンかはマウスを載せた時の説明に出す
       HGDIOBJ old = SelectObject(dc, font);
-      const std::wstring v = (i == 0 ? std::wstring(captions[0]) : RibbonValue(i)) + L" ▼";
+      std::wstring v;
+      if (i == 0) v = captions[0];
+      else if (i == 1) v = RibbonValue(1);
+      else if (i == 2) v = std::wstring(SortKey() == kListOrder ? L"検索結果" : SortName(SortKey())) + (settings.sortDesc ? L"↓" : L"↑");
+      else v = captions[3];
+      v += L" ▼";
       RECT cr = {r.left + Px(2), r.top + Px(30), r.right - Px(2), r.top + Px(46)};
       DrawTextW(dc, v.c_str(), -1, &cr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
       SelectObject(dc, old);

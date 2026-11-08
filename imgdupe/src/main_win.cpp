@@ -214,7 +214,7 @@ struct App {
     HWND hwnd = nullptr;
     HWND folders = nullptr, add = nullptr, remove = nullptr, foldersLabel = nullptr;
     HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr, variants = nullptr;
-    HWND toolbar = nullptr;
+    HWND toolbar = nullptr, toolbar2 = nullptr;  // ホームのリボン: 左（開く・手動編集・同一画像）と右（設定など）。間に表示の四角いボタン
     HWND progress = nullptr, status = nullptr;
     HWND groups = nullptr, thumbs = nullptr, info = nullptr;
     HFONT font = nullptr;
@@ -371,14 +371,14 @@ int px(int v) { return static_cast<int>(v * app.scale + 0.5); }
 int stopImage = 0, startImage = 0;  // 検索開始ボタンの絵（検索中は中止の絵にする）
 
 void tbEnable(int id, bool on) {
-    for (HWND bar : {app.toolbar, app.dupBar}) SendMessageW(bar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0));
+    for (HWND bar : {app.toolbar, app.toolbar2, app.dupBar}) SendMessageW(bar, TB_ENABLEBUTTON, id, MAKELPARAM(on ? TRUE : FALSE, 0));
 }
 
 void tbSetText(int id, const wchar_t* text) {
     TBBUTTONINFOW bi{sizeof(bi)};
     bi.dwMask = TBIF_TEXT;
     bi.pszText = const_cast<wchar_t*>(text);
-    for (HWND bar : {app.toolbar, app.dupBar}) SendMessageW(bar, TB_SETBUTTONINFOW, id, reinterpret_cast<LPARAM>(&bi));
+    for (HWND bar : {app.toolbar, app.toolbar2, app.dupBar}) SendMessageW(bar, TB_SETBUTTONINFOW, id, reinterpret_cast<LPARAM>(&bi));
 }
 
 // ---------------------------------------------------------------- 設定
@@ -6386,6 +6386,7 @@ void switchTab(int t) {
     SendMessageW(app.hwnd, WM_SETREDRAW, FALSE, 0);
     layout();  // 先に並べてから出す（前の場所に絵が残らないように）
     ShowWindow(app.toolbar, t == 2 ? SW_SHOW : SW_HIDE);
+    ShowWindow(app.toolbar2, t == 2 ? SW_SHOW : SW_HIDE);
     if (HWND vb = ex.view->ViewBar()) ShowWindow(vb, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : {app.queryBar, app.queryStrip, app.queryTags}) ShowWindow(h, t == 3 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
@@ -6942,14 +6943,19 @@ void layout() {
         // ホーム: 左にボタン、右に表示の設定（表示・並び順・大きさ・表紙・フォルダ一覧・プレビュー）
         SIZE bar{};
         SendMessageW(app.toolbar, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar));
-        const int barW = std::max<int>(bar.cx, px(200));
+        const int barW = std::max<int>(bar.cx, px(100));
         // ボタン（高さ 58）はリボンの真ん中に（上に寄って下が空いていた）
         const int btnH = px(58), by = y + std::max(0, (panelH - px(4) - btnH) / 2);
         MoveWindow(app.toolbar, m, by, barW, btnH, TRUE);
+        int x = m + barW + px(8);
         if (HWND vb = ex.view->ViewBar()) {
             const SIZE vs = ex.view->ViewBarSize();
-            MoveWindow(vb, m + barW + px(16), by, vs.cx, btnH, TRUE);
+            MoveWindow(vb, x, by, vs.cx, btnH, TRUE);
+            x += vs.cx + px(8);
         }
+        SIZE bar2{};
+        SendMessageW(app.toolbar2, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar2));
+        MoveWindow(app.toolbar2, x, by, std::max<int>(bar2.cx, px(100)), btnH, TRUE);
     } else if (app.tab == 3) {
         // 画像で探す: 左にボタン、真ん中に足した画像、右に生成したタグ・様子
         SIZE bar{};
@@ -7556,8 +7562,12 @@ const ToolButton kToolButtons[] = {
     {CMD_COPY_PATH, 0xE8C8, L"複", L"パスをコピー", false},
     {CMD_REFRESH, 0xE72C, L"新", L"再読み込み", true},
     {0, 0, nullptr, nullptr, false},
-    {CMD_FIND_SAME, 0xE71E, L"同", L"同一画像を探す", true},
+    {CMD_TAG_EDIT, 0xE70F, L"編", L"タグの手動編集", true},
     {0, 0, nullptr, nullptr, false},
+    {CMD_FIND_SAME, 0xE71E, L"同", L"同一画像を探す", true},
+};
+// ホームのリボンの右（表示の四角いボタンの右）
+const ToolButton kToolButtons2[] = {
     {CMD_SETTINGS, 0xE713, L"設", L"設定", true},
     {CMD_KEY_SETTINGS, 0xE765, L"鍵", L"キー", true},
     {CMD_CHECK_UPDATE, 0xE895, L"更", L"アップデート", true},
@@ -7608,7 +7618,7 @@ HWND createRibbonBar(const ToolButton (&defs)[N], int id) {
             if (d.id == CMD_SEARCH) startImage = b.iBitmap;
             b.idCommand = d.id;
             b.fsState = d.enabled ? TBSTATE_ENABLED : 0;
-            b.fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+            b.fsStyle = (d.id == CMD_TAG_EDIT ? BTNS_CHECK : BTNS_BUTTON) | BTNS_AUTOSIZE;  // 手動編集は入 / 切
             b.iString = reinterpret_cast<INT_PTR>(d.tip);  // 絵の下に出す
         }
         buttons.push_back(b);
@@ -7623,6 +7633,7 @@ HWND createRibbonBar(const ToolButton (&defs)[N], int id) {
 
 void createToolbar() {
     app.toolbar = createRibbonBar(kToolButtons, IDC_TOOLBAR);
+    app.toolbar2 = createRibbonBar(kToolButtons2, IDC_TOOLBAR);
     app.dupBar = createRibbonBar(kDupButtons, IDC_DUPBAR);
     app.queryBar = createRibbonBar(kQueryButtons, IDC_QUERYBAR);
 }
@@ -7725,6 +7736,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
         case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
         case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
+        case CMD_TAG_EDIT: return L"タグの手動編集を入れる・切る（プレビューのタグをクリックで 確定 → 否定 → そのまま、＋で足す）";
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
         case CMD_HELP: return L"使い方の説明を出します（F1）";
@@ -7747,7 +7759,7 @@ const wchar_t* commandHelp(int id) {
 
 LRESULT onNotify(NMHDR* nm) {
     if (onSearchNotify(nm)) return 0;
-    if ((nm->hwndFrom == app.toolbar || nm->hwndFrom == app.dupBar || nm->hwndFrom == app.queryBar) && nm->code == TBN_GETINFOTIPW) {
+    if ((nm->hwndFrom == app.toolbar || nm->hwndFrom == app.toolbar2 || nm->hwndFrom == app.dupBar || nm->hwndFrom == app.queryBar) && nm->code == TBN_GETINFOTIPW) {
         auto* it = reinterpret_cast<NMTBGETINFOTIPW*>(nm);
         if (const wchar_t* help = commandHelp(it->iItem); help && it->pszText && it->cchTextMax > 0)
             lstrcpynW(it->pszText, help, it->cchTextMax);
@@ -7755,6 +7767,7 @@ LRESULT onNotify(NMHDR* nm) {
     }
     if (nm->code == TTN_GETDISPINFOW &&
         (nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.toolbar, TB_GETTOOLTIPS, 0, 0)) ||
+         nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.toolbar2, TB_GETTOOLTIPS, 0, 0)) ||
          nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.dupBar, TB_GETTOOLTIPS, 0, 0)) ||
          nm->hwndFrom == reinterpret_cast<HWND>(SendMessageW(app.queryBar, TB_GETTOOLTIPS, 0, 0)))) {
         auto* di = reinterpret_cast<NMTTDISPINFOW*>(nm);
@@ -7894,6 +7907,7 @@ void syncMenuChecks() {
     CheckMenuItem(app.menuBar, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(app.menuBar, CMD_TAG_EDIT, MF_BYCOMMAND | (ex.view && ex.view->TagEditing() ? MF_CHECKED : MF_UNCHECKED));
+    SendMessageW(app.toolbar, TB_CHECKBUTTON, CMD_TAG_EDIT, MAKELPARAM(ex.view && ex.view->TagEditing() ? TRUE : FALSE, 0));
     if (ex.view) {
         auto mark = [](int cmd, bool on) { CheckMenuItem(app.menuBar, cmd, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED)); };
         mark(CMD_VIEW_TREE, ex.view->ShowTree());
