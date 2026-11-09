@@ -59,7 +59,7 @@ enum {
   ID_VIEW, ID_SORT, ID_SORT_DIR
 };
 enum { MENU_OPEN = 1, MENU_SHOW, MENU_COPY, MENU_SAME, MENU_ADD_ROOT, MENU_TAG_SEARCH, MENU_TAG_TRAY, MENU_TAG_COPY, MENU_TAG_RENAME, MENU_SAVE_SMART, MENU_BULK_TAG, MENU_SIMILAR_AI,
-       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_EDIT, MENU_TEACH, MENU_TAG_PAGE };
+       MENU_RELOOKUP, MENU_SCAN_TOP, MENU_REMOVE_ROOT, MENU_TAG_EDIT, MENU_TEACH, MENU_TAG_PAGE, MENU_DELETE };
 constexpr int kListOrder = 4;  // 並び順の「検索結果の順」
 constexpr int kFolderSort = 5;  // 詳細表示の「フォルダ」の列（検索の結果）
 constexpr int kIndexSort = 6;   // 詳細表示の「インデックス」の列（進み具合）
@@ -449,6 +449,7 @@ class ExplorerImpl {
   HWND ribbonWnd = nullptr, statusIcons = nullptr, ribbonTip = nullptr, statusTip = nullptr;
   int ribbonHot = -1, statusHot = -1, ribbonWheel = 0;
   HFONT iconFont = nullptr, smallFont = nullptr;
+  int ribbonMinW = 0;  // ボタンの最低の幅（ホームのほかのボタンと同じ 6 文字分。main から）
   std::wstring iconFace;
   HWND viewBox = nullptr, sortBox = nullptr, sortDirBtn = nullptr, trayWnd = nullptr;
   HWND tree = nullptr, preview = nullptr;
@@ -472,6 +473,67 @@ class ExplorerImpl {
   bool dragArmed = false;
   POINT dragFrom = {};
   int collapseOnUp = -1;  // 選んでいるものの上を押した: ドラッグしなければ、離した時にその 1 つだけにする
+
+  // 選んでいるものを削除する（ごみ箱へ。確かめてから）。まとまり（重複のまとまり）は消さない（開いて中を選ぶ）
+  void DeleteSelected() {
+    if (!ConfirmTagEdit()) return;
+    std::vector<std::wstring> paths;
+    bool stack = false;
+    for (int i : PickedIndices()) {
+      const Item& it = items[size_t(i)];
+      if (it.Stack()) stack = true;
+      else if (!it.path.empty()) paths.push_back(it.path);
+    }
+    HWND owner = GetAncestor(hwnd, GA_ROOT);
+    if (paths.empty()) {
+      if (stack) MessageBoxW(owner, L"まとまりはそのままでは削除できません。開いて、中の画像を選んでから削除してください。", L"削除", MB_ICONINFORMATION);
+      return;
+    }
+    std::wstring names;
+    for (size_t k = 0; k < paths.size() && k < 5; k++) names += L"\r\n" + paths[k].substr(paths[k].find_last_of(L"\\/") + 1);
+    if (paths.size() > 5) names += L"\r\n…ほか " + std::to_wstring(paths.size() - 5) + L" 個";
+    std::wstring msg = std::to_wstring(paths.size()) + L" 個をごみ箱に移しますか？" + names;
+    if (stack) msg += L"\r\n\r\n（まとまりは削除しません）";
+    if (MessageBoxW(owner, msg.c_str(), L"削除", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    std::wstring from;
+    for (const auto& p : paths) {
+      from += p;
+      from.push_back(L'\0');
+    }
+    from.push_back(L'\0');
+    SHFILEOPSTRUCTW op = {};
+    op.hwnd = owner;
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;  // ごみ箱へ（入らない時は Windows が確かめる）
+    SHFileOperationW(&op);
+    // 消えたものを一覧から外す（フォルダは読み直す）
+    std::wstring next;
+    if (!PickedIndices().empty()) {
+      const int last = PickedIndices().back();
+      for (int k = last + 1; k < int(items.size()); k++)
+        if (GetFileAttributesW(items[size_t(k)].path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+          next = items[size_t(k)].path;
+          break;
+        }
+    }
+    if (listMode) {
+      items.erase(std::remove_if(items.begin(), items.end(),
+                                 [](const Item& it) { return !it.Stack() && GetFileAttributesW(it.path.c_str()) == INVALID_FILE_ATTRIBUTES; }),
+                  items.end());
+      multi = false;
+      sel = -1;
+      for (int k = 0; k < int(items.size()); k++)
+        if (items[size_t(k)].path == next) sel = k;
+      if (sel < 0 && !items.empty()) sel = 0;
+      UpdateScroll();
+      InvalidateRect(grid, nullptr, FALSE);
+      UpdatePreview(true);
+      NotifySelected();
+    } else {
+      Load(dir, next);
+    }
+  }
 
   void StartDragOut() {
     std::vector<std::wstring> paths;
@@ -591,6 +653,12 @@ class ExplorerImpl {
   }
   int HitTest(POINT pt) const {
     if (pt.y < HeaderH()) return -1;
+    if (Details()) {
+      // 詳細は行のどこでも（空いている列・名前より右も）その行。押してそのままドラッグできるように
+      if (pt.x < 0 || pt.x >= GridW()) return -1;
+      const int row = (pt.y - HeaderH() + scrollY) / std::max(1, CellH());
+      return pt.y - HeaderH() + scrollY >= 0 && row < int(items.size()) ? row : -1;
+    }
     for (int i = 0; i < int(items.size()); i++) {
       RECT r = CellRect(i);
       if (PtInRect(&r, pt)) return i;
@@ -1540,6 +1608,7 @@ class ExplorerImpl {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, MENU_COPY, (L"パスをコピー（" + n + L" 個）(&C)").c_str());
     AppendMenuW(menu, MF_STRING, MENU_SHOW, L"エクスプローラーで表示(&E)");
+    AppendMenuW(menu, MF_STRING, MENU_DELETE, (L"削除（ごみ箱へ。" + n + L" 個）(&D)").c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     UINT on = images ? MF_STRING : MF_STRING | MF_GRAYED;
     AppendMenuW(menu, on, MENU_SAVE_SMART, (L"選んだ画像（" + ni + L" 枚）をスマートフォルダに保存(&M)...").c_str());
@@ -1561,6 +1630,7 @@ class ExplorerImpl {
         break;
       }
       case MENU_SHOW: ShowInShell(SelectedPath()); break;
+      case MENU_DELETE: DeleteSelected(); break;
       case MENU_SAVE_SMART: host->ExplorerSaveSelection(); break;
       case MENU_TAG_EDIT: SetTagEditing(!tagEdit); break;
       case MENU_ADD_ROOT:
@@ -1586,6 +1656,7 @@ class ExplorerImpl {
     AppendMenuW(menu, MF_STRING, MENU_OPEN, L"開く(&O)");
     AppendMenuW(menu, MF_STRING, MENU_SHOW, L"エクスプローラーで表示(&E)");
     AppendMenuW(menu, MF_STRING, MENU_COPY, L"パスをコピー(&C)");
+    if (!it.Stack()) AppendMenuW(menu, MF_STRING, MENU_DELETE, L"削除（ごみ箱へ）(&D)");
     if (it.image) {
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, MENU_SAME, L"同一画像を探す(&S)");
@@ -1615,6 +1686,7 @@ class ExplorerImpl {
     switch (cmd) {
       case MENU_OPEN: Open(i); break;
       case MENU_SHOW: ShowInShell(path); break;
+      case MENU_DELETE: DeleteSelected(); break;
       case MENU_COPY: CopyText(path); break;
       case MENU_SAME: host->ExplorerFindSameFile(path); break;
       case MENU_SIMILAR_AI: host->ExplorerFindSimilarAi(path); break;
@@ -3641,7 +3713,7 @@ class ExplorerImpl {
     }
     SelectObject(dc, old);
     ReleaseDC(nullptr, dc);
-    return std::max(Px(64), w + Px(14));
+    return std::max({Px(64), ribbonMinW, w + Px(14)});
   }
   RECT RibbonRect(int i) const {
     RECT rc;
@@ -4956,7 +5028,10 @@ void Explorer::Move(const RECT& r) {
 
 HWND Explorer::Window() const { return impl_->hwnd; }
 HWND Explorer::ViewBar() const { return impl_->viewBar; }
-SIZE Explorer::ViewBarSize() const { return impl_->ViewBarSize(); }
+SIZE Explorer::ViewBarSize(int minButtonW) const {
+  impl_->ribbonMinW = minButtonW;
+  return impl_->ViewBarSize();
+}
 
 std::wstring Explorer::Dir() const { return impl_->dir; }
 
@@ -4990,6 +5065,7 @@ void Explorer::SetGroups(const std::wstring& title, std::vector<ExplorerGroup> g
 
 void Explorer::AddTrayTag(const std::wstring& tag) { impl_->AddTray(tag); }
 bool Explorer::TagEditing() const { return impl_->tagEdit; }
+void Explorer::DeleteSelected() { impl_->DeleteSelected(); }
 bool Explorer::ShowTree() const { return impl_->settings.showTree; }
 bool Explorer::ShowPreview() const { return impl_->settings.showPreview; }
 void Explorer::TogglePane(bool tree) { impl_->TogglePanel(tree); }

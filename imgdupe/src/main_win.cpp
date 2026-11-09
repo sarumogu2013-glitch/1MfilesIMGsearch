@@ -214,7 +214,9 @@ struct App {
     HWND hwnd = nullptr;
     HWND folders = nullptr, add = nullptr, remove = nullptr, foldersLabel = nullptr;
     HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr, variants = nullptr;
-    HWND toolbar = nullptr, toolbar2 = nullptr;  // ホームのリボン: 左（開く・手動編集・同一画像）と右（設定など）。間に表示の四角いボタン
+    HWND toolbar = nullptr, toolbar2 = nullptr;
+    HWND homeSep1 = nullptr, homeSep2 = nullptr;
+    int homeButtonW = 0;  // ホームのボタンの最低の幅（6 文字分）  // ホームのリボンの仕切り（同一画像と表示の間、並び順と設定の間）  // ホームのリボン: 左（開く・手動編集・同一画像）と右（設定など）。間に表示の四角いボタン
     HWND progress = nullptr, status = nullptr;
     HWND groups = nullptr, thumbs = nullptr, info = nullptr;
     HFONT font = nullptr;
@@ -6387,6 +6389,7 @@ void switchTab(int t) {
     layout();  // 先に並べてから出す（前の場所に絵が残らないように）
     ShowWindow(app.toolbar, t == 2 ? SW_SHOW : SW_HIDE);
     ShowWindow(app.toolbar2, t == 2 ? SW_SHOW : SW_HIDE);
+    for (HWND h : {app.homeSep1, app.homeSep2}) ShowWindow(h, t == 2 ? SW_SHOW : SW_HIDE);
     if (HWND vb = ex.view->ViewBar()) ShowWindow(vb, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : {app.queryBar, app.queryStrip, app.queryTags}) ShowWindow(h, t == 3 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
@@ -6947,12 +6950,16 @@ void layout() {
         // ボタン（高さ 58）はリボンの真ん中に（上に寄って下が空いていた）
         const int btnH = px(58), by = y + std::max(0, (panelH - px(4) - btnH) / 2);
         MoveWindow(app.toolbar, m, by, barW, btnH, TRUE);
-        int x = m + barW + px(8);
+        int x = m + barW + px(4);
+        MoveWindow(app.homeSep1, x, by + px(4), 2, btnH - px(8), TRUE);
+        x += px(6);
         if (HWND vb = ex.view->ViewBar()) {
-            const SIZE vs = ex.view->ViewBarSize();
+            const SIZE vs = ex.view->ViewBarSize(app.homeButtonW);
             MoveWindow(vb, x, by, vs.cx, btnH, TRUE);
-            x += vs.cx + px(8);
+            x += vs.cx + px(4);
         }
+        MoveWindow(app.homeSep2, x, by + px(4), 2, btnH - px(8), TRUE);
+        x += px(6);
         SIZE bar2{};
         SendMessageW(app.toolbar2, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar2));
         MoveWindow(app.toolbar2, x, by, std::max<int>(bar2.cx, px(100)), btnH, TRUE);
@@ -7563,7 +7570,6 @@ const ToolButton kToolButtons[] = {
     {CMD_REFRESH, 0xE72C, L"新", L"再読み込み", true},
     {0, 0, nullptr, nullptr, false},
     {CMD_TAG_EDIT, 0xE70F, L"編", L"タグの手動編集", true},
-    {0, 0, nullptr, nullptr, false},
     {CMD_FIND_SAME, 0xE71E, L"同", L"同一画像を探す", true},
 };
 // ホームのリボンの右（表示の四角いボタンの右）
@@ -7634,6 +7640,41 @@ HWND createRibbonBar(const ToolButton (&defs)[N], int id) {
 void createToolbar() {
     app.toolbar = createRibbonBar(kToolButtons, IDC_TOOLBAR);
     app.toolbar2 = createRibbonBar(kToolButtons2, IDC_TOOLBAR);
+    // ホームのボタンの幅: 6 文字までの名前は 6 文字の幅にそろえる
+    {
+        HDC dc = GetDC(app.hwnd);
+        HGDIOBJ old = SelectObject(dc, app.font);
+        SIZE six{};
+        GetTextExtentPoint32W(dc, L"あいうえおか", 6, &six);
+        SelectObject(dc, old);
+        ReleaseDC(app.hwnd, dc);
+        app.homeButtonW = six.cx + px(12);
+        // 名前に合わせて広げる（BTNS_AUTOSIZE は最低の幅を見ないので、ボタンごとに幅を決める）
+        HDC dc2 = GetDC(app.hwnd);
+        HGDIOBJ old2 = SelectObject(dc2, app.font);
+        for (HWND bar : {app.toolbar, app.toolbar2}) {
+            const int n = static_cast<int>(SendMessageW(bar, TB_BUTTONCOUNT, 0, 0));
+            for (int k = 0; k < n; ++k) {
+                TBBUTTON b{};
+                SendMessageW(bar, TB_GETBUTTON, k, reinterpret_cast<LPARAM>(&b));
+                if (b.fsStyle & BTNS_SEP) continue;
+                wchar_t text[128] = L"";
+                SendMessageW(bar, TB_GETBUTTONTEXTW, b.idCommand, reinterpret_cast<LPARAM>(text));
+                SIZE t{};
+                GetTextExtentPoint32W(dc2, text, lstrlenW(text), &t);
+                TBBUTTONINFOW bi{sizeof(bi)};
+                bi.dwMask = TBIF_SIZE | TBIF_STYLE;
+                bi.fsStyle = static_cast<BYTE>(b.fsStyle & ~BTNS_AUTOSIZE);
+                bi.cx = static_cast<WORD>(std::max<int>(app.homeButtonW, t.cx + px(12)));
+                SendMessageW(bar, TB_SETBUTTONINFOW, b.idCommand, reinterpret_cast<LPARAM>(&bi));
+            }
+            SendMessageW(bar, TB_AUTOSIZE, 0, 0);
+        }
+        SelectObject(dc2, old2);
+        ReleaseDC(app.hwnd, dc2);
+    }
+    for (HWND* sep : {&app.homeSep1, &app.homeSep2})
+        *sep = CreateWindowExW(0, WC_STATICW, L"", WS_CHILD | SS_ETCHEDVERT, 0, 0, 2, 10, app.hwnd, nullptr, app.inst, nullptr);
     app.dupBar = createRibbonBar(kDupButtons, IDC_DUPBAR);
     app.queryBar = createRibbonBar(kQueryButtons, IDC_QUERYBAR);
 }
@@ -7736,6 +7777,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
         case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
         case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
+        case CMD_DELETE: return L"選んでいるファイル・フォルダをごみ箱に移します（確かめてから。Delete キーでも）";
         case CMD_TAG_EDIT: return L"タグの手動編集を入れる・切る（プレビューのタグをクリックで 確定 → 否定 → そのまま、＋で足す）";
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
@@ -7874,7 +7916,7 @@ void appendMainMenus(HMENU root) {
         AppendMenuW(parent, MF_POPUP, reinterpret_cast<UINT_PTR>(m), title);
     };
     auto popup = [&](const wchar_t* title, std::initializer_list<int> cmds) { sub(root, title, cmds); };
-    popup(L"ファイル(&F)", {CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE,
+    popup(L"ファイル(&F)", {CMD_DELETE, 0, CMD_MANAGE_ROOTS, CMD_SCAN_FOLDER, CMD_SCAN_FOLDER_TOP, CMD_SCAN_TASKS, 0, CMD_INDEXER_TOGGLE,
                             CMD_INDEXER_AUTOSTART, 0, CMD_EXIT});
     HMENU view = CreatePopupMenu();
     fill(view, {CMD_TAB_EXPLORER, CMD_TAB_DUPES, CMD_TAB_SEARCH, CMD_TAB_QUERY, 0, CMD_REFRESH, 0, CMD_VIEW_TREE, CMD_VIEW_PREVIEW, 0,
@@ -8316,6 +8358,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_COVER_1: case CMD_COVER_2: case CMD_COVER_3: case CMD_COVER_4: case CMD_COVER_5:
                     if (ex.view) ex.view->SetFolderStyle(LOWORD(wp) - CMD_COVER_1);
                     syncMenuChecks();
+                    break;
+                case CMD_DELETE:
+                    if (ex.view && ex.view->Visible()) ex.view->DeleteSelected();
                     break;
                 case CMD_TAG_EDIT:
                     if (ex.view) ex.view->SetTagEditing(!ex.view->TagEditing());

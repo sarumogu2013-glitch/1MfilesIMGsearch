@@ -96,6 +96,7 @@ enum Cmd : int {
     CMD_COVER_3,
     CMD_COVER_4,
     CMD_COVER_5,
+    CMD_DELETE,           // 削除（ごみ箱へ）
 };
 
 struct CmdInfo {

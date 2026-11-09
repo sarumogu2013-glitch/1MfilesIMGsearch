@@ -115,6 +115,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_COVER_3, "Cover3", L"最後と 1 枚目(&3)", ""},
     {CMD_COVER_4, "Cover4", L"最後(&4)", ""},
     {CMD_COVER_5, "Cover5", L"最後の一つ前と最後(&5)", ""},
+    {CMD_DELETE, "Delete", L"削除（ごみ箱へ）(&D)", "Delete"},
 };
 
 std::string trim(const std::string& s) {

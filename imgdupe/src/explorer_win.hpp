@@ -126,7 +126,7 @@ class Explorer {
   void Move(const RECT& r);
   HWND Window() const;
   HWND ViewBar() const;            // 表示・並び順・大きさ・表紙・パネルの切り替え（ホストのリボンに置く。親はホストの窓）
-  SIZE ViewBarSize() const;
+  SIZE ViewBarSize(int minButtonW = 0) const;  // minButtonW: ボタンの最低の幅（ホームのほかのボタンにそろえる）
   std::wstring Dir() const;
   std::wstring Selected() const;                    // 今の項目（プレビューに出しているもの）
   std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）
@@ -148,6 +148,7 @@ class Explorer {
   // 重複のまとまりを真ん中の一覧に出す（まとまりは重なった絵）
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups);
   void AddTrayTag(const std::wstring& tag);
+  void DeleteSelected();  // 選んでいるものを削除（ごみ箱へ。確かめてから）
   // 表示（ホストのメニューから）
   bool ShowTree() const;
   bool ShowPreview() const;
