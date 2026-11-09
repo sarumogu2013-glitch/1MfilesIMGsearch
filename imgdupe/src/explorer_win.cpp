@@ -469,6 +469,8 @@ class ExplorerImpl {
   bool banding = false, bandMoved = false;
   POINT bandFrom = {}, bandTo = {};
   std::vector<char> bandBase;  // 囲み始めた時の選び方 (Ctrl を押していれば足す)
+  int bandRow = -1;            // 詳細の白い所から囲み始めた行（動かさずに離したらその行を選ぶ）
+  bool bandCtrl = false, bandShift = false;
   // 項目を押したまま動かすと、外へファイルをドラッグする
   bool dragArmed = false;
   POINT dragFrom = {};
@@ -651,13 +653,32 @@ class ExplorerImpl {
     int rows = (int(items.size()) + Cols() - 1) / Cols();
     return (Details() ? HeaderH() : Pad()) + Pad() + rows * CellH();
   }
+  // 詳細の行（横の位置は見ない）
+  int RowAt(POINT pt) const {
+    if (!Details()) return HitTest(pt);
+    if (pt.y < HeaderH() || pt.x < 0 || pt.x >= GridW()) return -1;
+    const int y = pt.y - HeaderH() + scrollY;
+    const int row = y / std::max(1, CellH());
+    return y >= 0 && row < int(items.size()) ? row : -1;
+  }
+  // 項目そのもの（掴んでドラッグできる所）。詳細は Windows のエクスプローラーと同じく、名前（アイコンと文字）の上だけ。
+  // ほかの白い所から押すと、枠で囲んで選ぶ（クリックだけならその行を選ぶ）
   int HitTest(POINT pt) const {
     if (pt.y < HeaderH()) return -1;
     if (Details()) {
-      // 詳細は行のどこでも（空いている列・名前より右も）その行。押してそのままドラッグできるように
-      if (pt.x < 0 || pt.x >= GridW()) return -1;
-      const int row = (pt.y - HeaderH() + scrollY) / std::max(1, CellH());
-      return pt.y - HeaderH() + scrollY >= 0 && row < int(items.size()) ? row : -1;
+      const int row = RowAt(pt);
+      if (row < 0) return -1;
+      const auto cols = DetailColumns();
+      if (cols.empty()) return row;
+      HDC dc = GetDC(grid);
+      HGDIOBJ old = SelectObject(dc, font);
+      const std::wstring name = DisplayName(items[size_t(row)]);
+      SIZE sz = {};
+      GetTextExtentPoint32W(dc, name.c_str(), int(name.size()), &sz);
+      SelectObject(dc, old);
+      ReleaseDC(grid, dc);
+      const int pad = Px(6), right = std::min<int>(cols[0].right - pad, cols[0].left + pad + Px(16) + Px(6) + sz.cx);
+      return pt.x >= cols[0].left + pad - Px(2) && pt.x <= right + Px(2) ? row : -1;
     }
     for (int i = 0; i < int(items.size()); i++) {
       RECT r = CellRect(i);
@@ -3261,7 +3282,7 @@ class ExplorerImpl {
     if (WindowFromPoint(screen) != grid) return -1;
     POINT pt = screen;
     ScreenToClient(grid, &pt);
-    const int i = HitTest(pt);
+    const int i = RowAt(pt);  // タグを落とす先は行のどこでも
     return i >= 0 && (items[size_t(i)].image || items[size_t(i)].Stack()) ? i : -1;
   }
   void SetTagDropItem(int i) {
@@ -4559,7 +4580,7 @@ class ExplorerImpl {
           TrackMouseEvent(&tme);
           tracking = true;
         }
-        int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        int h = RowAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});  // 詳細は行のどこでも明るくする
         if (h != hover) {
           hover = h;
           InvalidateRect(grid, nullptr, FALSE);
@@ -4591,7 +4612,8 @@ class ExplorerImpl {
               SetSort(c.sortKey, c.sortKey == SortKey() ? !settings.sortDesc : false);
           return 0;
         }
-        int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        // 右クリックは行のどこでも、左は名前の上だけ（詳細の白い所は、枠で囲んで選ぶ）
+        int h = msg == WM_RBUTTONDOWN ? RowAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}) : HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
         bool ctrl = (wp & MK_CONTROL) != 0, shift = (wp & MK_SHIFT) != 0;
         // 選ぶ画像が変わる時は、手動編集の保存していない変更を確かめる（キャンセルなら選ばない）
         const bool keeps = h >= 0 && ((msg == WM_RBUTTONDOWN && IsPicked(h)) ||
@@ -4623,6 +4645,9 @@ class ExplorerImpl {
           // 空いている所から: 枠で囲んで選ぶ
           banding = true;
           bandMoved = false;
+          bandRow = RowAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+          bandCtrl = ctrl;
+          bandShift = shift;
           bandFrom = bandTo = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp) + scrollY};
           bandBase.assign(items.size(), 0);
           if (ctrl)
@@ -4647,7 +4672,9 @@ class ExplorerImpl {
         if (banding) {
           banding = false;
           ReleaseCapture();
-          if (bandMoved) {
+          if (!bandMoved && bandRow >= 0 && bandRow < int(items.size())) {
+            SelectWith(bandRow, bandCtrl, bandShift);  // 詳細の白い所をクリックだけ: その行を選ぶ
+          } else if (bandMoved) {
             multi = true;
             if (!IsPicked(sel)) {
               auto picked = PickedIndices();
@@ -4673,7 +4700,7 @@ class ExplorerImpl {
         return 0;
       case WM_RBUTTONUP: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        int h = HitTest(pt);
+        int h = RowAt(pt);
         if (h >= 0) {
           ClientToScreen(grid, &pt);
           ContextMenu(h, pt);
@@ -4702,7 +4729,7 @@ class ExplorerImpl {
           }
           return 0;
         }
-        int h = HitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        int h = RowAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
         if (h >= 0) Open(h);
         return 0;
       }
