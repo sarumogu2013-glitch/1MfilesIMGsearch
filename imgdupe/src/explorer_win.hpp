@@ -131,6 +131,10 @@ class Explorer {
   HWND Window() const;
   HWND ViewBar() const;            // 表示・並び順・大きさ・表紙・パネルの切り替え（ホストのリボンに置く。親はホストの窓）
   SIZE ViewBarSize(int minButtonW = 0) const;  // minButtonW: ボタンの最低の幅（ホームのほかのボタンにそろえる）
+  // 表示の四角いボタン（並べる順）: 種類（0 ペイン・1 表示・2 並び順・3 表紙）と幅
+  std::vector<std::pair<int, int>> ViewButtons(int minButtonW = 0) const;
+  // 先頭から count 個だけ出す（窓が狭い時。残りはホストが「…」のメニューに出す）
+  void SetViewButtonsVisible(int count);
   std::wstring Dir() const;
   std::wstring Selected() const;                    // 今の項目（プレビューに出しているもの）
   std::vector<std::wstring> SelectedPaths() const;  // 選んでいるもの全部（Ctrl・Shift・枠で囲んで、いくつも選べる）

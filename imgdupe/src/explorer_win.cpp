@@ -2545,10 +2545,39 @@ class ExplorerImpl {
 
   // 切り替えのボタン
   std::vector<std::pair<RECT, int>> previewTabHits;
+  // プレビュー全体の縦のスクロール（タグ・プロパティが入りきらない時）。描く時は中身の座標（上からの位置）で描き、
+  // 画面へは previewScrollY だけ上にずらす。当たりの四角（tagHits など）も中身の座標
+  int previewScrollY = 0, previewContentH = 0;
+  void ScrollPreviewTo(int y) {
+    RECT rc;
+    GetClientRect(preview, &rc);
+    y = std::max(0, std::min(y, std::max(0, previewContentH - int(rc.bottom))));
+    if (y == previewScrollY) return;
+    CancelPlusEdit();
+    previewScrollY = y;
+    InvalidateRect(preview, nullptr, FALSE);
+  }
+  // 描いた後: スクロールバーを今の中身の高さに合わせる（いつも出しておき、要らない時は使えなくする。幅が変わらないように）
+  void UpdatePreviewScroll(int clientH) {
+    const int maxY = std::max(0, previewContentH - clientH);
+    if (previewScrollY > maxY) {
+      previewScrollY = maxY;
+      InvalidateRect(preview, nullptr, FALSE);
+    }
+    SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL};
+    si.nMin = 0;
+    si.nMax = std::max(previewContentH, clientH) - 1;
+    si.nPage = UINT(std::max(1, clientH));
+    si.nPos = previewScrollY;
+    SCROLLINFO cur = {sizeof(cur), SIF_RANGE | SIF_PAGE | SIF_POS};
+    GetScrollInfo(preview, SB_VERT, &cur);
+    if (cur.nMax != si.nMax || cur.nPage != si.nPage || cur.nPos != si.nPos) SetScrollInfo(preview, SB_VERT, &si, TRUE);
+  }
 
   void SetPreviewMode(int mode) {
     if (mode == settings.previewMode) return;
     settings.previewMode = mode;
+    previewScrollY = 0;
     host->ExplorerSettingsChanged(settings);
     InvalidateRect(preview, nullptr, FALSE);
     UpdatePreview(true);  // 大きさが変わるので読み直す
@@ -2579,6 +2608,7 @@ class ExplorerImpl {
     if (path != previewPath) {
       ClearPreviewThumb();
       previewPath = path;
+      previewScrollY = 0;
       previewInfoOk = !path.empty() && GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &previewInfo);
     }
     if (it && it->Thumbable()) {
@@ -2628,15 +2658,14 @@ class ExplorerImpl {
     return L"";
   }
 
+  // 中身を描く（背景と左の境目は呼ぶ側。dc は previewScrollY だけ上にずらしてある）。中身の高さを previewContentH に残す
   void PaintPreview(HDC dc, const RECT& rc) {
-    Fill(dc, rc, RGB(246, 246, 246));
-    // 左の境目
-    Fill(dc, {rc.left, rc.top, rc.left + 1, rc.bottom}, RGB(220, 220, 220));
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = SelectObject(dc, nameFont);
     const Item* it = PreviewItem();
     tagHits.clear();
     editSaveR = editCancelR = plusR = RECT{};
+    previewContentH = 0;
     if (!it) {
       RECT tr = rc;
       SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
@@ -2706,6 +2735,7 @@ class ExplorerImpl {
       y = measure.bottom + Px(8);
     }
     if (settings.previewMode == 0) {  // 画像だけ
+      previewContentH = box.bottom + Px(8);
       SelectObject(dc, oldFont);
       return;
     }
@@ -2754,10 +2784,10 @@ class ExplorerImpl {
       }
       const int labelW = Px(100);
       for (const auto& [k, v] : rows) {
-        if (y > nr.bottom) break;
-        RECT vr = {nr.left + (k.empty() ? 0 : labelW), y, nr.right, nr.bottom};
+        RECT vr = {nr.left + (k.empty() ? 0 : labelW), y, nr.right, y + Px(4000)};  // 入りきらなければスクロールで見る
         RECT calc = vr;
         DrawTextW(dc, v.c_str(), -1, &calc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_CALCRECT);
+        vr.bottom = std::max(calc.bottom, LONG(y + Px(18)));
         if (!k.empty()) {
           RECT kr = {nr.left, y, nr.left + labelW - Px(6), y + Px(20)};
           SetTextColor(dc, RGB(110, 110, 110));
@@ -2767,16 +2797,22 @@ class ExplorerImpl {
         DrawTextW(dc, v.c_str(), -1, &vr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
         y += std::max(int(calc.bottom - calc.top), Px(18)) + Px(4);
       }
+      previewContentH = y + Px(8);
       SelectObject(dc, oldFont);
       return;
     }
     // タグ
     if (it->image || many) y = PaintTags(dc, nr, y, rc);
     if (showName) {
-      RECT ir = {nr.left, y, nr.right, nr.bottom};
+      RECT ir = {nr.left, y, nr.right, y + Px(4000)};
+      RECT calc = ir;
+      DrawTextW(dc, info.c_str(), -1, &calc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+      ir.bottom = calc.bottom;
       SetTextColor(dc, RGB(96, 96, 96));
       DrawTextW(dc, info.c_str(), -1, &ir, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+      y = ir.bottom;
     }
+    previewContentH = y + Px(8);
     SelectObject(dc, oldFont);
   }
 
@@ -2835,7 +2871,6 @@ class ExplorerImpl {
           y += Px(24);
         }
       };
-      bool full = false;
       for (size_t i = 0; i < shownTags.size(); i++) {
         const ExplorerTag& t = shownTags[i];
         if (t.file != (pass == 0)) continue;
@@ -2863,14 +2898,11 @@ class ExplorerImpl {
         SIZE sz = {};
         GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &sz);
         place(sz.cx + Px(14));
-        if (y + Px(20) > rc.bottom) {
-          if (prev) SelectObject(dc, prev);
-          full = true;
-          break;
-        }
-        RECT r = DrawChip(dc, x, y, label, color, filled);
+        // 入りきらない分は、プレビューをスクロールして見る。見えていない札は描かない（当たりの四角だけ作る）
+        const bool visible = y + Px(24) >= previewScrollY && y <= previewScrollY + int(rc.bottom - rc.top);
+        RECT r = visible ? DrawChip(dc, x, y, label, color, filled) : RECT{x, y, x + sz.cx + Px(14), y + Px(20)};
         if (prev) SelectObject(dc, prev);
-        if (changed) {
+        if (changed && visible) {
           // まだ保存していない変更: 太い点線の枠
           LOGBRUSH lb = {BS_SOLID, RGB(40, 40, 40), 0};
           HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_DOT, std::max(2, Px(2)), &lb, 0, nullptr);
@@ -2883,9 +2915,9 @@ class ExplorerImpl {
         tagHits.push_back({r, i});
         x = r.right + Px(5);
       }
-      if (tagEdit && pass == 1 && !full) {
+      if (tagEdit && pass == 1) {
         place(Px(28));
-        if (y + Px(20) <= rc.bottom) plusR = DrawChip(dc, x, y, L"＋", RGB(0, 100, 220), false);
+        plusR = DrawChip(dc, x, y, L"＋", RGB(0, 100, 220), false);
       }
       y += Px(28);
     }
@@ -3033,7 +3065,7 @@ class ExplorerImpl {
   void StartPlusEdit() {
     CancelPlusEdit();
     if (plusR.right <= plusR.left) return;
-    plusEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, plusR.left, plusR.top,
+    plusEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, plusR.left, plusR.top - previewScrollY,
                                Px(180), plusR.bottom - plusR.top, preview, nullptr, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(plusEdit, WM_SETFONT, WPARAM(font), TRUE);
     SendMessageW(plusEdit, EM_SETCUEBANNER, TRUE, LPARAM(L"タグ（表示名でも）"));
@@ -3146,6 +3178,7 @@ class ExplorerImpl {
     const std::wstring key = PathsKey(paths) + (tagEdit ? L"|edit" : L"");
     if (key == previewTagsKey) return;
     previewTagsKey = key;
+    previewScrollY = 0;  // 選ぶ画像が変わった: 上から
     ++summaryToken[0];  // 前に頼んだ分は捨てる
     summaryLoading[0] = false;
     if (paths.size() > kMaxTagImages) paths.resize(kMaxTagImages);
@@ -3763,7 +3796,7 @@ class ExplorerImpl {
   // ホームのリボンに置く部品（3 段: 表示・並び順 / 大きさ・表紙 / フォルダ一覧・プレビュー）
   SIZE ViewBarSize() const {
     int w = 0;
-    for (int k = 0; k < kRibbonButtons; k++) w += RibbonW(k);
+    for (int pos = 0; pos < ribbonVisible && pos < kRibbonButtons; pos++) w += RibbonW(kRibbonOrder[pos]);
     return SIZE{w, Px(58)};  // 高さは今のボタン（main の TB_SETBUTTONSIZE）と同じ
   }  // 今のボタン（main の TB_SETBUTTONSIZE）と同じ高さ
   void LayoutViewBar() {
@@ -3798,15 +3831,22 @@ class ExplorerImpl {
     ReleaseDC(nullptr, dc);
     return std::max({Px(64), ribbonMinW, w + Px(14)});
   }
+  int ribbonVisible = kRibbonButtons;  // 並べる順で、先頭からこの数だけ出す（窓が狭い時、残りはホストの「…」のメニューへ）
   RECT RibbonRect(int i) const {
     RECT rc;
     GetClientRect(ribbonWnd, &rc);
-    int x = 0;
+    int x = 0, pos = 0;
     for (int k : kRibbonOrder) {
+      if (pos++ >= ribbonVisible) break;
       if (k == i) return RECT{x, 0, x + RibbonW(i), rc.bottom};
       x += RibbonW(k);
     }
-    return RECT{};
+    return RECT{};  // 隠している
+  }
+  bool RibbonShown(int i) const {
+    for (int pos = 0; pos < ribbonVisible && pos < kRibbonButtons; pos++)
+      if (kRibbonOrder[pos] == i) return true;
+    return false;
   }
   // 表示（詳細・サムネイルの大きさ）を 1 つの並びに: 0 詳細・1 小・2 普通・3 大・4 可変
   int LayoutIndex() const { return Details() ? 0 : 1 + std::max(0, std::min(3, settings.sizeMode)); }
@@ -3925,6 +3965,7 @@ class ExplorerImpl {
     const wchar_t* fallback[] = {L"窓", L"表", L"順", L"紙"};  // 記号のフォントが無い時（今のリボンと同じく漢字 1 字）
     const wchar_t* captions[] = {L"ペイン", L"表示", L"並び順", L"表紙"};
     for (int i = 0; i < kRibbonButtons; i++) {
+      if (!RibbonShown(i)) continue;
       RECT r = RibbonRect(i);
       if (i == ribbonHot) {
         HBRUSH br = CreateSolidBrush(RGB(229, 241, 251));
@@ -4000,6 +4041,7 @@ class ExplorerImpl {
   }
   int RibbonAt(POINT pt) const {
     for (int i = 0; i < kRibbonButtons; i++) {
+      if (!RibbonShown(i)) continue;
       RECT r = RibbonRect(i);
       if (PtInRect(&r, pt)) return i;
     }
@@ -4079,7 +4121,7 @@ class ExplorerImpl {
       ti.rect = RibbonRect(i);
       ti.lpszText = const_cast<wchar_t*>(tips[i]);
       SendMessageW(ribbonTip, TTM_DELTOOLW, 0, LPARAM(&ti));
-      SendMessageW(ribbonTip, TTM_ADDTOOLW, 0, LPARAM(&ti));
+      if (RibbonShown(i)) SendMessageW(ribbonTip, TTM_ADDTOOLW, 0, LPARAM(&ti));
     }
   }
 
@@ -4407,20 +4449,50 @@ class ExplorerImpl {
         HDC buf = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, std::max(1L, rc.right), std::max(1L, rc.bottom));
         HGDIOBJ old = SelectObject(buf, bmp);
+        self->Fill(buf, rc, RGB(246, 246, 246));
+        self->Fill(buf, {rc.left, rc.top, rc.left + 1, rc.bottom}, RGB(220, 220, 220));  // 左の境目
+        SetViewportOrgEx(buf, 0, -self->previewScrollY, nullptr);  // 中身はスクロールの分だけ上にずらして描く
         self->PaintPreview(buf, rc);
+        SetViewportOrgEx(buf, 0, 0, nullptr);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
         SelectObject(buf, old);
         DeleteObject(bmp);
         DeleteDC(buf);
         EndPaint(hwnd, &ps);
+        self->UpdatePreviewScroll(rc.bottom);
         return 0;
       }
       case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
         if (!self->dragSplit) self->UpdatePreview();
         return 0;
+      case WM_MOUSEWHEEL:
+        self->ScrollPreviewTo(self->previewScrollY - GET_WHEEL_DELTA_WPARAM(wp) * self->Px(72) / WHEEL_DELTA);
+        return 0;
+      case WM_VSCROLL: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int y = self->previewScrollY;
+        switch (LOWORD(wp)) {
+          case SB_LINEUP: y -= self->Px(24); break;
+          case SB_LINEDOWN: y += self->Px(24); break;
+          case SB_PAGEUP: y -= rc.bottom; break;
+          case SB_PAGEDOWN: y += rc.bottom; break;
+          case SB_TOP: y = 0; break;
+          case SB_BOTTOM: y = self->previewContentH; break;
+          case SB_THUMBTRACK:
+          case SB_THUMBPOSITION: {
+            SCROLLINFO si = {sizeof(si), SIF_TRACKPOS};
+            GetScrollInfo(hwnd, SB_VERT, &si);
+            y = si.nTrackPos;
+            break;
+          }
+        }
+        self->ScrollPreviewTo(y);
+        return 0;
+      }
       case WM_LBUTTONDBLCLK: {
-        const POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp) + self->previewScrollY};  // 中身の座標に
         const int hit = self->TagAt(pt);
         if (self->tagEdit && hit >= 0) self->CycleTag(self->tagHits[size_t(hit)].index);  // 続けて押した 2 回目
         else if (self->tagEdit && (PtInRect(&self->plusR, pt) || PtInRect(&self->editSaveR, pt) || PtInRect(&self->editCancelR, pt))) {
@@ -4434,6 +4506,7 @@ class ExplorerImpl {
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hwnd, &pt);
+        pt.y += self->previewScrollY;
         const bool button = self->tagEdit && (PtInRect(&self->plusR, pt) || PtInRect(&self->editSaveR, pt) || PtInRect(&self->editCancelR, pt));
         if (self->tagDragging || self->TagAt(pt) >= 0 || button) {
           SetCursor(LoadCursor(nullptr, self->tagDragging ? IDC_SIZEALL : IDC_HAND));
@@ -4442,7 +4515,7 @@ class ExplorerImpl {
         break;
       }
       case WM_LBUTTONDOWN: {
-        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp) + self->previewScrollY};
         for (const auto& [r, mode] : self->previewTabHits)
           if (PtInRect(&r, pt)) {
             self->SetPreviewMode(mode);
@@ -4472,7 +4545,9 @@ class ExplorerImpl {
       case WM_MOUSEMOVE:
         if (self->tagDown >= 0 && GetCapture() == hwnd) {
           POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-          if (!self->tagDragging && (abs(pt.x - self->tagDownPt.x) > self->Px(4) || abs(pt.y - self->tagDownPt.y) > self->Px(4)))
+          // tagDownPt は中身の座標（スクロールの分を足してある）
+          if (!self->tagDragging &&
+              (abs(pt.x - self->tagDownPt.x) > self->Px(4) || abs(pt.y + self->previewScrollY - self->tagDownPt.y) > self->Px(4)))
             self->tagDragging = true;
           if (self->tagDragging) {
             SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
@@ -4514,7 +4589,7 @@ class ExplorerImpl {
         return 0;
       case WM_RBUTTONUP: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        int hit = self->TagAt(pt);
+        int hit = self->TagAt(POINT{pt.x, pt.y + self->previewScrollY});
         if (hit >= 0) {
           ClientToScreen(hwnd, &pt);
           self->TagMenu(hit, pt);
@@ -5033,7 +5108,7 @@ class ExplorerImpl {
     SendMessageW(tree, WM_SETFONT, WPARAM(font), TRUE);
     SetWindowSubclass(tree, ChildKeyProc, 1, DWORD_PTR(this));
     TreeInit();
-    CreateWindowExW(0, kPreviewClass, nullptr, WS_CHILD, 0, 0, 10, 10, hwnd, nullptr, inst, this);
+    CreateWindowExW(0, kPreviewClass, nullptr, WS_CHILD | WS_VSCROLL, 0, 0, 10, 10, hwnd, nullptr, inst, this);
     CreateWindowExW(0, kTrayClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd, nullptr, inst, this);
     for (const auto& t : settings.tray) tray.push_back({t, true});
     for (const auto& [d, n] : settings.frequent) visits[DirKey(d)] = {d, n};
@@ -5130,6 +5205,20 @@ HWND Explorer::ViewBar() const { return impl_->viewBar; }
 SIZE Explorer::ViewBarSize(int minButtonW) const {
   impl_->ribbonMinW = minButtonW;
   return impl_->ViewBarSize();
+}
+std::vector<std::pair<int, int>> Explorer::ViewButtons(int minButtonW) const {
+  impl_->ribbonMinW = minButtonW;
+  std::vector<std::pair<int, int>> out;
+  for (int k : ExplorerImpl::kRibbonOrder) out.push_back({k, impl_->RibbonW(k)});
+  return out;
+}
+void Explorer::SetViewButtonsVisible(int count) {
+  count = std::max(0, std::min(ExplorerImpl::kRibbonButtons, count));
+  if (count == impl_->ribbonVisible) return;
+  impl_->ribbonVisible = count;
+  impl_->ribbonHot = -1;
+  impl_->UpdateRibbonTips();
+  if (impl_->ribbonWnd) InvalidateRect(impl_->ribbonWnd, nullptr, FALSE);
 }
 
 std::wstring Explorer::Dir() const { return impl_->dir; }

@@ -8,3 +8,4 @@
 
 #define APP_REPOSITORY L"sarumogu2013-glitch/1MfilesIMGsearch"
 #define APP_RELEASES_URL L"https://github.com/" APP_REPOSITORY L"/releases/latest"
+#define APP_HELP_URL L"https://github.com/" APP_REPOSITORY L"/blob/main/HELP.md"  // 使い方（F1）

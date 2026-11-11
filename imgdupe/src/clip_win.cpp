@@ -461,7 +461,7 @@ bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std:
     std::lock_guard<std::mutex> lock(m);
     const Files f = findFiles(dataDir);
     if (!f.ok) {
-        error = L"CLIP（内容検索部品）が入っていません。「その他 → AI の部品…」で入れられます";
+        error = L"CLIP（内容検索部品）が入っていません。「ツール → 設定… → AI 解析」の「最新版を調べる」で入れられます";
         return false;
     }
     if (!model || modelVersion != f.version) {
@@ -494,7 +494,7 @@ bool encodeImageFile(const std::wstring& dataDir, const std::wstring& path, std:
 std::shared_ptr<imgdupe::ClipModel> loadText(const std::wstring& dataDir, std::wstring& error) {
     const Files f = findFiles(dataDir);
     if (!f.ok) {
-        error = L"CLIP（内容検索部品）が入っていません。「その他 → AI の部品…」で入れられます";
+        error = L"CLIP（内容検索部品）が入っていません。「ツール → 設定… → AI 解析」の「最新版を調べる」で入れられます";
         return nullptr;
     }
     auto model = std::make_shared<OnnxClip>();

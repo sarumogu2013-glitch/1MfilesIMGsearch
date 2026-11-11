@@ -129,6 +129,7 @@ enum : int {
     IDC_FOLDERS_LABEL,
     IDC_THRESHOLD_CAPTION,
     IDC_TOOLBAR,
+    IDC_HOME_MORE,
     IDC_TABS,
     // 検索の画面
     IDC_S_TAGS = 600,
@@ -216,6 +217,8 @@ struct App {
     HWND folders = nullptr, add = nullptr, remove = nullptr, foldersLabel = nullptr;
     HWND thresholdCaption = nullptr, threshold = nullptr, thresholdLabel = nullptr, exact = nullptr, flat = nullptr, variants = nullptr;
     HWND toolbar = nullptr, toolbar2 = nullptr;
+    HWND homeMore = nullptr;  // 窓が狭くて入りきらないボタンを出す「…」
+    std::vector<int> homeHiddenCmds, homeHiddenCmds2, homeHiddenViews;  // 「…」に入れたもの（左のボタン・右のボタン・表示のボタンの種類）
     HWND homeSep1 = nullptr, homeSep2 = nullptr;
     int homeButtonW = 0;  // ホームのボタンの最低の幅（6 文字分）  // ホームのリボンの仕切り（同一画像と表示の間、並び順と設定の間）  // ホームのリボン: 左（開く・手動編集・同一画像）と右（設定など）。間に表示の四角いボタン
     HWND progress = nullptr, status = nullptr;
@@ -1670,22 +1673,8 @@ void exportResult() {
         ShellExecuteW(app.hwnd, L"open", (base + L".html").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-void showHelp() {
-    logBox(app.hwnd,
-                L"1. ホームでフォルダを右クリックして「解析の予約に追加」を選ぶか、「ファイル → フォルダを解析の予約に追加」で監視フォルダを足します（ウィンドウへのドラッグ＆ドロップでも足せます。複数可）。\r\n"
-                L"2. 「チェック開始」を押すと、同じ画像のまとまり（グループ）を左に出します。\r\n"
-                L"　・完全一致: 中身がまったく同じファイル\r\n"
-                L"　・見た目一致: 縮小・再圧縮・形式の違い（JPEG と PNG など）があっても見た目が同じ画像\r\n"
-                L"3. グループを選ぶと、右にサムネイルを出します。ダブルクリックで開き、右クリックで「エクスプローラーで表示」などができます。\r\n"
-                L"4. 「結果を書き出す」で CSV と、サムネイル付きの HTML を書き出します。\r\n\r\n"
-                L"・見た目一致の厳しさ: 小さいほど厳しく（ほぼ同じものだけ）、大きいほどゆるく（似ているものまで）まとめます。\r\n"
-                L"・単色に近い画像（真っ白・真っ黒など）は見分けにくく、別の画像がまとまりやすいので、ふだんは見た目では比べません。\r\n"
-                L"・「1 枚の重複チェック」で、選んだ画像に類似画像を探します。\r\n"
-                L"・キーの割り当ては「その他 → ショートカットキーの設定」（Ctrl+K）で変えられます。\r\n"
-                L"・2 回目からは読み込んだ結果（キャッシュ）を使うので、増えた・変わった画像だけを読み込みます。\r\n"
-                L"・このツールは画像を読むだけで、移動や削除はしません。",
-                L"imgdupe の使い方", MB_ICONINFORMATION);
-}
+// 使い方: GitHub の HELP.md をブラウザーで開く（本体の中に持つと、画面が変わるたびに古くなっていた）
+void showHelp() { ShellExecuteW(app.hwnd, L"open", APP_HELP_URL, nullptr, nullptr, SW_SHOWNORMAL); }
 
 // ---------------------------------------------------------------- 検索の画面
 
@@ -6405,6 +6394,7 @@ void switchTab(int t) {
     ShowWindow(app.toolbar, t == 2 ? SW_SHOW : SW_HIDE);
     ShowWindow(app.toolbar2, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : {app.homeSep1, app.homeSep2}) ShowWindow(h, t == 2 ? SW_SHOW : SW_HIDE);
+    if (t != 2) ShowWindow(app.homeMore, SW_HIDE);  // ホームでは layoutHomeRibbon が、入りきらない時だけ出す
     if (HWND vb = ex.view->ViewBar()) ShowWindow(vb, t == 2 ? SW_SHOW : SW_HIDE);
     for (HWND h : {app.queryBar, app.queryStrip, app.queryTags}) ShowWindow(h, t == 3 ? SW_SHOW : SW_HIDE);
     for (HWND h : app.dupPage) ShowWindow(h, t == 0 ? SW_SHOW : SW_HIDE);
@@ -6946,6 +6936,112 @@ void loadSearchSettings() {
 // ---------------------------------------------------------------- 画面
 
 // 上にリボン（見出しと、その下に選んだリボンの中身）、検索のリボンなら詳細検索、残りはエクスプローラー
+// ホームのリボン: 左のボタン ｜ 表示の四角いボタン ｜ 右のボタン。窓が狭くて入りきらない分は隠して、右端の「…」のメニューに出す
+void layoutHomeRibbon(int y, int W, int panelH) {
+    const int m = px(6), btnH = px(58), by = y + std::max(0, (panelH - px(4) - btnH) / 2);  // ボタン（高さ 58）はリボンの真ん中に
+    const int moreW = px(36), gap = px(10);  // gap: 仕切りとその左右
+    // ツールバーは、いったん全部出して幅を読む
+    auto showAll = [](HWND bar) {
+        const int n = static_cast<int>(SendMessageW(bar, TB_BUTTONCOUNT, 0, 0));
+        for (int k = 0; k < n; ++k) {
+            TBBUTTON b{};
+            SendMessageW(bar, TB_GETBUTTON, k, reinterpret_cast<LPARAM>(&b));
+            if (!(b.fsState & TBSTATE_HIDDEN)) continue;
+            TBBUTTONINFOW bi{sizeof(bi)};
+            bi.dwMask = TBIF_BYINDEX | TBIF_STATE;
+            bi.fsState = static_cast<BYTE>(b.fsState & ~TBSTATE_HIDDEN);
+            SendMessageW(bar, TB_SETBUTTONINFOW, k, reinterpret_cast<LPARAM>(&bi));
+        }
+        return n;
+    };
+    struct Unit {
+        int group;  // 0 左のボタン・1 表示のボタン・2 右のボタン
+        int index;  // ツールバーの番号、表示のボタンは並びの番号
+        int width;
+        int cmd;    // ツールバーのボタンの機能（仕切りは 0）、表示のボタンは種類
+    };
+    std::vector<Unit> units;
+    auto addBar = [&](HWND bar, int group) {
+        const int n = showAll(bar);
+        for (int k = 0; k < n; ++k) {
+            TBBUTTON b{};
+            RECT r{};
+            SendMessageW(bar, TB_GETBUTTON, k, reinterpret_cast<LPARAM>(&b));
+            SendMessageW(bar, TB_GETITEMRECT, k, reinterpret_cast<LPARAM>(&r));
+            units.push_back({group, k, static_cast<int>(r.right - r.left), (b.fsStyle & BTNS_SEP) ? 0 : b.idCommand});
+        }
+    };
+    addBar(app.toolbar, 0);
+    const auto views = ex.view->ViewButtons(app.homeButtonW);
+    for (size_t k = 0; k < views.size(); ++k) units.push_back({1, static_cast<int>(k), views[k].second, views[k].first});
+    addBar(app.toolbar2, 2);
+    // 入る所まで出す（1 つ目は必ず出す）
+    auto widthUpTo = [&](size_t count) {
+        int x = 0, last = 0;
+        for (size_t k = 0; k < count; ++k) {
+            if (units[k].group != last) x += gap;
+            last = units[k].group;
+            x += units[k].width;
+        }
+        return x;
+    };
+    const int avail = W - 2 * m;
+    size_t shown = units.size();
+    if (widthUpTo(units.size()) > avail) {
+        shown = 1;
+        while (shown < units.size() && widthUpTo(shown + 1) <= avail - moreW - px(4)) ++shown;
+        while (shown > 1 && units[shown - 1].group != 1 && !units[shown - 1].cmd) --shown;  // 最後が仕切りなら、それも隠す
+    }
+    // 隠す・出す
+    app.homeHiddenCmds.clear();
+    app.homeHiddenCmds2.clear();
+    app.homeHiddenViews.clear();
+    int viewShown = 0;
+    int barRight[3] = {0, 0, 0};  // それぞれのまとまりの、出している分の幅
+    for (size_t k = 0; k < units.size(); ++k) {
+        const Unit& u = units[k];
+        const bool hide = k >= shown;
+        if (u.group == 1) {
+            if (hide) app.homeHiddenViews.push_back(u.cmd);
+            else ++viewShown;
+        } else {
+            HWND bar = u.group == 0 ? app.toolbar : app.toolbar2;
+            if (hide) {
+                TBBUTTON b{};
+                SendMessageW(bar, TB_GETBUTTON, u.index, reinterpret_cast<LPARAM>(&b));
+                TBBUTTONINFOW bi{sizeof(bi)};
+                bi.dwMask = TBIF_BYINDEX | TBIF_STATE;
+                bi.fsState = static_cast<BYTE>(b.fsState | TBSTATE_HIDDEN);
+                SendMessageW(bar, TB_SETBUTTONINFOW, u.index, reinterpret_cast<LPARAM>(&bi));
+                if (u.cmd) (u.group == 0 ? app.homeHiddenCmds : app.homeHiddenCmds2).push_back(u.cmd);
+            }
+        }
+        if (!hide) barRight[u.group] += u.width;
+    }
+    ex.view->SetViewButtonsVisible(viewShown);
+    // 並べる
+    int x = m;
+    auto place = [&](HWND h, int w) {
+        ShowWindow(h, w > 0 ? SW_SHOW : SW_HIDE);
+        if (w > 0) MoveWindow(h, x, by, w, btnH, TRUE);
+        x += w;
+    };
+    auto sep = [&](HWND h, bool on) {
+        ShowWindow(h, on ? SW_SHOW : SW_HIDE);
+        if (!on) return;
+        MoveWindow(h, x + gap / 2 - 1, by + px(4), 2, btnH - px(8), TRUE);
+        x += gap;
+    };
+    place(app.toolbar, barRight[0]);
+    sep(app.homeSep1, barRight[1] > 0 || barRight[2] > 0);
+    if (HWND vb = ex.view->ViewBar()) place(vb, barRight[1]);
+    sep(app.homeSep2, barRight[2] > 0 && barRight[1] > 0);
+    place(app.toolbar2, barRight[2]);
+    const bool more = shown < units.size();
+    ShowWindow(app.homeMore, more ? SW_SHOW : SW_HIDE);
+    if (more) MoveWindow(app.homeMore, std::max(x + px(4), W - m - moreW), by + px(8), moreW, btnH - px(16), TRUE);
+}
+
 void layout() {
     // WM_CREATE の中の SetMenu でも WM_SIZE が来る（まだ部品を作っていない）
     if (!ex.view) return;
@@ -6959,25 +7055,7 @@ void layout() {
     y += tabH + px(2);
     if (app.tab == 2) {
         // ホーム: 左にボタン、右に表示の設定（表示・並び順・大きさ・表紙・フォルダ一覧・プレビュー）
-        SIZE bar{};
-        SendMessageW(app.toolbar, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar));
-        const int barW = std::max<int>(bar.cx, px(100));
-        // ボタン（高さ 58）はリボンの真ん中に（上に寄って下が空いていた）
-        const int btnH = px(58), by = y + std::max(0, (panelH - px(4) - btnH) / 2);
-        MoveWindow(app.toolbar, m, by, barW, btnH, TRUE);
-        int x = m + barW + px(4);
-        MoveWindow(app.homeSep1, x, by + px(4), 2, btnH - px(8), TRUE);
-        x += px(6);
-        if (HWND vb = ex.view->ViewBar()) {
-            const SIZE vs = ex.view->ViewBarSize(app.homeButtonW);
-            MoveWindow(vb, x, by, vs.cx, btnH, TRUE);
-            x += vs.cx + px(4);
-        }
-        MoveWindow(app.homeSep2, x, by + px(4), 2, btnH - px(8), TRUE);
-        x += px(6);
-        SIZE bar2{};
-        SendMessageW(app.toolbar2, TB_GETMAXSIZE, 0, reinterpret_cast<LPARAM>(&bar2));
-        MoveWindow(app.toolbar2, x, by, std::max<int>(bar2.cx, px(100)), btnH, TRUE);
+        layoutHomeRibbon(y, W, panelH);
     } else if (app.tab == 3) {
         // 画像で探す: 左にボタン、真ん中に足した画像、右に生成したタグ・様子
         SIZE bar{};
@@ -7344,7 +7422,7 @@ void queryTags() {
                 tagger::LoadResult lr = tagger::load(dataDir, 2);
                 app.guiTagger = lr.analyzer;
                 if (!lr.analyzer)
-                    r->error = !lr.error.empty() ? lr.error : L"WD14 タガーが入っていません（「その他 → AI の部品…」で入れられます）";
+                    r->error = !lr.error.empty() ? lr.error : L"WD14 タガーが入っていません（「ツール → 設定… → AI 解析」の「最新版を調べる」で入れられます）";
             }
             tagger = app.guiTagger;
         }
@@ -7688,6 +7766,9 @@ void createToolbar() {
         SelectObject(dc2, old2);
         ReleaseDC(app.hwnd, dc2);
     }
+    app.homeMore = CreateWindowExW(0, WC_BUTTONW, L"…", WS_CHILD | BS_PUSHBUTTON, 0, 0, 10, 10, app.hwnd,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_HOME_MORE)), app.inst, nullptr);
+    SendMessageW(app.homeMore, WM_SETFONT, reinterpret_cast<WPARAM>(app.font), TRUE);
     for (HWND* sep : {&app.homeSep1, &app.homeSep2})
         *sep = CreateWindowExW(0, WC_STATICW, L"", WS_CHILD | SS_ETCHEDVERT, 0, 0, 2, 10, app.hwnd, nullptr, app.inst, nullptr);
     app.dupBar = createRibbonBar(kDupButtons, IDC_DUPBAR);
@@ -7797,7 +7878,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_TAG_EDIT: return L"タグの手動編集を入れる・切る（プレビューのタグをクリックで 確定 → 否定 → そのまま、＋で足す）";
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
         case CMD_CHECK_UPDATE: return L"新しい版が出ていないか確かめ、あれば更新します";
-        case CMD_HELP: return L"使い方の説明を出します（F1）";
+        case CMD_HELP: return L"使い方のページ（GitHub の HELP.md）をブラウザーで開きます（F1）";
         case CMD_OPEN_DATA: return L"設定・DB・キャッシュの入ったフォルダを開きます";
         case CMD_OPEN_LOGS: return L"動作履歴（ログ）のフォルダを開きます。おかしな動きをした時は、ここの .log を見せてください";
         case CMD_SEARCH: return L"監視フォルダの中から、同じ画像のまとまりを探します。探している間に押すと中止します（F5）";
@@ -7954,20 +8035,16 @@ void appendMainMenus(HMENU root) {
     popup(L"ヘルプ(&H)", {CMD_HELP, 0, CMD_CHECK_UPDATE, CMD_RELEASES, 0, CMD_OPEN_LOGS, CMD_OPEN_DATA, 0, CMD_ABOUT});
 }
 
-void syncMenuChecks() {
-    if (!app.menuBar) return;
-    CheckMenuItem(app.menuBar, CMD_TOGGLE_EXACT,
-                  MF_BYCOMMAND | (Button_GetCheck(app.exact) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(app.menuBar, CMD_TOGGLE_FLAT,
-                  MF_BYCOMMAND | (Button_GetCheck(app.flat) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(app.menuBar, CMD_TOGGLE_VARIANTS,
-                  MF_BYCOMMAND | (Button_GetCheck(app.variants) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(app.menuBar, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(app.menuBar, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(app.menuBar, CMD_TAG_EDIT, MF_BYCOMMAND | (ex.view && ex.view->TagEditing() ? MF_CHECKED : MF_UNCHECKED));
-    SendMessageW(app.toolbar, TB_CHECKBUTTON, CMD_TAG_EDIT, MAKELPARAM(ex.view && ex.view->TagEditing() ? TRUE : FALSE, 0));
+// メニュー（メニューバー・ホームのリボンの「…」）に、今の状態のチェックを付ける
+void markMenuChecks(HMENU menu) {
+    CheckMenuItem(menu, CMD_TOGGLE_EXACT, MF_BYCOMMAND | (Button_GetCheck(app.exact) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, CMD_TOGGLE_FLAT, MF_BYCOMMAND | (Button_GetCheck(app.flat) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, CMD_TOGGLE_VARIANTS, MF_BYCOMMAND | (Button_GetCheck(app.variants) == BST_CHECKED ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, CMD_SEARCH_ADVANCED, MF_BYCOMMAND | (app.advancedShown ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, CMD_TAG_JAPANESE, MF_BYCOMMAND | (app.tagJapanese ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, CMD_TAG_EDIT, MF_BYCOMMAND | (ex.view && ex.view->TagEditing() ? MF_CHECKED : MF_UNCHECKED));
     if (ex.view) {
-        auto mark = [](int cmd, bool on) { CheckMenuItem(app.menuBar, cmd, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED)); };
+        auto mark = [menu](int cmd, bool on) { CheckMenuItem(menu, cmd, MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED)); };
         mark(CMD_VIEW_TREE, ex.view->ShowTree());
         mark(CMD_VIEW_PREVIEW, ex.view->ShowPreview());
         for (int k = 0; k < 5; ++k) mark(CMD_VIEW_DETAILS + k, ex.view->LayoutIndex() == k);
@@ -7976,6 +8053,63 @@ void syncMenuChecks() {
         mark(CMD_SORT_DESC, ex.view->SortDesc());
         for (int k = 0; k < 5; ++k) mark(CMD_COVER_1 + k, ex.view->FolderStyle() == k);
     }
+}
+
+void syncMenuChecks() {
+    if (!app.menuBar) return;
+    markMenuChecks(app.menuBar);
+    SendMessageW(app.toolbar, TB_CHECKBUTTON, CMD_TAG_EDIT, MAKELPARAM(ex.view && ex.view->TagEditing() ? TRUE : FALSE, 0));
+}
+
+// ホームのリボンの「…」: 窓が狭くて隠したボタンをメニューで出す（表示のボタンは、選ぶものをサブメニューに）
+void homeMoreMenu() {
+    HMENU menu = CreatePopupMenu();
+    auto addCmd = [&](HMENU m, int cmd, HWND bar) {
+        const bool enabled = !bar || SendMessageW(bar, TB_ISBUTTONENABLED, cmd, 0) != 0;
+        AppendMenuW(m, MF_STRING | (enabled ? 0 : MF_GRAYED), static_cast<UINT_PTR>(cmd), menuText(cmd).c_str());
+    };
+    bool pendingSep = false;  // 次の項目の前に仕切りを入れる（まとまりの間。前後に項目がある時だけ）
+    auto addSep = [&] { pendingSep = GetMenuItemCount(menu) > 0; };
+    auto flushSep = [&] {
+        if (pendingSep) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        pendingSep = false;
+    };
+    for (int cmd : app.homeHiddenCmds) addCmd(menu, cmd, app.toolbar);
+    addSep();
+    for (int kind : app.homeHiddenViews) {
+        flushSep();
+        HMENU sub = CreatePopupMenu();
+        const wchar_t* title = L"";
+        std::vector<int> cmds;
+        if (kind == 0) {
+            title = L"ペイン(&P)";
+            cmds = {CMD_VIEW_TREE, CMD_VIEW_PREVIEW};
+        } else if (kind == 1) {
+            title = L"表示(&V)";
+            cmds = {CMD_VIEW_DETAILS, 0, CMD_VIEW_SMALL, CMD_VIEW_MEDIUM, CMD_VIEW_LARGE, CMD_VIEW_CUSTOM};
+        } else if (kind == 2) {
+            title = L"並び順(&O)";
+            cmds = {CMD_SORT_NAME, CMD_SORT_DATE, CMD_SORT_TYPE, CMD_SORT_SIZE, CMD_SORT_RESULT, 0, CMD_SORT_ASC, CMD_SORT_DESC};
+        } else {
+            title = L"表紙（フォルダのサムネイル）(&C)";
+            cmds = {CMD_COVER_1, CMD_COVER_2, CMD_COVER_3, CMD_COVER_4, CMD_COVER_5};
+        }
+        for (int c : cmds) {
+            if (c) addCmd(sub, c, nullptr);
+            else AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), title);
+    }
+    addSep();
+    for (int cmd : app.homeHiddenCmds2) {
+        flushSep();
+        addCmd(menu, cmd, app.toolbar2);
+    }
+    markMenuChecks(menu);
+    RECT r{};
+    GetWindowRect(app.homeMore, &r);
+    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_TOPALIGN, r.right, r.bottom, 0, app.hwnd, nullptr);  // 選んだ機能は WM_COMMAND で届く
+    DestroyMenu(menu);
 }
 
 void rebuildMenu() {
@@ -8275,7 +8409,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_GETMINMAXINFO: {
             auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {px(900), px(520)};
+            // 幅は、ホームのリボンのボタン 1 つと「…」が入る所まで狭くできる（入りきらないボタンは「…」のメニューに出す）
+            mm->ptMinTrackSize = {std::max(px(64), app.homeButtonW) + px(36) + px(6) * 2 + px(8) + 2 * GetSystemMetrics(SM_CXSIZEFRAME) + px(16),
+                                  px(520)};
             return 0;
         }
         case WM_DROPFILES: {
@@ -8503,6 +8639,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (ex.view && ex.view->Visible()) ex.view->DeleteSelected();
                     break;
                 case CMD_CLEANUP: cleanupUi(); break;
+                case IDC_HOME_MORE: homeMoreMenu(); break;
                 case CMD_TAG_EDIT:
                     if (ex.view) ex.view->SetTagEditing(!ex.view->TagEditing());
                     syncMenuChecks();  // 保存を聞かれてキャンセルした時も、リボンのボタンの見た目を今の状態に戻す
@@ -8543,7 +8680,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 "ここに「キャラ名」や「作者名」のフォルダを作り、その人の画像を 10〜30 枚入れてください。\r\n"
                                 "常駐解析が見本の CLIP のベクトルを作り、それに近い画像に、フォルダの名前のタグを付けます\r\n"
                                 "（タグの由来「見本画像との類似」）。新しいキャラも、見本を足すだけで探せるようになります。\r\n"
-                                "確認キューで「確定」と確定した画像（同じタグに 3 枚以上）も、自動で見本になります。\r\n";
+                                "タグの手動編集で「確定」にした画像（同じタグに 3 枚以上）も、自動で見本になります。\r\n";
                             fwrite(t.data(), 1, t.size(), f);
                             fclose(f);
                         }
@@ -8612,7 +8749,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (text->empty()) {
                 app.sourcesStale = true;
                 PostMessageW(hwnd, WM_APP_CONVERT, 1, reinterpret_cast<LPARAM>(new std::wstring(L"?")));  // 詰めるのをすすめる
-                ex.view->SetSameStatus(L"DB を新しい形に変換しました（検索・統計が速くなります。「その他 → DB を詰めて小さくする」でファイルも小さくできます）");
+                ex.view->SetSameStatus(L"DB を新しい形に変換しました（検索・統計が速くなります。「ツール → 設定… → データ」の「DB を詰めて小さくする」でファイルも小さくできます）");
             } else {
                 ex.view->SetSameStatus(*text);
             }
@@ -9246,7 +9383,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
             {  // ホームのリボンの四角いボタン（表示・並び順・表紙）は、カーソルの下のボタンで替える
                 wchar_t cls[64] = L"";
                 if (under) GetClassNameW(under, cls, 64);
-                if (lstrcmpW(cls, L"imgdupe_view_ribbon") == 0) {
+                if (lstrcmpW(cls, L"imgdupe_view_ribbon") == 0 || lstrcmpW(cls, L"imgdupe_explorer_preview") == 0) {  // プレビューはスクロール
                     SendMessageW(under, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
                     continue;
                 }
