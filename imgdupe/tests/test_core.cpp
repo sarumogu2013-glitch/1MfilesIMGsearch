@@ -21,6 +21,7 @@
 #include "names.hpp"
 #include "pathinfer.hpp"
 #include "tagstore.hpp"
+#include "tagsum.hpp"
 #include "log.hpp"
 #include "models.hpp"
 #include "tagger.hpp"
@@ -428,6 +429,37 @@ static void testKeys() {
     CHECK(m.at(ch) == CMD_HELP);
     CHECK(m.size() == def.size() + 1);
     for (const auto& c : allCommands()) CHECK(findCommand(c.name) == &c && findCommand(c.id) == &c);
+
+    // 新しい標準のキーを、自分でキーを変えた人に届ける
+    {
+        KeyStroke comma, del, f1;
+        CHECK(parseKey("Ctrl+Comma", comma) && parseKey("Delete", del) && parseKey("F1", f1));
+        // v3.10 より前に保存した人: 設定の Ctrl+, と削除の Delete はまだ見ていない
+        const auto before = defaultPairsBeforeTracking();
+        CHECK(std::find(before.begin(), before.end(), "Settings=Ctrl+Comma") == before.end());
+        CHECK(std::find(before.begin(), before.end(), "Help=F1") != before.end());
+        // キーが空いていれば割り当てる。前からある標準（F1）は、外してあっても戻さない
+        KeyMap mine = def;
+        mine.erase(comma);
+        mine.erase(del);
+        mine.erase(f1);
+        KeyUpgrade up = upgradeKeys(mine, before);
+        CHECK(up.assigned.size() == 2 && up.conflicts.empty());
+        CHECK(mine.at(comma) == CMD_SETTINGS && mine.at(del) == CMD_DELETE && !mine.count(f1));
+        // 別の機能に割り当ててあれば、変えずに conflicts に入れる（聞いてから）
+        KeyMap taken = def;
+        taken.erase(del);
+        taken[comma] = CMD_HELP;
+        up = upgradeKeys(taken, before);
+        CHECK(up.assigned.size() == 1 && up.assigned[0].cmd == CMD_DELETE);
+        CHECK(up.conflicts.size() == 1 && up.conflicts[0].cmd == CMD_SETTINGS && up.conflicts[0].current == CMD_HELP);
+        CHECK(taken.at(comma) == CMD_HELP);
+        // 全部見たことがあれば何もしない
+        KeyMap none = def;
+        none.erase(comma);
+        up = upgradeKeys(none, defaultPairs());
+        CHECK(up.assigned.empty() && up.conflicts.empty() && !none.count(comma));
+    }
 }
 
 // 画像のパスに "fail" があれば失敗、それ以外はパスの文字数をタグにする解析器
@@ -3489,6 +3521,58 @@ static void testTagStore() {
     fs::remove_all(dir);
 }
 
+// いくつもの画像のタグをまとめる（プレビュー・タグの手動編集）
+static void testTagSummary() {
+    const fs::path dir = fs::temp_directory_path() / "imgdupe-tagsum-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    Db db;
+    CHECK(db.open((dir / "t.db").string()));
+    std::vector<ScannedFile> files;
+    for (int i = 1; i <= 3; ++i) files.push_back({"C:\\p\\" + std::to_string(i) + ".jpg", 1, static_cast<uint64_t>(i)});
+    auto ids = upsertScanned(db, files);
+    auto I = [&](int n) { return ids["C:\\p\\" + std::to_string(n) + ".jpg"]; };
+    replaceTags(db, I(1), "tagger", {TagRow{"long_hair", "general", "tagger", 0.9, false}, TagRow{"smile", "general", "tagger", 0.5, false},
+                                     TagRow{"weak", "general", "tagger", 0.2, false}, TagRow{"general", "rating", "tagger", 0.9, false}});
+    replaceTags(db, I(2), "tagger", {TagRow{"Long_Hair", "general", "tagger", 0.6, false}});
+    replaceTags(db, I(1), "folder", {TagRow{"作者さん", "artist", "folder", 1.0, false}});
+    replaceTags(db, I(2), "folder", {TagRow{"作者さん", "artist", "folder", 1.0, false}});
+    replaceTags(db, I(3), "embedded", {TagRow{"photo", "general", "embedded", 1.0, false}});
+    setManualTag(db, I(1), "smile", false);   // 否定
+    setManualTag(db, I(2), "cat", true);      // 手で足した
+    auto find = [](const std::vector<TagSummary>& v, const std::string& tag, bool file = false) -> const TagSummary* {
+        for (const auto& t : v)
+            if (t.tag == tag && t.file == file) return &t;
+        return nullptr;
+    };
+    const std::vector<int64_t> all = {I(1), I(2), I(3)};
+    // 普段: 確度の低いもの・否定したもの・年齢区分は出さない。大文字と小文字は同じタグ。確度は高いほう
+    auto v = summarizeTags(db, all, false);
+    CHECK(!find(v, "weak") && !find(v, "smile") && !find(v, "general"));
+    const TagSummary* lh = find(v, "long_hair");
+    CHECK(lh && lh->count == 2 && lh->total == 3 && lh->confidence > 0.89 && lh->editable && lh->state == 1 && !lh->mixed);
+    const TagSummary* au = find(v, "作者さん");
+    CHECK(au && au->count == 2 && !au->editable);  // フォルダ名から: さわれない
+    const TagSummary* cat = find(v, "cat");
+    CHECK(cat && cat->count == 1 && cat->state == 2 && cat->editable);
+    CHECK(!v.empty() && v[0].file && v[0].tag == "photo" && !v[0].editable);  // 埋め込みタグが先
+    // 手動編集: 否定したタグも出す。確度は低いほう
+    v = summarizeTags(db, all, true);
+    const TagSummary* sm = find(v, "smile");
+    CHECK(sm && sm->state == 0 && sm->editable);
+    lh = find(v, "long_hair");
+    CHECK(lh && lh->confidence < 0.61);
+    // 状態が画像ごとに違う: 低いほうを出して mixed
+    setManualTag(db, I(1), "long_hair", true);
+    v = summarizeTags(db, all, true);
+    lh = find(v, "long_hair");
+    CHECK(lh && lh->state == 1 && lh->mixed);
+    // 途中でやめる
+    std::atomic<bool> cancel{true};
+    CHECK(summarizeTags(db, all, false, &cancel).empty());
+    CHECK(aiTagSource("tagger") && aiTagSource("clip") && aiTagSource("dict") && aiTagSource("reference") && !aiTagSource("folder"));
+}
+
 static void testLogs() {
     const std::string line = logs::formatLine(0, "解析", logs::Level::Warn, "a\nb");
     CHECK(line.find("[解析] 注意: a b") != std::string::npos && line.size() >= 2 && line.substr(line.size() - 2) == "\r\n");
@@ -3614,6 +3698,7 @@ int main() {
     testLogs();
     testPathInfer();
     testTagStore();
+    testTagSummary();
     testTagNames();
     testClusterResults();
     testExifOrientation();

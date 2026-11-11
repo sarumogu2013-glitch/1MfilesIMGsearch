@@ -1,5 +1,6 @@
 #include "commands.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -116,6 +117,7 @@ const std::vector<CmdInfo> kCommands = {
     {CMD_COVER_4, "Cover4", L"最後(&4)", ""},
     {CMD_COVER_5, "Cover5", L"最後の一つ前と最後(&5)", ""},
     {CMD_DELETE, "Delete", L"削除（ごみ箱へ）(&D)", "Delete"},
+    {CMD_CLEANUP, "Cleanup", L"クリーンナップ（DB とフォルダの整合）(&L)...", ""},
 };
 
 std::string trim(const std::string& s) {
@@ -263,6 +265,47 @@ std::string keyLabel(const KeyMap& keys, int cmd) {
     for (const auto& [k, id] : keys)
         if (id == cmd && (!best || __builtin_popcount(k.mods) < __builtin_popcount(best->mods))) best = &k;
     return best ? keyName(*best) : std::string();
+}
+
+std::vector<std::string> defaultPairs() {
+    std::vector<std::string> out;
+    for (const auto& c : kCommands)
+        for (const auto& t : splitList(c.keys)) {
+            KeyStroke k;
+            if (parseKey(t, k)) out.push_back(std::string(c.name) + "=" + keyName(k));
+        }
+    return out;
+}
+
+std::vector<std::string> defaultPairsBeforeTracking() {
+    // v3.10 以降に足した標準のキー（これより前に保存した人は、まだ見ていない）
+    static const char* const kAdded[] = {"Settings=Ctrl+Comma", "Delete=Delete"};
+    std::vector<std::string> out;
+    for (const auto& p : defaultPairs()) {
+        bool added = false;
+        for (const char* a : kAdded) added = added || p == a;
+        if (!added) out.push_back(p);
+    }
+    return out;
+}
+
+KeyUpgrade upgradeKeys(KeyMap& keys, const std::vector<std::string>& seen) {
+    KeyUpgrade up;
+    for (const auto& c : kCommands)
+        for (const auto& t : splitList(c.keys)) {
+            KeyStroke k;
+            if (!parseKey(t, k)) continue;
+            const std::string pair = std::string(c.name) + "=" + keyName(k);
+            if (std::find(seen.begin(), seen.end(), pair) != seen.end()) continue;  // 前からある標準（外してあっても戻さない）
+            auto it = keys.find(k);
+            if (it == keys.end()) {
+                keys[k] = c.id;
+                up.assigned.push_back({k, c.id, 0});
+            } else if (it->second != c.id) {
+                up.conflicts.push_back({k, c.id, it->second});
+            }
+        }
+    return up;
 }
 
 }  // namespace imgdupe

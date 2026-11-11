@@ -509,7 +509,13 @@ class ExplorerImpl {
     op.pFrom = from.c_str();
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;  // ごみ箱へ（入らない時は Windows が確かめる）
     SHFileOperationW(&op);
-    // 消えたものを一覧から外す（フォルダは読み直す）
+    // 本当に消えたもの（ごみ箱に入らなかった・使用中だったものは残っている）
+    std::vector<std::wstring> gone;
+    for (const auto& p : paths)
+      if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) gone.push_back(p);
+    if (gone.empty()) return;
+    host->ExplorerDeleted(gone);  // DB から片付ける（退避）
+    // 次に選ぶもの: 消したものの次に残っているもの
     std::wstring next;
     if (!PickedIndices().empty()) {
       const int last = PickedIndices().back();
@@ -519,22 +525,46 @@ class ExplorerImpl {
           break;
         }
     }
-    if (listMode) {
-      items.erase(std::remove_if(items.begin(), items.end(),
-                                 [](const Item& it) { return !it.Stack() && GetFileAttributesW(it.path.c_str()) == INVALID_FILE_ATTRIBUTES; }),
-                  items.end());
-      multi = false;
-      sel = -1;
-      for (int k = 0; k < int(items.size()); k++)
-        if (items[size_t(k)].path == next) sel = k;
-      if (sel < 0 && !items.empty()) sel = 0;
-      UpdateScroll();
-      InvalidateRect(grid, nullptr, FALSE);
-      UpdatePreview(true);
-      NotifySelected();
-    } else {
+    if (!listMode) {
       Load(dir, next);
+      return;
     }
+    // 検索の結果・重複のまとまり: 元のデータ（listEntries）からも外す（外さないと「戻る」でまた出ていた）
+    auto lower = [](std::wstring p) {
+      if (!p.empty()) CharLowerBuffW(&p[0], DWORD(p.size()));
+      return p;
+    };
+    std::vector<std::wstring> dead;
+    for (const auto& g : gone) dead.push_back(lower(g));
+    auto removed = [&](const std::wstring& path) {
+      const std::wstring p = lower(path);
+      for (const auto& d : dead)
+        if (p == d || (p.size() > d.size() && p.compare(0, d.size(), d) == 0 && (p[d.size()] == L'\\' || p[d.size()] == L'/'))) return true;  // 消したフォルダの中も
+      return false;
+    };
+    std::vector<int> moved(listEntries.size(), -1);  // 前の番号 → 新しい番号（全部消えたまとまりは -1）
+    std::vector<std::vector<std::wstring>> kept;
+    for (size_t e = 0; e < listEntries.size(); e++) {
+      std::vector<std::wstring> members;
+      for (const auto& m : listEntries[e])
+        if (!removed(m)) members.push_back(m);
+      if (members.empty()) continue;
+      moved[e] = int(kept.size());
+      kept.push_back(std::move(members));
+    }
+    listEntries.swap(kept);
+    // まとまりの番号がずれるので、今の場所と「戻る」「進む」の履歴も直す
+    auto remap = [&](int index) { return index >= 0 && index < int(moved.size()) ? moved[size_t(index)] : -1; };
+    stackIndex = remap(stackIndex);
+    const size_t markerLen = wcslen(kListMarker);
+    for (auto* stack : {&backStack, &forwardStack})
+      for (auto& entry : *stack) {
+        std::wstring& d = entry.first;
+        if (d.compare(0, markerLen, kListMarker) != 0 || d.size() == markerLen) continue;
+        const int to = remap(_wtoi(d.c_str() + markerLen));
+        d = to >= 0 ? std::wstring(kListMarker) + std::to_wstring(to) : std::wstring(kListMarker);
+      }
+    LoadList(next);
   }
 
   void StartDragOut() {
@@ -1170,6 +1200,7 @@ class ExplorerImpl {
     for (auto& it : items) it.picked = true;
     if (sel < 0) sel = 0;
     InvalidateRect(grid, nullptr, FALSE);
+    UpdatePreview();  // プレビューの画像・タグを、選んだ全部の分に（読み直さないと前の 1 枚のタグのままだった）
     if (preview) InvalidateRect(preview, nullptr, FALSE);
   }
 
@@ -2687,25 +2718,21 @@ class ExplorerImpl {
         if (previewPropsPath != key) {
           previewPropsPath = key;
           previewProps.clear();
-          const size_t n = std::min<size_t>(paths.size(), 500);  // 多すぎる時は先頭の分で比べる
-          for (size_t k = 0; k < n; k++) {
-            auto props = host->ExplorerProperties(paths[k]);
-            if (k == 0) {
-              previewProps = props;
-              continue;
-            }
-            std::vector<std::pair<std::wstring, std::wstring>> keep;
-            for (auto& [name, value] : previewProps) {
-              auto f = std::find_if(props.begin(), props.end(), [&](const auto& p) { return p.first == name; });
-              if (f == props.end()) continue;  // この画像には無い項目
-              keep.push_back({name, f->second == value ? value : std::wstring(L"複数のプロパティ")});
-            }
-            previewProps.swap(keep);
-          }
-          previewProps.insert(previewProps.begin(), {L"選択", std::to_wstring(picked.size()) + L" 個"});
+          std::vector<std::wstring> some = paths;
+          if (some.size() > 500) some.resize(500);  // 多すぎる時は先頭の分で比べる
+          summaryLoading[1] = true;
+          host->ExplorerRequestSummary(1, ++summaryToken[1], some, false);  // 裏で比べてもらう
         }
-        rows = previewProps;
+        rows.push_back({L"選択", std::to_wstring(picked.size()) + L" 個"});
+        if (summaryLoading[1]) rows.push_back({L"", L"プロパティを比べています…"});
+        rows.insert(rows.end(), previewProps.begin(), previewProps.end());
       } else {
+        if (previewPropsPath.compare(0, 5, L"many|") == 0) {  // いくつも選んでいた時の分は捨てる
+          previewPropsPath.clear();
+          previewProps.clear();
+          ++summaryToken[1];
+          summaryLoading[1] = false;
+        }
         if (it->image) {
           if (previewPropsPath != it->path) {
             previewPropsPath = it->path;
@@ -2862,7 +2889,12 @@ class ExplorerImpl {
       }
       y += Px(28);
     }
-    if (shownTags.empty() && !tagEdit) {
+    if (summaryLoading[0]) {
+      RECT tr = {nr.left, y, nr.right, y + Px(20)};
+      SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+      DrawTextW(dc, L"タグをまとめています…", -1, &tr, DT_CENTER | DT_SINGLELINE);
+      y += Px(26);
+    } else if (shownTags.empty() && !tagEdit) {
       RECT tr = {nr.left, y, nr.right, y + Px(20)};
       SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
       DrawTextW(dc, L"タグはまだありません", -1, &tr, DT_CENTER | DT_SINGLELINE);
@@ -2877,6 +2909,16 @@ class ExplorerImpl {
   std::wstring previewTagsKey;          // 読んだ時の選んでいる画像（PathsKey）と手動編集かどうか
   std::vector<ExplorerTag> shownTags;   // 描いたタグ（previewTags と、手動編集で足したもの）。tagHits の番号はこれの番号
   static constexpr size_t kMaxTagImages = 2000;  // プレビューにまとめて出すのは先頭のこれだけ（直すのは全部）
+  // いくつも選んでいる時のまとめは、ホストが裏で作る（ExplorerRequestSummary → SetSummary）。[0] タグ、[1] プロパティ
+  unsigned summaryToken[2] = {0, 0};
+  bool summaryLoading[2] = {false, false};
+  void SetSummary(int kind, unsigned token, std::vector<ExplorerTag> tags, std::vector<std::pair<std::wstring, std::wstring>> props) {
+    if (kind < 0 || kind > 1 || token != summaryToken[kind]) return;  // 選び直した後に届いた古い結果
+    summaryLoading[kind] = false;
+    if (kind == 0) previewTags = std::move(tags);
+    else previewProps = std::move(props);
+    if (preview) InvalidateRect(preview, nullptr, FALSE);
+  }
 
   // ---- タグの手動編集（タグの手動編集_仕様案.md）
   bool tagEdit = false;
@@ -2934,6 +2976,7 @@ class ExplorerImpl {
     tagEdit = on;
     pending.clear();
     editPaths.clear();
+    if (on && !settings.showPreview) TogglePanel(false);     // プレビューを隠していたら出す
     if (on && settings.previewMode != 1) SetPreviewMode(1);  // タグを出す
     previewTagsKey.clear();
     LoadPreviewTags();
@@ -3089,12 +3132,31 @@ class ExplorerImpl {
   }
 
   void LoadPreviewTags() {
+    // タグを出していない時は読まない（タグの表示に替えた時・手動編集を入れた時に読む）
+    if (!tagEdit && settings.previewMode != 1) {
+      if (!previewTagsKey.empty()) {
+        previewTagsKey.clear();
+        previewTags.clear();
+        ++summaryToken[0];
+        summaryLoading[0] = false;
+      }
+      return;
+    }
     std::vector<std::wstring> paths = TargetPaths();
     const std::wstring key = PathsKey(paths) + (tagEdit ? L"|edit" : L"");
     if (key == previewTagsKey) return;
     previewTagsKey = key;
+    ++summaryToken[0];  // 前に頼んだ分は捨てる
+    summaryLoading[0] = false;
     if (paths.size() > kMaxTagImages) paths.resize(kMaxTagImages);
-    previewTags = paths.empty() ? std::vector<ExplorerTag>() : host->ExplorerTagSet(paths, tagEdit);
+    if (paths.size() <= 1) {
+      previewTags = paths.empty() ? std::vector<ExplorerTag>() : host->ExplorerTagSet(paths, tagEdit);
+      return;
+    }
+    // いくつも: 裏でまとめてもらう（何千枚も選んだ時に画面が止まらないように）
+    previewTags.clear();
+    summaryLoading[0] = true;
+    host->ExplorerRequestSummary(0, summaryToken[0], paths, tagEdit);
   }
 
   // タグの表示名が変わった: プレビューのタグを読み直して描き直す
@@ -3791,14 +3853,18 @@ class ExplorerImpl {
     return n[std::max(0, std::min(4, i))];
   }
   static const wchar_t* SortName(int k) {
-    static const wchar_t* n[] = {L"名前", L"更新日時", L"種類", L"サイズ", L"検索結果の順"};
-    return n[std::max(0, std::min(4, k))];
+    static const wchar_t* n[] = {L"名前", L"更新日時", L"種類", L"サイズ", L"検索結果の順", L"フォルダ", L"解析"};
+    return n[std::max(0, std::min(6, k))];  // 5: kFolderSort、6: kIndexSort（詳細の列の見出しから）
+  }
+  // 今選べる並び順（押した時のメニューとホイールの順）: 列の見出しで選べるものも入れる
+  std::vector<int> SortChoices() const {
+    if (listMode) return {0, 1, 2, kFolderSort, 3, kIndexSort, kListOrder};
+    return {0, 1, 2, 3, kIndexSort};
   }
   static const wchar_t* CoverName(int k) {
     static const wchar_t* n[] = {L"1 枚目", L"1・2 枚目", L"最後と 1 枚目", L"最後", L"最後の一つ前と最後"};
     return n[std::max(0, std::min(4, k))];
   }
-  int SortKeys() const { return listMode ? 5 : 4; }  // 「検索結果の順」は検索の結果の時だけ
   std::wstring RibbonValue(int i) const {
     switch (i) {
       case 0:
@@ -3876,7 +3942,7 @@ class ExplorerImpl {
       std::wstring v;
       if (i == 0) v = captions[0];
       else if (i == 1) v = RibbonValue(1);
-      else if (i == 2) v = std::wstring(SortKey() == kListOrder ? L"検索結果" : SortName(SortKey())) + (settings.sortDesc ? L"↓" : L"↑");
+      else if (i == 2) v = std::wstring(SortKey() == kListOrder ? L"検索結果" : SortName(SortKey())) + (settings.sortDesc ? L"↓" : L"↑");  // 一番長いのは RibbonW の見本
       else v = captions[3];
       v += L" ▼";
       RECT cr = {r.left + Px(2), r.top + Px(30), r.right - Px(2), r.top + Px(46)};
@@ -3900,7 +3966,7 @@ class ExplorerImpl {
         if (k == 0) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
       }
     } else if (i == 2) {
-      for (int k = 0; k < SortKeys(); k++) item(kSort0 + k, SortName(k), SortKey() == k);
+      for (int k : SortChoices()) item(kSort0 + k, SortName(k), SortKey() == k);
       AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
       item(kAsc, L"昇順(&A)", !settings.sortDesc);
       item(kDesc, L"降順(&D)", settings.sortDesc);
@@ -3914,7 +3980,7 @@ class ExplorerImpl {
     DestroyMenu(m);
     if (cmd == kPaneTree || cmd == kPanePreview) TogglePanel(cmd == kPaneTree);
     else if (cmd >= kLayout0 && cmd < kLayout0 + 5) SetLayout(cmd - kLayout0);
-    else if (cmd >= kSort0 && cmd < kSort0 + 5) SetSort(cmd - kSort0, settings.sortDesc);
+    else if (cmd >= kSort0 && cmd < kSort0 + 7) SetSort(cmd - kSort0, settings.sortDesc);
     else if (cmd == kAsc || cmd == kDesc) SetSort(SortKey(), cmd == kDesc);
     else if (cmd >= kCover0 && cmd < kCover0 + 5) SetFolderStyle(cmd - kCover0);
     ViewChanged();
@@ -3922,7 +3988,13 @@ class ExplorerImpl {
   // 四角いボタンの上でホイール: 値を順に替える（上へ回すと次・大きく）
   void RibbonWheel(int i, int steps) {
     if (i == 1) SetLayout(LayoutIndex() + steps);
-    else if (i == 2) SetSort(((SortKey() - steps) % SortKeys() + SortKeys()) % SortKeys(), settings.sortDesc);
+    else if (i == 2) {
+      const std::vector<int> keys = SortChoices();
+      const int n = int(keys.size());
+      int at = int(std::find(keys.begin(), keys.end(), SortKey()) - keys.begin());
+      if (at >= n) at = 0;
+      SetSort(keys[size_t(((at - steps) % n + n) % n)], settings.sortDesc);
+    }
     else if (i == 3) SetFolderStyle(((settings.folderStyle - steps) % 5 + 5) % 5);
     ViewChanged();
   }
@@ -5093,6 +5165,10 @@ void Explorer::SetGroups(const std::wstring& title, std::vector<ExplorerGroup> g
 void Explorer::AddTrayTag(const std::wstring& tag) { impl_->AddTray(tag); }
 bool Explorer::TagEditing() const { return impl_->tagEdit; }
 void Explorer::DeleteSelected() { impl_->DeleteSelected(); }
+HWND Explorer::GridWindow() const { return impl_->grid; }
+void Explorer::SetSummary(int kind, unsigned token, std::vector<ExplorerTag> tags, std::vector<std::pair<std::wstring, std::wstring>> props) {
+  impl_->SetSummary(kind, token, std::move(tags), std::move(props));
+}
 bool Explorer::ShowTree() const { return impl_->settings.showTree; }
 bool Explorer::ShowPreview() const { return impl_->settings.showPreview; }
 void Explorer::TogglePane(bool tree) { impl_->TogglePanel(tree); }

@@ -58,6 +58,7 @@
 #include "links.hpp"
 #include "sqlite3.h"
 #include "tagstore.hpp"
+#include "tagsum.hpp"
 #include "pathinfer.hpp"
 #include "names.hpp"
 #include "quality.hpp"
@@ -305,6 +306,7 @@ struct App {
     HMENU menuBar = nullptr;
     KeyMap keys;
     std::vector<int> keyTmp = std::vector<int>(8, 0);  // ショートカットキーの設定画面の一時置き場
+    std::vector<KeyUpgrade::Item> keyConflicts;        // 新しい標準のキーが、別の機能に割り当ててある（起動した後に聞く）
 
     // 結果
     Result result;
@@ -354,6 +356,8 @@ struct ExplorerApp : ExplorerHost {
     bool ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, const std::vector<std::pair<std::wstring, int>>& edits) override;
     std::wstring ExplorerResolveTag(const std::wstring& text) override;
     void ExplorerTagEditChanged(bool on) override;
+    void ExplorerRequestSummary(int kind, unsigned token, const std::vector<std::wstring>& paths, bool edit) override;
+    void ExplorerDeleted(const std::vector<std::wstring>& paths) override;
     void ExplorerSearchTags(const std::vector<std::wstring>& tags) override;
     void ExplorerFindSimilarAi(const std::wstring& path) override;
     void ExplorerRelookup(const std::wstring& path) override;
@@ -2865,7 +2869,7 @@ void applyQueryToUi(const SearchQuery& q) {
         if (kSortChoices[i] == q.sort) ComboBox_SetCurSel(app.s.sort, static_cast<int>(i));
     ComboBox_SetCurSel(app.s.dateField, static_cast<int>(q.dateField));
     Button_SetCheck(app.s.desc, q.descending ? BST_CHECKED : BST_UNCHECKED);
-    Button_SetCheck(app.s.review, q.review ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(app.s.review, BST_UNCHECKED);  // 確認キューはやめた（前に保存したスマートフォルダに付いていても使わない）
     Button_SetCheck(app.s.noBody, q.excludeMangaBody ? BST_CHECKED : BST_UNCHECKED);
     searchStatus(L"スマートフォルダを読み込みました。「検索」（Enter）を押すと探します");
 }
@@ -3855,10 +3859,12 @@ std::vector<int64_t> selectedImageIds(size_t* missing) {
 
 // 選んだ画像のタグを書き換える。検索の結果を出していれば検索し直す（同じ位置の画像を選び直す）
 // edit(db, 画像 ID, history) は、タグを変える前に history.touch(画像 ID, タグ) を呼ぶ（取り消せるように）
+// rerunSearch: 検索の結果を出している時に、検索をやり直すか（タグの手動編集の保存では、一覧と選び方をそのままにするので false）。
+// 書けたら true
 template <typename F>
-void editSelectedTags(const std::vector<int64_t>& ids, const std::string& description, F&& edit) {
+bool editSelectedTags(const std::vector<int64_t>& ids, const std::string& description, F&& edit, bool rerunSearch = true) {
     Db* db = uiDb();
-    if (!db || ids.empty()) return;
+    if (!db || ids.empty()) return false;
     try {
         db->begin();
         TagHistory history(*db);
@@ -3871,15 +3877,16 @@ void editSelectedTags(const std::vector<int64_t>& ids, const std::string& descri
         } catch (const std::exception&) {
         }
         logBox(app.hwnd, widen(e.what()).c_str(), L"imgdupe", MB_ICONWARNING);
-        return;
+        return false;
     }
     refreshSources(true);
-    if (ex.view && ex.view->ShowingList()) {
+    if (ex.view && ex.view->ShowingList() && rerunSearch) {
         app.reselect = std::max(0, selectedResult());
         scheduleSearch(10);
     } else if (ex.view) {
         ex.view->RefreshTags();
     }
+    return true;
 }
 
 void markSelected(bool correct) {
@@ -4306,7 +4313,7 @@ void settingsShowPage(int page) {
     iniSet(L"settingsPage", std::to_wstring(page));
 }
 
-enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA, IDC_ST_LOAD, IDC_ST_TABS, IDC_ST_ARCHIVE, IDC_ST_COMPACT, IDC_ST_DATADIR };
+enum { IDC_ST_AUTOUPDATE = 300, IDC_ST_AUTOSTART, IDC_ST_QUALITY, IDC_ST_TAGGER, IDC_ST_CLIP, IDC_ST_VARIANT, IDC_ST_GPU, IDC_ST_MODELS, IDC_ST_LINKS, IDC_ST_KEYS, IDC_ST_INI, IDC_ST_LOOKUP, IDC_ST_LINKCHECK, IDC_ST_SAUCE, IDC_ST_SAUCEKEY, IDC_ST_SAUCELIMIT, IDC_ST_TAGJA, IDC_ST_LOAD, IDC_ST_TABS, IDC_ST_ARCHIVE, IDC_ST_COMPACT, IDC_ST_DATADIR, IDC_ST_CLEANUP };
 
 // 画面の内容を imgdupe.ini などに書く
 void applySettings() {
@@ -4381,6 +4388,7 @@ void settingsCommand(int id, int code) {
         case IDC_ST_KEYS: applySettings(); w.after = CMD_KEY_SETTINGS; w.done = true; break;
         case IDC_ST_ARCHIVE: applySettings(); w.after = CMD_ARCHIVE; w.done = true; break;
         case IDC_ST_COMPACT: applySettings(); w.after = CMD_COMPACT_DB; w.done = true; break;
+        case IDC_ST_CLEANUP: applySettings(); w.after = CMD_CLEANUP; w.done = true; break;
         case IDC_ST_DATADIR: ShellExecuteW(w.wnd, L"open", app.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
         case IDC_ST_INI:
             applySettings();
@@ -4515,7 +4523,7 @@ void showSettingsWindow() {
         w.sauceStatus = child(WC_STATICW, L"", SS_NOPREFIX, -1, in + px(18), ry + rowH + px(6), iw - px(18), px(34));
     }
     page(4);
-    gy = group(L"データ", px(150));
+    gy = group(L"データ", px(188));
     w.dbSize = child(WC_STATICW, L"", SS_NOPREFIX, -1, in, gy, iw, rowH);
     child(WC_BUTTONW, L"退避した解析結果…", WS_TABSTOP, IDC_ST_ARCHIVE, in, gy + rowH + px(8), px(180), bh);
     child(WC_STATICW, L"見つからなくなった画像の、退避したタグ・CLIP などを見る・消す", SS_NOPREFIX, -1, in + px(190),
@@ -4523,6 +4531,9 @@ void showSettingsWindow() {
     child(WC_BUTTONW, L"DB を詰めて小さくする…", WS_TABSTOP, IDC_ST_COMPACT, in, gy + rowH + bh + px(16), px(180), bh);
     child(WC_STATICW, L"DB の使っていない所を詰めて、ファイルを小さくする", SS_NOPREFIX, -1, in + px(190),
           gy + rowH + bh + px(22), iw - px(190), rowH);
+    child(WC_BUTTONW, L"クリーンナップ…", WS_TABSTOP, IDC_ST_CLEANUP, in, gy + rowH + 2 * bh + px(24), px(180), bh);
+    child(WC_STATICW, L"監視フォルダを調べ直して、DB を今のファイルに合わせる", SS_NOPREFIX, -1, in + px(190),
+          gy + rowH + 2 * bh + px(30), iw - px(190), rowH);
     page(5);
     gy = group(L"そのほか", px(60));
     const int b3 = (iw - 2 * px(8)) / 3;
@@ -5084,100 +5095,104 @@ void ExplorerApp::ExplorerSelected(const std::wstring& path, bool image) {
 }
 
 // 画像のタグ（ファイルのタグと、確度を合成した検索用のタグ。確度の高い順）
-// 手動編集でさわれるタグの由来（AI が付けるもの）
-bool aiTagSource(const std::string& source) {
-    return source == kSourceTagger || source == kSourceDict || source == kSourceClip || source == "reference";
+// 画像の ID（解析に無いものは飛ばす）
+std::vector<int64_t> imageIdsOf(Db& db, const std::vector<std::wstring>& paths, const std::vector<std::string>& roots,
+                                const std::atomic<bool>* cancel = nullptr) {
+    std::vector<int64_t> ids;
+    for (const auto& p : paths) {
+        if (cancel && *cancel) return {};
+        if (const int64_t id = findImageId(db, narrow(p), roots)) ids.push_back(id);
+    }
+    return ids;
 }
 
-// 画像のタグ（プレビューに出す）。いくつもならまとめる（タグの手動編集_仕様案.md）
-std::vector<ExplorerTag> ExplorerApp::ExplorerTagSet(const std::vector<std::wstring>& paths, bool edit) {
+// 画像のタグ（プレビューに出す）。まとめ方は tagsum.cpp（タグの手動編集_仕様案.md）。表示名は画面のスレッドで付ける
+std::vector<ExplorerTag> toExplorerTags(const std::vector<TagSummary>& sums) {
     std::vector<ExplorerTag> out;
+    out.reserve(sums.size());
+    for (const auto& u : sums) {
+        ExplorerTag t{widen(u.tag), widen(u.kind), tagLabel(u.tag), u.confidence, u.file};
+        t.count = u.count;
+        t.total = u.total;
+        t.state = u.state;
+        t.mixed = u.mixed;
+        t.editable = u.editable;
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+std::vector<ExplorerTag> ExplorerApp::ExplorerTagSet(const std::vector<std::wstring>& paths, bool edit) {
     Db* db = uiDb();
-    if (!db || paths.empty()) return out;
+    if (!db || paths.empty()) return {};
     try {
         std::vector<std::string> roots;
         for (const auto& f : folderList()) roots.push_back(narrow(f));
-        struct Row {
-            std::string tag, kind;
-            double p = 0;
-            int state = 1;
-            bool file = false, editable = false;
-        };
-        struct Sum {
-            std::string tag, kind;
-            bool file = false;
-            int count = 0;
-            double lo = 2, hi = -1;
-            int stLo = 3, stHi = -1;
-            bool editable = false;
-        };
-        std::vector<Sum> sums;
-        std::unordered_map<std::string, size_t> at;  // 小文字のタグ + 埋め込みか → sums の番号
-        int total = 0;
-        for (const auto& path : paths) {
-            const int64_t id = findImageId(*db, narrow(path), roots);
-            if (!id) continue;
-            ++total;
-            struct Agg {
-                std::string kind;
-                std::vector<double> ps;
-                int manual = -1;
-                bool file = false, dbOnly = false, ai = false;
-            };
-            std::vector<std::pair<std::string, Agg>> agg;
-            for (const auto& t : tagsOf(*db, id)) {
-                if (t.kind == "rating") continue;  // general / sensitive などの年齢区分は出さない
-                auto it = std::find_if(agg.begin(), agg.end(), [&](const auto& a) { return lstrcmpiA(a.first.c_str(), t.tag.c_str()) == 0; });
-                if (it == agg.end()) it = agg.insert(agg.end(), {t.tag, Agg{t.kind}});
-                if (t.source == kSourceEmbedded) it->second.file = true;
-                else it->second.dbOnly = true;
-                if (t.manual) it->second.manual = t.confidence > 0.5 ? 1 : 0;
-                else it->second.ps.push_back(t.confidence);
-                if (aiTagSource(t.source)) it->second.ai = true;
-            }
-            std::vector<Row> rows;
-            for (const auto& [tag, a] : agg) {
-                const double p = a.manual >= 0 ? a.manual : combineConfidence(a.ps);
-                const int state = a.manual == 1 ? 2 : a.manual == 0 ? 0 : 1;
-                // 手動で外した（「違う」と確定した）タグは、ファイルに書き込まれていても出さない（ファイルは書き換えない）
-                if (a.file && a.manual != 0) rows.push_back({tag, a.kind, 1.0, state, true, false});
-                // 手動編集では、否定したタグも出す（クリックで戻せるように）
-                if (a.dbOnly && (p >= 0.35 || (edit && a.manual >= 0)))
-                    rows.push_back({tag, a.kind, p, state, false, a.ai || a.manual >= 0});
-            }
-            for (const auto& r : rows) {
-                std::string key = r.tag;
-                for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (r.file) key += '\x01';
-                auto f = at.find(key);
-                if (f == at.end()) {
-                    f = at.emplace(key, sums.size()).first;
-                    sums.push_back(Sum{r.tag, r.kind, r.file});
-                }
-                Sum& u = sums[f->second];
-                ++u.count;
-                u.lo = std::min(u.lo, r.p);
-                u.hi = std::max(u.hi, r.p);
-                u.stLo = std::min(u.stLo, r.state);
-                u.stHi = std::max(u.stHi, r.state);
-                u.editable = u.editable || r.editable;
-            }
-        }
-        std::vector<std::pair<double, ExplorerTag>> rows;
-        for (const auto& u : sums) {
-            ExplorerTag t{widen(u.tag), widen(u.kind), tagLabel(u.tag), edit ? u.lo : u.hi, u.file};
-            t.count = u.count;
-            t.total = total;
-            t.state = u.stLo;
-            t.mixed = u.stLo != u.stHi;
-            t.editable = u.editable;
-            rows.push_back({u.file ? 2.0 : t.confidence, std::move(t)});
-        }
-        std::stable_sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-        for (auto& r : rows) out.push_back(std::move(r.second));
+        return toExplorerTags(summarizeTags(*db, imageIdsOf(*db, paths, roots), edit));
     } catch (const std::exception&) {
     }
-    return out;
+    return {};
+}
+
+// いくつもの画像のまとめ（タグ・プロパティ）を、裏のスレッドで作る（自分の Db で読む。何千枚も選んだ時に画面を止めない）。
+// 頼み直したら、前の分は途中でやめる。結果は WM_APP_SUMMARY で画面のスレッドへ
+constexpr UINT WM_APP_SUMMARY = WM_APP + 62;  // lParam: SummaryResult*
+struct SummaryResult {
+    int kind = 0;
+    unsigned token = 0;
+    std::vector<TagSummary> tags;
+    std::vector<std::pair<std::wstring, std::wstring>> props;
+};
+std::shared_ptr<std::atomic<bool>> summaryCancel[2];
+
+void ExplorerApp::ExplorerRequestSummary(int kind, unsigned token, const std::vector<std::wstring>& paths, bool edit) {
+    if (kind < 0 || kind > 1) return;
+    if (summaryCancel[kind]) *summaryCancel[kind] = true;  // 前の分はやめる
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    summaryCancel[kind] = cancel;
+    std::vector<std::string> roots;
+    for (const auto& f : folderList()) roots.push_back(narrow(f));
+    const std::string dbFile = narrow(dbPath());
+    const HWND hwnd = app.hwnd;
+    std::thread([kind, token, paths, edit, roots, dbFile, hwnd, cancel] {
+        auto r = std::make_unique<SummaryResult>();
+        r->kind = kind;
+        r->token = token;
+        try {
+            Db d;
+            if (d.open(dbFile)) {
+                const std::vector<int64_t> ids = imageIdsOf(d, paths, roots, cancel.get());
+                if (kind == 0) {
+                    r->tags = summarizeTags(d, ids, edit, cancel.get());
+                } else {
+                    // 全部の画像にある項目だけ。値が違えば「複数のプロパティ」
+                    bool first = true;
+                    for (int64_t id : ids) {
+                        if (*cancel) break;
+                        std::vector<std::pair<std::wstring, std::wstring>> props;
+                        for (auto& [k, v] : imageProperties(d, id, [](int64_t t) { return narrow(localTimeText(t)); }))
+                            props.emplace_back(widen(k), widen(v));
+                        if (first) {
+                            r->props = std::move(props);
+                            first = false;
+                            continue;
+                        }
+                        std::vector<std::pair<std::wstring, std::wstring>> keep;
+                        for (auto& [name, value] : r->props) {
+                            auto f = std::find_if(props.begin(), props.end(), [&](const auto& p) { return p.first == name; });
+                            if (f == props.end()) continue;  // この画像には無い項目
+                            keep.push_back({name, f->second == value ? value : std::wstring(L"複数のプロパティ")});
+                        }
+                        r->props.swap(keep);
+                    }
+                }
+            }
+        } catch (const std::exception&) {
+        }
+        if (*cancel) return;  // 選び直した: 捨てる
+        SummaryResult* raw = r.release();
+        if (!PostMessageW(hwnd, WM_APP_SUMMARY, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
+    }).detach();
 }
 
 // タグの手動編集を保存する: 選んだ画像それぞれに、確定（手動で 1.0）・否定（手動で 0）・そのまま（手動の決定を外す）。
@@ -5206,8 +5221,8 @@ bool ExplorerApp::ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, 
         what += (what.empty() ? "" : "、") + narrow(tag) + (state == 2 ? " を確定" : state == 0 ? " を否定" : " をそのまま");
     }
     const std::string desc = "タグの手動編集（" + std::to_string(ids.size()) + " 枚）: " + what;
-    bool ok = true;
-    editSelectedTags(ids, desc, [&](Db& d, int64_t id, TagHistory& history) {
+    // 保存しても検索はやり直さない（一覧と、選んでいる画像をそのままにする。前は保存の後に選択が元に戻っていた）
+    const bool ok = editSelectedTags(ids, desc, [&](Db& d, int64_t id, TagHistory& history) {
         const std::vector<TagRow> rows = tagsOf(d, id);
         for (const auto& [wtag, state] : edits) {
             const std::string tag = narrow(wtag);
@@ -5223,9 +5238,9 @@ bool ExplorerApp::ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, 
             else if (state == 0) setManualTag(d, id, tag, false);
             else clearManualTag(d, id, tag);
         }
-    });
-    logs::info(desc);
-    return ok;
+    }, false);
+    if (ok) logs::info(desc);
+    return ok;  // 書けなかった時は false（編集中の変更は残す）
 }
 
 // 手で打ったタグ: 表示名（日本語など）なら元のタグに。決まらなければ打ったまま
@@ -7777,6 +7792,7 @@ const wchar_t* commandHelp(int id) {
         case CMD_STATS: return L"タグ・作者・形式などの数を表とグラフで見ます";
         case CMD_INFER_RULES: return L"フォルダ名から作者・アカウントを読み取るために教えた形の一覧（教えるのはフォルダの右クリックから）";
         case CMD_SETTINGS: return L"AI 解析・処理の負荷・タグの表示などの設定を変えます";
+        case CMD_CLEANUP: return L"監視フォルダを全部調べ直して、DB を今のファイルに合わせます（消えた画像は退避、動かした画像は引き継ぎ、新しい画像は登録）";
         case CMD_DELETE: return L"選んでいるファイル・フォルダをごみ箱に移します（確かめてから。Delete キーでも）";
         case CMD_TAG_EDIT: return L"タグの手動編集を入れる・切る（プレビューのタグをクリックで 確定 → 否定 → そのまま、＋で足す）";
         case CMD_KEY_SETTINGS: return L"ショートカットキーの割り当てを変えます（Ctrl+K）";
@@ -7974,6 +7990,8 @@ void rebuildMenu() {
 // ---------------------------------------------------------------- ショートカットキー
 
 // 割り当ては imgdupe.ini の [Keys] に「機能 = キー, キー」で持つ。一度も保存していなければ標準の割り当て
+void saveKeys();
+
 void loadKeys() {
     if (!iniInt(L"keysSaved", 0)) {
         app.keys = defaultKeys();
@@ -7987,6 +8005,28 @@ void loadKeys() {
             i += static_cast<DWORD>(line.size()) + 1;
         }
         app.keys = keysFromLines(lines);
+        // 自分でキーを変えた人にも、新しい標準のキーを届ける: 空いていれば割り当て、別の機能に割り当ててあれば起動した後に聞く
+        std::vector<std::string> seen;
+        {
+            std::vector<wchar_t> text(16384);
+            GetPrivateProfileStringW(L"imgdupe", L"keyDefaultsSeen", L"", text.data(), static_cast<DWORD>(text.size()), iniPath().c_str());
+            std::string cur;
+            for (char c : narrow(text.data())) {
+                if (c == ';') {
+                    if (!cur.empty()) seen.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur += c;
+                }
+            }
+            if (!cur.empty()) seen.push_back(cur);
+        }
+        if (seen.empty()) seen = defaultPairsBeforeTracking();  // 「見たことのある標準」を残し始める前に保存した設定
+        const KeyUpgrade up = upgradeKeys(app.keys, seen);
+        app.keyConflicts = up.conflicts;
+        for (const auto& a : up.assigned)
+            if (const CmdInfo* ci = findCommand(a.cmd)) logs::info(std::string("新しい標準のキーを割り当てた: ") + ci->name + " = " + keyName(a.key));
+        if (!up.assigned.empty() || up.conflicts.empty()) saveKeys();  // かぶりがある間は、聞き終わるまで「見たことにする」を書かない
     }
     for (size_t i = 0; i < app.keyTmp.size(); ++i) {
         wchar_t name[64];
@@ -8002,10 +8042,108 @@ void saveKeys() {
     section += L'\0';
     WritePrivateProfileSectionW(L"Keys", section.c_str(), iniPath().c_str());
     iniSet(L"keysSaved", L"1");
+    if (app.keyConflicts.empty()) {  // 今の標準の割り当てを「見たことにする」（次に標準が増えた時、増えた分だけ届ける）
+        std::string seen;
+        for (const auto& p : defaultPairs()) seen += (seen.empty() ? "" : ";") + p;
+        iniSet(L"keyDefaultsSeen", widen(seen));
+    }
     for (size_t i = 0; i < app.keyTmp.size(); ++i) {
         const CmdInfo* ci = app.keyTmp[i] ? findCommand(app.keyTmp[i]) : nullptr;
         WritePrivateProfileStringW(L"KeyTmp", (L"Slot" + std::to_wstring(i + 1)).c_str(),
                                    ci ? widen(ci->name).c_str() : nullptr, iniPath().c_str());
+    }
+}
+
+// 新しい標準のキーが、もう別の機能に割り当ててある時: アップデートの後の最初の起動で、どちらにするか聞く
+void askKeyConflicts() {
+    if (app.keyConflicts.empty()) return;
+    const std::vector<KeyUpgrade::Item> items = app.keyConflicts;
+    auto label = [](int cmd) {
+        const CmdInfo* ci = findCommand(cmd);
+        std::wstring t = ci ? ci->label : L"?";
+        const size_t paren = t.find(L"(&");  // メニューの下線の印を外す
+        if (paren != std::wstring::npos) t.erase(paren, t.find(L')', paren) == std::wstring::npos ? std::wstring::npos : t.find(L')', paren) - paren + 1);
+        while (!t.empty() && (t.back() == L'.' || t.back() == L' ')) t.pop_back();
+        return t;
+    };
+    bool changed = false;
+    for (const auto& c : items) {
+        std::string key = keyName(c.key);
+        if (const size_t at = key.find("Comma"); at != std::string::npos) key.replace(at, 5, ",");
+        const std::wstring msg = L"新しい版で、「" + label(c.cmd) + L"」の標準のキーが " + widen(key) + L" になりました。\r\n"
+                                 L"今、" + widen(key) + L" は「" + label(c.current) + L"」に割り当ててあります。\r\n\r\n" +
+                                 widen(key) + L" を「" + label(c.cmd) + L"」に割り当て直しますか？\r\n"
+                                 L"（「いいえ」なら今のままです。後から「ショートカットキーの設定」で変えられます）";
+        if (logBox(app.hwnd, msg.c_str(), L"ショートカットキー", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            app.keys[c.key] = c.cmd;
+            changed = true;
+        }
+    }
+    app.keyConflicts.clear();
+    saveKeys();  // 聞き終わったので「見たことにする」も書く
+    if (changed) rebuildMenu();
+}
+
+// クリーンナップ: 監視フォルダを全部調べ直して、DB を今のファイルに合わせる（常駐解析の調べ直しと同じもの）
+void cleanupUi() {
+    const wchar_t* msg = L"監視フォルダを全部調べ直して、DB を今のファイルに合わせます。\r\n\r\n"
+                         L"・消えた画像: 解析の結果を退避します（「退避した解析結果」で見られます。ファイルが戻れば復元します）\r\n"
+                         L"・動かした・名前を変えた画像: 解析の結果を引き継ぎます\r\n"
+                         L"・新しい画像: 登録して、解析します\r\n\r\n"
+                         L"常駐解析が行います（止まっていれば始めます）。進み具合はタスクトレイの窓に出ます。\r\n\r\n始めますか？";
+    if (logBox(app.hwnd, msg, L"クリーンナップ", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    saveSettings();  // 監視フォルダを DB に書いてから
+    indexer::requestRescan(app.dataDir);
+    if (!indexer::isRunning()) indexer::start();
+    logs::info("クリーンナップ（監視フォルダの調べ直し）を頼んだ");
+    if (ex.view) ex.view->SetSameStatus(L"クリーンナップを常駐解析に頼みました（進み具合はタスクトレイの窓に出ます）");
+}
+
+// ごみ箱に移したファイル・フォルダ: その画像の解析の結果を DB から片付ける（退避。ごみ箱から戻すと、次の解析で復元する）。
+// 常駐解析が動いていれば任せる（フォルダの変化に気づいて同じことをする）。止まっている時は、ここで退避する
+void ExplorerApp::ExplorerDeleted(const std::vector<std::wstring>& paths) {
+    Db* db = uiDb();
+    if (!db || paths.empty()) return;
+    if (indexer::isRunning()) {
+        indexer::requestRescan(app.dataDir);
+        return;
+    }
+    try {
+        std::vector<std::pair<int64_t, std::string>> found;  // 画像の ID とパス
+        Stmt one(db->handle(), "SELECT id,path FROM images WHERE path=?");
+        Stmt under(db->handle(), "SELECT id,path FROM images WHERE path >= ? AND path < ?");
+        for (const auto& wp : paths) {
+            for (const char sep : {'\\', '/'}) {
+                std::string p = narrow(stripTrailingSlash(wp));
+                std::replace(p.begin(), p.end(), sep == '/' ? '\\' : '/', sep);
+                one.bind(1, p);
+                while (one.step()) found.emplace_back(one.i64(0), one.text(1));
+                one.reset();
+                under.bind(1, p + sep).bind(2, p + sep + "\xff");  // 消したフォルダの中
+                while (under.step()) found.emplace_back(under.i64(0), under.text(1));
+                under.reset();
+            }
+        }
+        if (found.empty()) return;
+        if (found.size() > 5000) {  // 多すぎる: 画面を止めないで、常駐解析かクリーンナップに任せる
+            indexer::requestRescan(app.dataDir);
+            if (ex.view)
+                ex.view->SetSameStatus(L"消した画像（" + withCommas(found.size()) +
+                                       L" 枚）の解析の結果は、常駐解析を始めた時か、設定 → データ →「クリーンナップ」で片付けます");
+            return;
+        }
+        const HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        const std::string fallback = archiveFileOf(narrow(app.dataDir));
+        const std::string vec = narrow(clip::vectorPath(app.dataDir));
+        std::map<std::string, std::vector<int64_t>> byFile;  // ドライブ記録のあるドライブの画像は、そのドライブの退避へ
+        for (const auto& [id, path] : found) byFile[archiveFileForPath(*db, path, fallback)].push_back(id);
+        size_t n = 0;
+        for (const auto& [file, ids] : byFile) n += archiveImages(*db, file, ids, vec, "削除した");
+        SetCursor(old);
+        if (n) logs::info("削除した画像 " + std::to_string(n) + " 枚の解析の結果を退避した");
+    } catch (const std::exception& e) {
+        logs::error(std::string("削除した画像の解析の結果を退避できなかった（次の解析で片付ける）: ") + e.what());
+        indexer::requestRescan(app.dataDir);
     }
 }
 
@@ -8092,6 +8230,8 @@ bool handleShortcut(const MSG& msg) {
     }
     auto it = app.keys.find(KeyStroke{mods, vk});
     if (it == app.keys.end()) return false;
+    // 削除のキーは、真ん中の一覧にフォーカスがある時だけ（フォルダ一覧・日付の欄・「画像から検索」の足した画像の列では、その部品に渡す）
+    if (it->second == CMD_DELETE && !(ex.view && msg.hwnd == ex.view->GridWindow())) return false;
     SendMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(it->second), 0);
     return true;
 }
@@ -8362,8 +8502,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case CMD_DELETE:
                     if (ex.view && ex.view->Visible()) ex.view->DeleteSelected();
                     break;
+                case CMD_CLEANUP: cleanupUi(); break;
                 case CMD_TAG_EDIT:
                     if (ex.view) ex.view->SetTagEditing(!ex.view->TagEditing());
+                    syncMenuChecks();  // 保存を聞かれてキャンセルした時も、リボンのボタンの見た目を今の状態に戻す
                     break;
                 case CMD_UNDO:
                     if (app.tab != 1) switchTab(1);
@@ -8455,6 +8597,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_QUERY_TAGS:
             onQueryTags(reinterpret_cast<QueryTagsDone*>(lp));
             return 0;
+        case WM_APP_SUMMARY: {  // 裏で作った、いくつもの画像のまとめ（タグ・プロパティ）
+            std::unique_ptr<SummaryResult> r(reinterpret_cast<SummaryResult*>(lp));
+            if (ex.view) ex.view->SetSummary(r->kind, r->token, toExplorerTags(r->tags), std::move(r->props));
+            return 0;
+        }
         case WM_APP_CONVERT: {
             std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
             if (wp == 1) {
@@ -9077,6 +9224,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (autoStart) startSearch(L"");
     // 前の版の DB なら、タグの置き場所を変換する（解析が動いていればそちらで）。変換が済んでいれば、一度だけ詰めるのをすすめる
     suggestCompact();
+    askKeyConflicts();  // 新しい標準のキーが別の機能とかぶっていたら、どちらにするか聞く
     if (!indexer::isRunning()) startTagConversion();
     else if (Db* db = uiDb()) {
         try {

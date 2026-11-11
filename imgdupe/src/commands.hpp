@@ -97,6 +97,7 @@ enum Cmd : int {
     CMD_COVER_4,
     CMD_COVER_5,
     CMD_DELETE,           // 削除（ごみ箱へ）
+    CMD_CLEANUP,          // クリーンナップ（監視フォルダを調べ直して、DB を今のファイルに合わせる）
 };
 
 struct CmdInfo {
@@ -130,5 +131,22 @@ std::vector<std::string> keyLines(const KeyMap& keys);
 KeyMap keysFromLines(const std::vector<std::string>& lines);
 // メニューに出すキーの表示（最初の 1 つ。無ければ空）
 std::string keyLabel(const KeyMap& keys, int cmd);
+
+// ---- 新しい標準のキーを、自分でキーを変えた人にも届ける
+// 今の標準の割り当て全部（"機能の名前=キー"。設定ファイルに「見たことのある標準」として残す）
+std::vector<std::string> defaultPairs();
+// 「見たことのある標準」を残し始める前（v3.13 より前）に保存した設定で、見たことにする標準（v3.10 より前からあるもの）
+std::vector<std::string> defaultPairsBeforeTracking();
+struct KeyUpgrade {
+    struct Item {
+        KeyStroke key;
+        int cmd = 0;      // 新しい標準で、このキーを割り当てる機能
+        int current = 0;  // 今そのキーに割り当ててある機能（かぶった時）
+    };
+    std::vector<Item> assigned;   // 空いていたので割り当てた
+    std::vector<Item> conflicts;  // 別の機能に割り当ててある（聞いてから）
+};
+// seen に無い標準の割り当てを keys に足す。キーが空いていれば割り当て、別の機能に割り当ててあれば conflicts に入れる（keys は変えない）
+KeyUpgrade upgradeKeys(KeyMap& keys, const std::vector<std::string>& seen);
 
 }  // namespace imgdupe

@@ -98,6 +98,10 @@ class ExplorerHost {
   virtual bool ExplorerApplyTagEdits(const std::vector<std::wstring>& paths, const std::vector<std::pair<std::wstring, int>>& edits) = 0;
   virtual std::wstring ExplorerResolveTag(const std::wstring& text) = 0;  // 手で打ったタグ（表示名でも）を、タグの名前に
   virtual void ExplorerTagEditChanged(bool on) { (void)on; }              // 手動編集を入れた・切った
+  // いくつもの画像のまとめを、裏で作って Explorer::SetSummary で返す（画面を止めないように）。
+  // kind 0: タグ（edit なら手動編集の形）、1: プロパティ（全部にある項目だけ。値が違えば「複数のプロパティ」）
+  virtual void ExplorerRequestSummary(int kind, unsigned token, const std::vector<std::wstring>& paths, bool edit) = 0;
+  virtual void ExplorerDeleted(const std::vector<std::wstring>& paths) { (void)paths; }  // ごみ箱に移した（DB から片付ける）
   virtual void ExplorerSearchTags(const std::vector<std::wstring>& tags) = 0;       // タグ（すべてを持つ画像）で検索する
   virtual void ExplorerFindSimilarAi(const std::wstring& path) = 0;                 // 似た画像（CLIP）を探す
   virtual void ExplorerRelookup(const std::wstring& path) = 0;                      // 出典を調べ直す
@@ -149,6 +153,9 @@ class Explorer {
   void SetGroups(const std::wstring& title, std::vector<ExplorerGroup> groups);
   void AddTrayTag(const std::wstring& tag);
   void DeleteSelected();  // 選んでいるものを削除（ごみ箱へ。確かめてから）
+  HWND GridWindow() const;  // 真ん中の一覧（フォーカスがここにある時だけ Delete キーで削除する）
+  // ExplorerRequestSummary の結果（token が今のものでなければ捨てる）
+  void SetSummary(int kind, unsigned token, std::vector<ExplorerTag> tags, std::vector<std::pair<std::wstring, std::wstring>> props);
   // 表示（ホストのメニューから）
   bool ShowTree() const;
   bool ShowPreview() const;
