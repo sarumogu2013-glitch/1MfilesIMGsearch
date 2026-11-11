@@ -2338,7 +2338,8 @@ class ExplorerImpl {
   }
 
   // stackCount: 2 以上なら、いくつも選んでいる時のプレビュー（重ねた絵と「N 枚」）。badge: 解析の状態の印を出す
-  void DrawThumb(HDC dc, HDC mem, const Item& it, const Thumb* t, RECT box, int stackCount = 0, bool badge = true) {
+  // center: 枠の上下の真ん中に置く（プレビューの「画像だけ」。ふだんは下にそろえる）
+  void DrawThumb(HDC dc, HDC mem, const Item& it, const Thumb* t, RECT box, int stackCount = 0, bool badge = true, bool center = false) {
     int ts = std::min(box.right - box.left, box.bottom - box.top);
     if (it.dir) {
       // フォルダは本として描き、隅にフォルダの札を添える
@@ -2354,7 +2355,7 @@ class ExplorerImpl {
         // まとまりは、後ろに紙を 2 枚重ねて見せる
         const bool stack = it.Stack() || stackCount > 1;
         int lift = stack ? Px(8) : 0;
-        RECT r = FitRect(p.w, p.h, {box.left, box.top + lift, box.right - Px(4) - lift, box.bottom - Px(4)}, true);
+        RECT r = FitRect(p.w, p.h, {box.left, box.top + lift, box.right - Px(4) - lift, box.bottom - Px(4)}, !center);
         for (int k = 2; k >= 1 && stack; k--) {
           RECT back = {r.left + k * Px(4), r.top - k * Px(4), r.right + k * Px(4), r.bottom - k * Px(4)};
           Fill(dc, back, RGB(250, 250, 250));
@@ -2538,7 +2539,8 @@ class ExplorerImpl {
     GetClientRect(preview, &rc);
     int w = rc.right - Px(24);
     int h = int(rc.bottom) - PreviewTabsH();
-    if (settings.previewMode == 0) return std::max(Px(48), std::min({w, h - Px(16), 1024}));  // 画像だけ: 全部（名前は出さない）
+    // 画像だけ: パネル全部を使う（PreviewRect。正方形にしない）。ここは読む大きさ（長いほうの辺）
+    if (settings.previewMode == 0) return std::max(Px(48), std::min(std::max(int(rc.right) - Px(8), h - Px(8)), 1024));
     if (settings.previewMode == 2) return std::max(Px(48), std::min({w, h / 3, 1024}));       // プロパティ: 下に表を出すので 3 分の 1
     return std::max(Px(48), std::min({w, h * 2 / 5, 1024}));  // タグ: 下にタグと情報を出すので 4 割まで
   }
@@ -2692,6 +2694,13 @@ class ExplorerImpl {
     int m = Px(12);
     int top = PreviewTabsH() + Px(4);
     RECT box = {(rc.right - boxSize) / 2, top, (rc.right - boxSize) / 2 + boxSize, top + boxSize};
+    // 画像だけ: 画像はパネルの幅と高さいっぱいに（正方形の枠に入れると、横長・縦長の画像の横や上下が大きく空いていた）
+    const bool fill = settings.previewMode == 0 && it->image;
+    if (settings.previewMode == 0 && !fill) {  // フォルダ・画像でないファイルは正方形の枠（パネルに入る大きさ）
+      boxSize = std::max(Px(48), std::min({int(rc.right) - Px(24), int(rc.bottom) - top - Px(16), 1024}));
+      box = {(rc.right - boxSize) / 2, top, (rc.right - boxSize) / 2 + boxSize, top + boxSize};
+    }
+    if (fill) box = {rc.left + Px(4), top, rc.right - Px(4), std::max(LONG(top + Px(48)), rc.bottom - Px(4))};
     const Thumb* t = previewReady && it->path == previewPath ? &previewThumb : nullptr;
     if (!t && it->Thumbable()) {
       // 大きいのを読むまでは一覧の縮小版で
@@ -2699,7 +2708,7 @@ class ExplorerImpl {
     }
     // 画像だけ・いくつも選んでいる時は、名前・情報・解析の印を出さない（いくつもなら重ねた絵と「N 枚」）
     const bool showName = settings.previewMode != 0 && !many;
-    DrawThumb(dc, mem, *it, t, box, many ? int(picked.size()) : 0, showName);
+    DrawThumb(dc, mem, *it, t, box, many ? int(picked.size()) : 0, showName, fill);
     DeleteDC(mem);
 
     // 名前と情報
