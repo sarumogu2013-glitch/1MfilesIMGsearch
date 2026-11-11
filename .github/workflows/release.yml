@@ -30,7 +30,13 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "版: $TAG"
       - name: MinGW-w64 を入れる
-        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
+        # パッケージの置き場につながらないことがある（名前が引けないなど）ので、間を空けて 5 回までやり直す
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y -o Acquire::Retries=3 g++-mingw-w64-x86-64-posix && exit 0
+            echo "やり直す ($i)"; sleep $((i * 30))
+          done
+          exit 1
       - name: テスト
         run: imgdupe/build.sh test
       - name: ビルド
